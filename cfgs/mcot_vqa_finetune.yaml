@@ -1,0 +1,44 @@
+# Configuration file for MCOT VQA Fine-tuning (Stage 1)
+# This configuration uses the 4M-21_XL model as the base and fine-tunes it for VQA
+# using the VQAv2 dataset with standard cross-entropy loss.
+
+# Model and base parameters
+model: "fm_xl_32e_32d"  # 4M-21_XL model
+patch_size: 16
+input_size: 224
+dtype: "bfloat16"
+num_input_tokens: 1024
+num_target_tokens: 256
+
+# Fine-tuning parameters
+finetune: "/path/to/4M-21_XL/checkpoint"  # Replace with actual path
+loss_type: "token"  # For sequence-to-sequence learning
+
+# Optimizer parameters
+batch_size: 32  # Adjust based on available GPU memory
+epochs: 20
+opt: "adamw"
+weight_decay: 0.05
+blr: 2e-5  # Base learning rate
+min_blr: 0.0
+clip_grad: 1.0
+warmup_epochs: 2
+
+# Scheduler
+scheduler: "cosine"
+
+# Dataset parameters
+data_config: "cfgs/data_vqa.yaml"  # Will create this file
+text_tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
+
+# Evaluation parameters
+eval_freq: 1
+fixed_eval: true
+fixed_eval_batch_size: 16
+
+# Output directory
+output_dir: "./output/mcot_vqa_finetune"
+
+# Misc
+num_workers: 8
+pin_mem: true 

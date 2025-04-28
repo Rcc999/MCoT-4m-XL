@@ -1,0 +1,131 @@
+# MCOT multi-task dataset configuration for Stage 2 (Post-training)
+
+# Dataset paths for training and validation
+# These should be adjusted based on your actual data locations
+training:
+  # Original VQA data (small fraction)
+  vqa_v2:
+    path: "/path/to/vqav2/train"
+    weight: 0.1
+    pretokenized: false
+  
+  # Planning task: MS-COCO captions and bounding boxes
+  planning_mscoco:
+    path: "/path/to/mscoco/train"
+    weight: 0.3
+    pretokenized: false
+    
+  # Reflection task: RichHF-18K artifact annotations
+  reflection_richhf:
+    path: "/path/to/richhf18k/train"
+    weight: 0.3
+    pretokenized: false
+    
+  # Correction task: COCO-Stuff segmentation masks
+  correction_cocostuff:
+    path: "/path/to/cocostuff/train"
+    weight: 0.3
+    pretokenized: false
+
+validation:
+  # Original VQA data
+  vqa_v2:
+    path: "/path/to/vqav2/val"
+    weight: 0.25
+    pretokenized: false
+    
+  # Planning task validation
+  planning_mscoco:
+    path: "/path/to/mscoco/val"
+    weight: 0.25
+    pretokenized: false
+    
+  # Reflection task validation
+  reflection_richhf:
+    path: "/path/to/richhf18k/val"
+    weight: 0.25
+    pretokenized: false
+    
+  # Correction task validation
+  correction_cocostuff:
+    path: "/path/to/cocostuff/val"
+    weight: 0.25
+    pretokenized: false
+
+# Modality information for all tasks
+modality_info:
+  # Common modalities
+  rgb:
+    type: "img"
+    vqvae_ckpt_path: "fourm/utils/vqvae/ckpts/vit_large_patch16_input_adapters_output_adapters.pt"
+    vq_multiplicity: 8
+    patch_size: 16
+    path: "images"
+    
+  text:
+    type: "seq"
+    path: "questions"
+    
+  caption:
+    type: "seq"
+    path: "answers"
+  
+  # Planning task modalities
+  bbox:
+    type: "seq"
+    path: "bounding_boxes"
+    
+  # Reflection task modalities
+  heatmap:
+    type: "img"
+    vqvae_ckpt_path: "fourm/utils/vqvae/ckpts/segmentation_vqvae.pt"
+    vq_multiplicity: 1
+    patch_size: 1
+    path: "artifact_masks"
+    
+  # Correction task modalities
+  segmentation:
+    type: "img"
+    vqvae_ckpt_path: "fourm/utils/vqvae/ckpts/vit_large_patch16_input_adapters_output_adapters.pt"
+    vq_multiplicity: 8
+    patch_size: 16
+    path: "segmentation_masks"
+
+# Input-output modality configuration for different tasks
+task_to_modalities:
+  # VQA task
+  vqa:
+    input: ["rgb", "text"]
+    target: ["caption"]
+    
+  # Planning task
+  planning:
+    input: ["rgb"]
+    target: ["caption", "bbox"]
+    
+  # Reflection task
+  reflection:
+    input: ["rgb", "text"]
+    target: ["heatmap"]
+    
+  # Correction task
+  correction:
+    input: ["rgb", "text", "segmentation"]
+    target: ["rgb"]
+    
+# Sampling configuration
+sampling:
+  weights: 
+    # Regular modalities
+    rgb: 1.0
+    text: 1.0
+    caption: 1.0
+    
+    # Planning modalities
+    bbox: 1.0
+    
+    # Reflection modalities
+    heatmap: 1.0
+    
+    # Correction modalities
+    segmentation: 1.0 

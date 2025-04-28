@@ -1,0 +1,45 @@
+# VQAv2 dataset configuration for MCOT Stage 1 (VQA Fine-tuning)
+
+# Dataset paths for training and validation
+# These should be adjusted based on your actual data locations
+training:
+  vqa_v2:
+    path: "/path/to/vqav2/train"
+    weight: 1.0
+    pretokenized: false
+
+validation:
+  vqa_v2:
+    path: "/path/to/vqav2/val"
+    weight: 1.0
+    pretokenized: false
+
+# Modality information for VQA task
+modality_info:
+  rgb:
+    type: "img"
+    vqvae_ckpt_path: "fourm/utils/vqvae/ckpts/vit_large_patch16_input_adapters_output_adapters.pt"
+    vq_multiplicity: 8  # From 4M model
+    patch_size: 16
+    path: "images"  # Subfolder containing images
+    
+  text:
+    type: "seq"
+    path: "questions"  # Subfolder containing questions
+    
+  caption:
+    type: "seq"
+    path: "answers"  # Subfolder containing answers
+
+# Input-output modality configuration
+task_to_modalities:
+  vqa:
+    input: ["rgb", "text"]
+    target: ["caption"]
+    
+# Sampling configuration
+sampling:
+  weights: 
+    rgb: 1.0
+    text: 1.0
+    caption: 1.0 
