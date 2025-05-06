@@ -26,7 +26,17 @@ cd ml-4m
 pip install -r requirements.txt
 ```
 
-3. Download the pre-trained 4M-21_XL model (follow instructions in the main README.md).
+3. Download the pre-trained 4M-21_XL model and place it in the `ckpt` directory as `mcotmodel.safetensors`.
+
+4. Set up datasets and update configuration paths:
+
+```bash
+# Download all required datasets (VQAv2, MS-COCO, RichHF-18K, COCO-Stuff)
+python download_datasets.py
+
+# Update configuration files to use the new paths
+python update_paths.py
+```
 
 ## Project Structure
 
@@ -35,6 +45,8 @@ pip install -r requirements.txt
 - `fourm/models/mcot_generate.py`: MCOT generation implementation
 - `run_mcot_evaluation.py`: Evaluation script for MCOT model
 - `cfgs/`: Configuration files for MCOT training and post-training
+- `download_datasets.py`: Script to download and set up all required datasets
+- `update_paths.py`: Script to update configuration files with correct paths
 
 ## Usage
 
@@ -44,8 +56,8 @@ First, extend the 4M model's vocabulary to include the MCOT stage markers:
 
 ```bash
 python extend_vocabulary.py \
-  --checkpoint-path /path/to/4m-21-xl.pt \
-  --output-checkpoint-path /path/to/4m-21-xl-mcot.pt
+  --checkpoint-path ckpt/mcotmodel.safetensors \
+  --output-checkpoint-path ckpt/mcotmodel.safetensors
 ```
 
 ### 2. VQA Fine-tuning (Stage 1)
@@ -55,7 +67,7 @@ Fine-tune the model for Visual Question Answering using the VQAv2 dataset:
 ```bash
 python run_training_4m.py \
   --config cfgs/mcot_vqa_finetune.yaml \
-  --finetune /path/to/4m-21-xl-mcot.pt \
+  --finetune ckpt/mcotmodel.safetensors \
   --output_dir ./output/mcot_vqa_finetune
 ```
 
@@ -66,7 +78,7 @@ Train the model for all four MCOT stages using a mixture of datasets:
 ```bash
 python run_training_4m.py \
   --config cfgs/mcot_post_training.yaml \
-  --finetune ./output/mcot_vqa_finetune/checkpoint-best.pth \
+  --finetune ./output/mcot_vqa_finetune/checkpoint-best.safetensors \
   --output_dir ./output/mcot_post_training
 ```
 
@@ -76,20 +88,22 @@ Evaluate the model's performance on all four stages:
 
 ```bash
 python run_mcot_evaluation.py \
-  --checkpoint ./output/mcot_post_training/checkpoint-best.pth \
-  --vqa-dataset /path/to/vqav2/val \
-  --planning-dataset /path/to/mscoco/val \
-  --reflection-dataset /path/to/richhf18k/val \
-  --correction-dataset /path/to/cocostuff/val \
+  --checkpoint ./output/mcot_post_training/checkpoint-best.safetensors \
+  --vqa-dataset datasets/vqav2/val \
+  --planning-dataset datasets/mscoco/val \
+  --reflection-dataset datasets/richhf18k/val \
+  --correction-dataset datasets/cocostuff/val \
   --output-dir ./evaluation_results
 ```
 
 ## Datasets
 
-- **VQA Fine-tuning**: [VQAv2 dataset](https://visualqa.org/download.html)
-- **Planning**: [MS-COCO captions and bounding boxes](https://cocodataset.org/)
-- **Reflection**: [RichHF-18K artifact annotations](https://github.com/richzhang/PerceptualSimilarity)
-- **Correction**: [COCO-Stuff segmentation masks](https://github.com/nightrome/cocostuff)
+The `download_datasets.py` script will download and set up the following datasets:
+
+- **VQAv2 dataset**: For VQA fine-tuning (stored in `datasets/vqav2`)
+- **MS-COCO captions and bounding boxes**: For Planning (stored in `datasets/mscoco`)
+- **RichHF-18K artifact annotations**: For Reflection (stored in `datasets/richhf18k`)
+- **COCO-Stuff segmentation masks**: For Correction (stored in `datasets/cocostuff`)
 
 ## Configuration
 
@@ -99,6 +113,8 @@ The configuration files in the `cfgs/` directory control the model architecture,
 - `cfgs/data_vqa.yaml`: Dataset configuration for VQA
 - `cfgs/mcot_post_training.yaml`: Configuration for MCOT post-training
 - `cfgs/data_mcot.yaml`: Multi-task dataset configuration for MCOT
+
+The `update_paths.py` script ensures all configuration files use the correct paths for the model and datasets.
 
 ## Model Architecture
 

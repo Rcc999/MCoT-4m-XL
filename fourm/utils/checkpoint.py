@@ -95,10 +95,24 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, lo
 
     # Only create the save_dict on the main process, unless all_nodes is set to True
     if is_main_process() or (all_nodes and args.gpu == 0): 
+        # Save in safetensors format
+        checkpoint_safetensors_path = os.path.join(output_dir, f'checkpoint-{ckpt_name}.safetensors')
+        
+        # Save model weights in safetensors format with metadata
+        model_state_dict = model_without_ddp.state_dict()
+        
+        # Add metadata for epoch
+        metadata = {"epoch": str(epoch)}
+        
+        # Save using safetensors
+        from safetensors.torch import save_file
+        save_file(model_state_dict, checkpoint_safetensors_path, metadata=metadata)
+        
+        # Also save in PyTorch format for backward compatibility
         checkpoint_path = os.path.join(output_dir, f'checkpoint-{ckpt_name}.pth')
 
         to_save = {
-            'model': model_without_ddp.state_dict(),
+            'model': model_state_dict,
             'epoch': epoch,
             'args': args,
             'scaler': loss_scaler.state_dict(),
@@ -118,6 +132,10 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, lo
         if use_s3: 
             s3_path = os.path.join(args.s3_save_dir, f'checkpoint-{ckpt_name}.pth')
             save_on_s3(checkpoint_path, s3_path, args.s3_endpoint)
+            
+            # Also save safetensors format to S3
+            s3_safetensors_path = os.path.join(args.s3_save_dir, f'checkpoint-{ckpt_name}.safetensors')
+            save_on_s3(checkpoint_safetensors_path, s3_safetensors_path, args.s3_endpoint)
 
 
 def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, model_ema=None):
@@ -126,13 +144,17 @@ def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, mode
     if args.auto_resume and len(args.resume) == 0:
         import glob
         all_checkpoints = glob.glob(os.path.join(output_dir, 'checkpoint-*.pth'))
+        all_checkpoints.extend(glob.glob(os.path.join(output_dir, 'checkpoint-*.safetensors')))
         latest_ckpt = -1
         for ckpt in all_checkpoints:
             t = ckpt.split('-')[-1].split('.')[0]
             if t.isdigit():
                 latest_ckpt = max(int(t), latest_ckpt)
         if latest_ckpt >= 0:
-            args.resume = os.path.join(output_dir, 'checkpoint-%d.pth' % latest_ckpt)
+            if os.path.exists(os.path.join(output_dir, f'checkpoint-{latest_ckpt}.safetensors')):
+                args.resume = os.path.join(output_dir, f'checkpoint-{latest_ckpt}.safetensors')
+            else:
+                args.resume = os.path.join(output_dir, f'checkpoint-{latest_ckpt}.pth')
         print("Auto resume checkpoint: %s" % args.resume)
 
     if args.resume:
@@ -140,7 +162,13 @@ def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, mode
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu')
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            if args.resume.endswith('.safetensors'):
+                checkpoint_data, metadata = load_safetensors(args.resume)
+                checkpoint = {'model': checkpoint_data}
+                if 'epoch' in metadata:
+                    checkpoint['epoch'] = metadata['epoch']
+            else:
+                checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
         print("Resume checkpoint %s" % args.resume)
 

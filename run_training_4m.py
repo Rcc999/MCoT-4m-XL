@@ -477,7 +477,12 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.finetune, map_location='cpu')
         else:
-            checkpoint = torch.load(args.finetune, map_location='cpu')
+            if args.finetune.endswith('.safetensors'):
+                from fourm.utils import load_safetensors
+                checkpoint, config = load_safetensors(args.finetune)
+                checkpoint = {'model': checkpoint}
+            else:
+                checkpoint = torch.load(args.finetune, map_location='cpu')
 
         # Remove pos_emb
         # TODO: In the future, find a way to not have to store the pos_embs here

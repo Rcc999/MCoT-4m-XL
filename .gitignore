@@ -10,4 +10,4 @@ wandb/
 *.DS_Store
 tokenizer_ckpts/
 *pkl
-*.egg-info
+*.egg-infockpt/
