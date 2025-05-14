@@ -1,0 +1,28 @@
+train:
+  datasets:
+    vqav2:
+      type: huggingface
+      in_domains: rgb@224-caption
+      out_domains: caption
+      input_alphas: "1.0"
+      target_alphas: "1.0"
+      alphas_config: null
+      data_path: ./vqav2_data/vqa_dataset_wget
+      shuffle_buffer_load: 1_000
+  weights: [1.0]
+
+val:
+  datasets:
+    vqav2:
+      type: huggingface
+      in_domains: rgb@224-caption
+      out_domains: caption
+      data_path: ./vqav2_data/vqa_dataset_wget
+
+transform_keys:
+  - normal
+
+extras:
+  text_to_caption: false
+  insert_sep_between_answers: true
+  insert_image_at_beginning: true
