@@ -61,9 +61,9 @@ srun --label bash -c "
   torchrun \${TORCHRUN_ARGS} run_training_4m.py \
     --config \${CONFIG_FILE} \
     --output_dir outputs/mcot_training \
-    --batch_size 32 \
+    --batch_size 2 \
     --accum_iter 2 \
-    --epochs 20 \
+    --epochs 1 \
     --blr 3e-5 \
     --log_wandb \
     --wandb_entity \${WANDB_ENTITY} \

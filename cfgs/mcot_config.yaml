@@ -1,0 +1,113 @@
+# Configuration for MCoT Planning and Acting stages using MS-COCO
+#
+# This configuration defines the dataset and training parameters
+# for the first two stages of MCoT: Planning and Acting
+
+defaults:
+  - default/training
+
+# Input image size
+input_size: 224
+
+# Token budgets for model inputs and outputs
+num_input_tokens: 2048
+num_target_tokens: 512
+min_input_tokens: 512  
+min_target_tokens: 128
+
+# Text tokenizer with MCoT special tokens
+text_tokenizer_path: "tokenizers/mcot_tokenizer.json"
+
+# Model checkpoint (4M-XL-21 base model from Hugging Face)
+model_path: "EPFL-VILAB/4M-21_XL"  # HuggingFace model ID for 4M-XL-21
+
+# Data configuration for the two MCoT stages
+train:
+  datasets:
+    coco_planning:
+      type: "webdataset"
+      data_path: "data/coco_mcot_shards/planning_train/{00000..00099}.tar"
+      in_domains: "caption-rgb@224"
+      out_domains: "caption-det"
+      epoch_size: 100000
+      hflip: true
+      crop_scale: [0.5, 1.0]
+      crop_ratio: [0.75, 1.33]
+      wds_shuffle_buffer_tar: 1000
+      wds_shuffle_buffer_repeat: 5000
+      
+    coco_acting:
+      type: "webdataset"
+      data_path: "data/coco_mcot_shards/acting_train/{00000..00099}.tar"
+      in_domains: "caption-rgb@224"
+      out_domains: "caption"
+      epoch_size: 100000
+      hflip: true
+      crop_scale: [0.5, 1.0]
+      crop_ratio: [0.75, 1.33]
+      wds_shuffle_buffer_tar: 1000
+      wds_shuffle_buffer_repeat: 5000
+      
+  # Equal weights for Planning and Acting
+  weights: [0.5, 0.5]
+
+# Validation configurations
+val:
+  datasets:
+    coco_planning_val:
+      type: "webdataset"
+      data_path: "data/coco_mcot_shards/planning_val/{00000..00005}.tar"
+      in_domains: "caption-rgb@224"
+      out_domains: "caption-det"
+      epoch_size: 5000
+      hflip: false
+      
+    coco_acting_val:
+      type: "webdataset"
+      data_path: "data/coco_mcot_shards/acting_val/{00000..00005}.tar"
+      in_domains: "caption-rgb@224"
+      out_domains: "caption"
+      epoch_size: 5000
+      hflip: false
+      
+  weights: [0.5, 0.5]
+
+# Modality information
+modality_info:
+  rgb@224:
+    type: img
+    num_channels: 3
+    input_size: 224
+    max_tokens: 256
+    is_input_modality: true
+    
+  caption:
+    type: seq
+    max_tokens: 512
+    token_type: text
+    is_input_modality: true
+    is_output_modality: true
+    
+  det:
+    type: seq
+    max_tokens: 256
+    token_type: text
+    coord_bins: 1000
+    is_output_modality: true
+
+# Training parameters
+batch_size: 32
+gradient_accumulation_steps: 2
+learning_rate: 3e-5
+weight_decay: 0.01
+warmup_steps: 1000
+max_steps: 100000
+save_steps: 5000
+eval_steps: 5000
+
+# LoRA parameters for efficient fine-tuning
+use_lora: true
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1
+lora_target_modules: ["query", "value"] 
