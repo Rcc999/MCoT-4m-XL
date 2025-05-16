@@ -1,0 +1,152 @@
+# Configuration for MCoT datasets (Planning and Acting using MS-COCO)
+#
+# NOTES:
+# 1. You MUST replace placeholder paths like '/path/to/your/...' with actual
+#    paths to your preprocessed WebDataset shards for COCO.
+# 2. The in_domains and out_domains specify the modalities used for input and output
+#    for each stage. These names MUST correspond to keys in modality_info.py
+#    (e.g., 'caption', 'det', 'rgb@224').
+# 3. The `load_and_preprocess_*_sample` functions in `unified_datasets.py` prepare
+#    data with keys like 'caption', 'rgb@224', 'mcot_target_for_caption', 'mcot_target_for_det'.
+#    `UnifiedMasking` needs to correctly interpret these for input and target processing
+#    based on the MCoT stage and these in_domains/out_domains.
+#    If 'caption' is in in_domains, the 'caption' field from the sample is input.
+#    If 'caption' is in out_domains, 'mcot_target_for_caption' is used as its target.
+#    If 'det' is in out_domains, 'mcot_target_for_det' is used as its target.
+#    This interaction is CRITICAL and might need adjustment in unified_datasets.py or UnifiedMasking.
+
+defaults:
+  - default/training
+
+# Input image size
+input_size: 224
+
+# Token budgets for model inputs and outputs
+num_input_tokens: 2048
+num_target_tokens: 512
+min_input_tokens: 512  # Minimum input token budget (for variable budget training)
+min_target_tokens: 128  # Minimum target token budget (for variable budget training)
+
+# Text tokenizer (should have MCoT tokens added during setup)
+text_tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json" # Path to your tokenizer (will be updated with MCoT tokens)
+
+# Data configuration
+train:
+  datasets:
+    coco_planning:
+      type: "huggingface"
+      data_path: "shunk031/MSCOCO"
+      year: 2017  # Or 2014 if preferred
+      coco_task: ["captions", "instances"]  # Need both for planning
+      in_domains: "caption-rgb@224"
+      out_domains: "caption-det"
+      epoch_size: 200000
+      # Other HF-specific settings
+      hflip: true
+      crop_scale: [0.5, 1.0]
+      crop_ratio: [0.75, 1.33]
+      # MCoT Planning specific settings
+      image_file_key: "image.jpg"
+      caption_prompt_key: "caption_prompt.txt"
+      target_plan_text_key: "target_plan_text.txt"
+      bbox_json_key: "bboxes.json"
+      wds_shuffle_buffer_tar: 1000
+      wds_shuffle_buffer_repeat: 5000
+      
+    coco_acting:
+      type: "huggingface"
+      data_path: "shunk031/MSCOCO"
+      year: 2017
+      coco_task: ["captions", "instances"]
+      in_domains: "caption-rgb@224"
+      out_domains: "caption"
+      epoch_size: 200000
+      hflip: true
+      crop_scale: [0.5, 1.0]
+      crop_ratio: [0.75, 1.33]
+      # MCoT Acting specific settings
+      image_file_key: "image.jpg"
+      plan_text_key: "plan_text.txt"
+      plan_bboxes_json_key: "plan_bboxes.json"
+      target_final_caption_key: "target_final_caption.txt"
+      wds_shuffle_buffer_tar: 1000
+      wds_shuffle_buffer_repeat: 5000
+      
+  # Dataset sampling weights (must match order of datasets above)
+  weights: [0.5, 0.5]  # Equal weights for Planning and Acting
+
+# Validation configurations
+val:
+  datasets:
+    # Similar structure as train datasets but with smaller epoch_size
+    coco_planning_val:
+      type: "huggingface"
+      data_path: "shunk031/MSCOCO"
+      year: 2017
+      coco_task: ["captions", "instances"]
+      in_domains: "caption-rgb@224"
+      out_domains: "caption-det"
+      epoch_size: 5000
+      # Validation typically doesn't use augmentation
+      hflip: false
+      # Split setting
+      split: "validation"
+      
+    coco_acting_val:
+      type: "huggingface"
+      data_path: "shunk031/MSCOCO"
+      year: 2017
+      coco_task: ["captions", "instances"]
+      in_domains: "caption-rgb@224"
+      out_domains: "caption"
+      epoch_size: 5000
+      hflip: false
+      split: "validation"
+      
+  weights: [0.5, 0.5]
+
+# Modality information
+modality_info:
+  rgb@224:
+    type: img
+    num_channels: 3
+    input_size: 224
+    max_tokens: 256  # For Vision Transformer, patch size 14x14
+    is_input_modality: true
+    
+  caption:
+    type: seq
+    max_tokens: 512
+    token_type: text
+    is_input_modality: true
+    is_output_modality: true
+    
+  det:
+    type: seq
+    max_tokens: 256
+    token_type: text  # Shares text tokenizer for category names
+    coord_bins: 1000  # Number of bins for coordinates
+    is_output_modality: true
+
+# Training parameters
+batch_size: 32
+gradient_accumulation_steps: 2
+learning_rate: 3e-5
+weight_decay: 0.01
+warmup_steps: 1000
+max_steps: 100000
+save_steps: 5000
+eval_steps: 5000
+
+# Example of other MCoT datasets you might have (e.g., for Reflection, Correction)
+# richhf_reflection:
+#   type: "mcot_reflection"
+#   data_path: "/path/to/your/richhf18k_reflection_shards"
+#   in_domains: "..."
+#   out_domains: "..."
+# cocostuff_correction:
+#   type: "mcot_correction"
+#   data_path: "/path/to/your/cocostuff_correction_shards"
+#   in_domains: "..."
+#   out_domains: "..."
+#   ... 

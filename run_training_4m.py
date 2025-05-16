@@ -31,12 +31,19 @@ import yaml
 from tokenizers import Tokenizer
 
 import fourm.utils as utils
-from fourm.data import build_mixture_dataloader, get_train_dataloader, get_val_dataloader, setup_sampling_mod_info
+from fourm.data import (
+    build_mixture_dataloader,
+    get_val_dataloader, 
+    setup_sampling_mod_info,
+    EmptyAugmenter,
+)
+from fourm.data.pretrain_utils import get_train_dataloader as get_pretrain_default_train_dataloader
 from fourm.data.unified_datasets import (
     get_mcot_planning_data_pipeline,
     get_mcot_acting_data_pipeline,
     get_mcot_reflection_data_pipeline,
     get_mcot_correction_data_pipeline,
+    get_train_dataloader as get_mcot_unified_train_dataloader,
     UnifiedMasking,
 )
 from fourm.models import fm
@@ -227,6 +234,13 @@ def get_args():
     parser.add_argument('--wandb_run_name', default='auto', type=str,
                         help='Run name on wandb')
 
+    # Add new arguments for local debugging
+    parser.add_argument('--local_debug', action='store_true',
+                        help='Run in local debug mode: disables DDP, overrides some args for quick testing.')
+    parser.add_argument('--local_batch_size', type=int, default=2, 
+                        help="Batch size to use when --local_debug is active (overrides --batch_size).")
+    parser.add_argument('--local_output_dir', type=str, default="tmp_local_output",
+                        help="Output directory for local debug mode.")
 
     # Parse config file if there is one
     args_config, remaining = config_parser.parse_known_args()
@@ -269,8 +283,7 @@ def setup_data(args):
 
     # Load text tokenizer
     print(f"Loading text tokenizer from: {args.text_tokenizer_path}")
-    if not os.path.exists(args.text_tokenizer_path):
-        args.text_tokenizer_path = utils.s3_download_file(args.s3_endpoint, args.text_tokenizer_path, args.output_dir)
+    # args.text_tokenizer_path = utils.s3_download_file(args.s3_endpoint, args.text_tokenizer_path, args.output_dir)
     text_tokenizer = Tokenizer.from_file(args.text_tokenizer_path)
     mcot_special_tokens = ["[PLANNING_START]", "[ACTING_START]", "[REFLECTION_START]", "[CORRECTION_START]"]
     num_added_toks = text_tokenizer.add_special_tokens(mcot_special_tokens)
@@ -286,14 +299,17 @@ def setup_data(args):
     # Example:
     # image_vqvae_tokenizer_path = getattr(args, 'image_vqvae_tokenizer_path', None)
     # semantic_seg_vqvae_tokenizer_path = getattr(args, 'semantic_seg_vqvae_tokenizer_path', None)
-    image_vqvae_tokenizer = None # Replace with actual loading
-    semantic_seg_vqvae_tokenizer = None # Replace with actual loading
+    image_vqvae_tokenizer = None # Replace with actual loading if specific MCoT WDS paths are used
+    semantic_seg_vqvae_tokenizer = None # Replace with actual loading if specific MCoT WDS paths are used
     # if image_vqvae_tokenizer_path:
     #     print(f"Loading image VQ-VAE tokenizer from: {image_vqvae_tokenizer_path}")
     #     # image_vqvae_tokenizer = YourImageVQVAELoader(image_vqvae_tokenizer_path)
     # if semantic_seg_vqvae_tokenizer_path:
     #     print(f"Loading semantic segmentation VQ-VAE tokenizer from: {semantic_seg_vqvae_tokenizer_path}")
     #     # semantic_seg_vqvae_tokenizer = YourSemanticVQVAELoader(semantic_seg_vqvae_tokenizer_path)
+
+    # Define a default image augmenter for WDS MCoT pipelines if not specified otherwise
+    image_augmenter_for_wds_mcot = EmptyAugmenter() # Or more sophisticated based on config
 
 
     print(f"Loading data config from: {args.data_config}")
@@ -315,95 +331,125 @@ def setup_data(args):
     shards_per_dataset = [] 
 
     # Define a map for MCoT pipeline functions or use if/elif
-    DATA_LOADER_FN_MAP = {
+    DATA_LOADER_FN_MAP_MCOT_SPECIFIC = {
         "mcot_planning": get_mcot_planning_data_pipeline,
         "mcot_acting": get_mcot_acting_data_pipeline,
         "mcot_reflection": get_mcot_reflection_data_pipeline,
         "mcot_correction": get_mcot_correction_data_pipeline,
-        "default_train": get_train_dataloader, # For VQA or other non-MCoT tasks
     }
 
     for dataset_name, dataset_cfg in train_config.items():
         print(f'Setting up dataset {dataset_name} / train')
+        
+        # Calculate all_domains for this specific dataset_cfg
+        current_in_domains = sorted(dataset_cfg['in_domains'].split('-'))
+        current_out_domains = sorted(dataset_cfg['out_domains'].split('-'))
+        current_all_domains = sorted(list(set(current_in_domains) | set(current_out_domains)))
+
         dataset_mod_info, sampling_weights = setup_sampling_mod_info(dataset_cfg, modality_info)
         
-        # Determine which dataloader function to use
-        # Assumes dataset_cfg has a 'type' field like "mcot_planning", "vqa", etc.
-        # Or uses a 'data_loader_fn_name' as suggested in YAML example
-        loader_fn_key = dataset_cfg.get("type", "default_train") 
-        # Fallback to "default_train" if type is not MCoT specific or not defined
-        if loader_fn_key not in DATA_LOADER_FN_MAP:
-            print(f"Warning: No specific loader for type '{loader_fn_key}', falling back to default_train for {dataset_name}.")
-            loader_fn_key = "default_train"
-        
-        loader_fn = DATA_LOADER_FN_MAP[loader_fn_key]
-        
-        common_loader_args = {
-            "data_path": dataset_cfg['data_path'], # Specific to MCoT loaders, get_train_dataloader uses dataset_config
-            "text_tokenizer": text_tokenizer,
-            "modality_info": dataset_mod_info, # Or modality_info if MCoT loaders expect the global one
-            "image_augmenter": None, # Initialize your image augmenter, pass if needed
-            "input_tokens_range": (args.min_input_tokens, args.num_input_tokens),
-            "target_tokens_range": (args.min_target_tokens, args.num_target_tokens),
-            "num_gpus": args.num_tasks, # Renamed from num_tasks in some stubs
-            "num_workers": args.num_workers,
-            "batch_size": args.batch_size, # MCoT loaders might take this directly
-            "epoch_size": args.epoch_size, # MCoT loaders might take this directly
-        }
+        dataset_type = dataset_cfg.get("type")
+        dataiter = None
 
-        if loader_fn_key == "default_train":
-            dataiter = loader_fn(
-                dataset_config=dataset_cfg, modality_info=dataset_mod_info, 
-                sampling_weights=sampling_weights, text_tokenizer=text_tokenizer, input_size=args.input_size, 
-                num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens,
-                min_input_tokens=args.min_input_tokens, min_target_tokens=args.min_target_tokens,
-                num_tasks=args.num_tasks, num_workers=args.num_workers, 
-                dataset_batch_size=None, # build_mixture_dataloader handles final batch_size
-                epoch_size=None # build_mixture_dataloader handles final epoch_size
+        if dataset_type == "huggingface": # For MCoT datasets specified via Hugging Face
+            print(f"Using MCoT unified dataloader for Hugging Face dataset: {dataset_name}")
+            dataiter = get_mcot_unified_train_dataloader(
+                config=dataset_cfg, # Contains data_path, year, coco_task, mcot_task_type etc.
+                all_domains=current_all_domains,
+                modality_info=dataset_mod_info,
+                text_tokenizer=text_tokenizer,
+                input_size=args.input_size,
+                num_input_tokens=args.num_input_tokens,
+                num_target_tokens=args.num_target_tokens,
+                min_input_tokens=args.min_input_tokens,
+                min_target_tokens=args.min_target_tokens,
+                num_gpus=args.num_tasks,
+                num_workers=args.num_workers,
+                batch_size=None, # For mixture dataloader (unbatched)
+                epoch_size=None, # For mixture dataloader (unbatched)
             )
-        elif loader_fn_key == "mcot_planning":
-             dataiter = loader_fn(**common_loader_args) # image_vqvae_tokenizer not typically needed for planning text/bbox
-        elif loader_fn_key == "mcot_acting":
-            dataiter = loader_fn(image_vqvae_tokenizer=image_vqvae_tokenizer, **common_loader_args)
-        elif loader_fn_key == "mcot_reflection":
-            dataiter = loader_fn(semantic_seg_vqvae_tokenizer=semantic_seg_vqvae_tokenizer, **common_loader_args)
-        elif loader_fn_key == "mcot_correction":
-            dataiter = loader_fn(image_vqvae_tokenizer=image_vqvae_tokenizer, **common_loader_args)
+        elif dataset_type in DATA_LOADER_FN_MAP_MCOT_SPECIFIC:
+            loader_fn = DATA_LOADER_FN_MAP_MCOT_SPECIFIC[dataset_type]
+            print(f"Using MCoT specific pipeline '{dataset_type}' for {dataset_name} (likely WDS-based)")
+            
+            mcot_pipeline_args = {
+                "data_path": dataset_cfg['data_path'],
+                "all_domains": current_all_domains,
+                "modality_info": dataset_mod_info,
+                "text_tokenizer": text_tokenizer,
+                "image_augmenter": image_augmenter_for_wds_mcot, # Use defined augmenter
+                "input_tokens_range": (args.min_input_tokens, args.num_input_tokens),
+                "target_tokens_range": (args.min_target_tokens, args.num_target_tokens),
+                "num_gpus": args.num_tasks, 
+                "num_workers": args.num_workers,
+                "batch_size": None, # For mixture dataloader (unbatched)
+                "epoch_size": None, # For mixture dataloader (unbatched)
+                "shuffle_buffer_load": dataset_cfg.get('wds_shuffle_buffer_tar', 1_000),
+                "n_repeats": dataset_cfg.get('wds_n_repeats', 1),
+            }
+            
+            # Add specific VQVAE tokenizers if required by the MCoT stage
+            if dataset_type == "mcot_acting":
+                mcot_pipeline_args["image_vqvae_tokenizer"] = image_vqvae_tokenizer
+            elif dataset_type == "mcot_reflection":
+                mcot_pipeline_args["semantic_seg_vqvae_tokenizer"] = semantic_seg_vqvae_tokenizer
+            elif dataset_type == "mcot_correction": # Assuming correction might also use image_vqvae_tokenizer
+                 mcot_pipeline_args["image_vqvae_tokenizer"] = image_vqvae_tokenizer
+            
+            dataiter = loader_fn(**mcot_pipeline_args)
+        else: # Fallback to general pretraining loader (from pretrain_utils)
+            print(f"Warning: Dataset type '{dataset_type}' (or not specified) for '{dataset_name}' not handled by MCoT specific loaders. Falling back to pretrain_utils default loader.")
+            dataiter = get_pretrain_default_train_dataloader(
+                dataset_config=dataset_cfg, 
+                modality_info=dataset_mod_info, 
+                sampling_weights=sampling_weights, 
+                text_tokenizer=text_tokenizer, 
+                input_size=args.input_size, 
+                num_input_tokens=args.num_input_tokens, 
+                num_target_tokens=args.num_target_tokens,
+                min_input_tokens=args.min_input_tokens, 
+                min_target_tokens=args.min_target_tokens,
+                num_tasks=args.num_tasks, 
+                num_workers=args.num_workers,
+                dataset_batch_size=None, # For mixture dataloader (unbatched)
+                epoch_size=None # For mixture dataloader (unbatched)
+            )
+        
+        if dataiter is not None:
+            train_iters.append(dataiter)
+            if hasattr(dataiter, 'n_shards'): # WebDataset typically has this
+                shards_per_dataset.append(dataiter.n_shards)
+            elif isinstance(dataiter, list) and not dataiter: # Empty list from STUB
+                print(f"Warning: Data iterator for {dataset_name} is an empty list. Training may fail if weights are non-zero.")
         else:
-            # Should not happen due to fallback logic, but as a safeguard
-            raise ValueError(f"Unknown data loader type for {dataset_name}: {loader_fn_key}")
-
-        train_iters.append(dataiter)
-        if hasattr(dataiter, 'n_shards'): # WebDataset typically has this
-            shards_per_dataset.append(dataiter.n_shards)
-        elif isinstance(dataiter, list) and not dataiter: # Empty list from STUB
-             print(f"Warning: Data iterator for {dataset_name} is an empty list (likely a STUB). Training may fail if weights are non-zero.")
-             # Optionally, don't add to shards_per_dataset or handle appropriately
-        # else: HuggingFace dataset might not have n_shards in the same way
+            # This case should ideally not be reached if fallbacks are robust.
+             print(f"ERROR: Failed to create a data iterator for dataset {dataset_name} with type '{dataset_type}'. Check configuration and loader logic.")
+             # Consider raising an error here if a data iterator is crucial and not created.
+             # For now, it will result in an empty train_iters list if all fail, handled later.
 
     num_workers = min(min(shards_per_dataset), args.num_workers) if shards_per_dataset else args.num_workers
     
     # Filter out empty iterators from STUBS before passing to MixtureDataset
     # This is a temporary fix. Real iterators should be returned by pipeline functions.
-    valid_train_iters = [it for it in train_iters if not (isinstance(it, list) and not it)]
-    if len(valid_train_iters) != len(train_iters):
-        print("WARNING: Some MCoT data pipelines are STUBS and returned empty iterators. They will be excluded from the mixture.")
-        # Adjust weights accordingly if you have a sophisticated setup.
-        # For now, MixtureDataset will fail if it gets an empty list of iterators and non-zero weights.
-        # A simple fix: if valid_train_iters is empty but weights are not, this will error later.
-        # Ensure your YAML weights correspond to the *actual* number of loaders you expect to run.
-
-    weights = data_config['train'].get('weights', [1.0] * len(valid_train_iters)) # Adjust weights if iterators were skipped
-    if len(weights) != len(valid_train_iters) and valid_train_iters:
+    valid_train_iters = [it for it in train_iters if not (isinstance(it, list) and not it)] # Keep existing filter for stubs
+    if not valid_train_iters and any(w > 0 for w in data_config['train'].get('weights', [])):
+        # If all iters failed or were stubs, but weights were specified, this is an issue.
+        raise ValueError("No valid data iterators found (or all were STUBs), but weights are specified. Check MCoT pipeline implementations and dataset configurations.")
+    elif not valid_train_iters:
+        print("Warning: No valid data iterators to train on. Data loader train will be empty.")
+        # build_mixture_dataloader might handle an empty list of iterators if weights are also empty or not provided.
+    
+    weights = data_config['train'].get('weights', [])
+    if len(weights) != len(valid_train_iters) and valid_train_iters: # Adjust weights if iterators were skipped or if mismatch
         print(f"Warning: Number of weights ({len(weights)}) does not match number of valid data iterators ({len(valid_train_iters)}). Using equal weights for valid iterators.")
         weights = [1.0] * len(valid_train_iters)
-    elif not valid_train_iters and any(w > 0 for w in weights):
-         raise ValueError("No valid data iterators found, but weights are specified. Check MCoT pipeline stubs.")
-    elif not valid_train_iters:
-        print("Warning: No valid data iterators to train on.")
-        # Handle this case: maybe raise error, or return None for data_loader_train if this is acceptable.
-        # For now, build_mixture_dataloader might handle an empty list of iterators if weights are also empty or not provided.
-        
+    elif not valid_train_iters and not weights: # No iterators, no weights, this is fine.
+        print("No data iterators and no weights specified. Training will proceed with no data if epoch_size is not 0.")
+        weights = [] # Ensure weights is an empty list for build_mixture_dataloader
+    elif not valid_train_iters and any(w > 0 for w in weights): # Should be caught by the earlier ValueError
+         raise ValueError("No valid data iterators found, but weights are specified. Check MCoT pipeline stubs and configurations.")
+
+
     epoch_size = args.epoch_size
     # Ensure UnifiedMasking is used as the collate_fn in build_mixture_dataloader or that
     # individual MCoT pipelines are already structured to output what the model expects
@@ -528,11 +574,63 @@ def get_model(args, modality_info):
 
 
 def main(args):
-    ## Distributed init
-    utils.init_distributed_mode(args)
+    ## Distributed init / Local debug mode setup
+    if args.local_debug:
+        args.distributed = False
+        args.rank = 0
+        args.world_size = 1
+        args.num_tasks = 1 # Crucial for data loaders and other logic expecting world_size
+        
+        if args.device == 'cuda' and not torch.cuda.is_available():
+            print("Local Debug: CUDA not available, switching to CPU.")
+            args.device = 'cpu'
+        # No DDP-specific args.gpu needed for local mode if DDP is disabled
+        
+        print(f"Running in LOCAL DEBUG mode on device: {args.device}. Distributed training disabled.")
+        
+        # Override critical args for a quick local test
+        args.epochs = 1
+        args.num_workers = 0  # Often better for debugging
+        # Use the dedicated local_batch_size, falling back to the general batch_size if not specified by user in local_debug
+        args.batch_size = args.local_batch_size if hasattr(args, 'local_batch_size') else args.batch_size 
+        args.output_dir = args.local_output_dir if hasattr(args, 'local_output_dir') else "tmp_local_output"
+        args.log_wandb = False
+
+        # Adjust epoch_size for local run. If epoch_size is in config, scale it.
+        # Otherwise, set a small default for a few steps.
+        if hasattr(args, 'epoch_size') and args.epoch_size is not None:
+            original_epoch_size_from_config = args.epoch_size
+            # For local debug, we assume epoch_size from config is total samples.
+            # No need to divide by num_tasks here as it's already a single task.
+            # We might want to make it smaller just for testing, e.g. ensure it's at least a few batches.
+            args.epoch_size = max(args.batch_size * 2, original_epoch_size_from_config // 10 if original_epoch_size_from_config > args.batch_size * 20 else original_epoch_size_from_config) 
+            args.epoch_size = min(args.epoch_size, original_epoch_size_from_config) # Don't exceed original
+            print(f"Local Debug: Original epoch_size from config={original_epoch_size_from_config}, using adjusted epoch_size={args.epoch_size} for local run.")
+        else:
+            args.epoch_size = args.batch_size * 5 # Default to 5 steps if not set in config
+            print(f"Local Debug: epoch_size not in config, setting to {args.epoch_size} for a few steps.")
+
+
+        print(f"Local Debug Overrides: epochs={args.epochs}, num_workers={args.num_workers}, batch_size={args.batch_size}, output_dir='{args.output_dir}', log_wandb={args.log_wandb}, effective_epoch_size={args.epoch_size}")
+        # Ensure output directory exists for local run
+        if args.output_dir:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            
+    else:
+        utils.init_distributed_mode(args)
+        # args.num_tasks is set to world_size by init_distributed_mode or should be.
+        # If not, ensure it here:
+        if hasattr(utils, 'get_world_size'):
+             args.num_tasks = utils.get_world_size()
+        else: # Fallback if the util is not as expected
+             args.num_tasks = 1 
+             if torch.distributed.is_initialized():
+                 args.num_tasks = torch.distributed.get_world_size()
+    
     device = torch.device(args.device)
     
-    seed = args.seed + utils.get_rank()
+    # utils.get_rank() will be 0 if not DDP initialized via utils.init_distributed_mode
+    seed = args.seed + utils.get_rank() 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -550,10 +648,8 @@ def main(args):
     else:
         raise ValueError(f"Invalid dtype: {args.dtype}")
     
-    # Distributed training variables
-    num_tasks = utils.get_world_size()
-    args.num_tasks = num_tasks
-    global_rank = utils.get_rank()
+    # global_rank is used for logging, ensure it's 0 for local debug
+    global_rank = args.rank if hasattr(args, 'rank') else 0 # Should be set by now either way
     
     ## Data
     modality_info, data_loader_train, num_training_steps_per_epoch, data_loaders_val, data_loaders_fixed_eval = setup_data(args)
@@ -562,52 +658,54 @@ def main(args):
     model = get_model(args, modality_info)
 
     # Logger
-    if global_rank == 0 and args.log_wandb:
+    # Use global_rank for conditional logging
+    if global_rank == 0 and args.log_wandb: 
         log_writer = utils.WandbLogger(args)
     else:
         log_writer = None
 
     ## Training phases / epochs
-    if args.epochs < 0:
-        if args.total_tokens < 0:
-            print("Epochs and total tokens are both set to negative values, stopping training.")
-            exit(1)
-        else:
-            train_dataset_size = args.epoch_size # or len(dataset_train)
-            args.epochs = math.ceil(args.total_tokens * 1e9 / ((args.num_input_tokens + args.num_target_tokens) * train_dataset_size))
-            print(f"Total tokens: {args.total_tokens}B")
-            print(f"Setting the number of epochs accordingly to {args.epochs}")
-    elif args.total_tokens > 0:
-        print("Epochs and total tokens are both non-negative, stopping training.")
-        exit(1)
+    if not args.local_debug: # Only do these complex calculations if not in local_debug
+        if args.epochs < 0:
+            if args.total_tokens < 0:
+                print("Epochs and total tokens are both set to negative values, stopping training.")
+                sys.exit(1) # Changed from exit(1) to sys.exit(1) for clarity
+            else:
+                train_dataset_size = args.epoch_size # or len(dataset_train)
+                args.epochs = math.ceil(args.total_tokens * 1e9 / ((args.num_input_tokens + args.num_target_tokens) * train_dataset_size))
+                print(f"Total tokens: {args.total_tokens}B")
+                print(f"Setting the number of epochs accordingly to {args.epochs}")
+        elif args.total_tokens > 0:
+            print("Epochs and total tokens are both non-negative, stopping training.")
+            sys.exit(1) # Changed
 
-    # Warmup
-    if args.warmup_epochs < 0 and args.warmup_steps < 0:
-        if args.warmup_tokens < 0:
-            print("Warmup epochs, steps and total tokens all set to negative values, stopping training.")
-            exit(1)
-        else:
-            args.warmup_steps = math.ceil(args.warmup_tokens * 1e9 / ((args.num_input_tokens + args.num_target_tokens) * args.batch_size * utils.get_world_size()))
+        # Warmup
+        if args.warmup_epochs < 0 and args.warmup_steps < 0:
+            if args.warmup_tokens < 0:
+                print("Warmup epochs, steps and total tokens all set to negative values, stopping training.")
+                sys.exit(1) # Changed
+            else:
+                args.warmup_steps = math.ceil(args.warmup_tokens * 1e9 / ((args.num_input_tokens + args.num_target_tokens) * args.batch_size * args.num_tasks)) # utils.get_world_size() became args.num_tasks
 
-    # Cooldown
-    if args.cooldown_epochs < 0 and args.cooldown_steps < 0:
-        if args.cooldown_tokens < 0 and args.lr_schedule in ['inverse_sqrt']:
-            print("Cooldown epochs, steps and total tokens all set to negative values, stopping training.")
-            exit(1)
+        # Cooldown
+        if args.cooldown_epochs < 0 and args.cooldown_steps < 0:
+            if args.cooldown_tokens < 0 and args.scheduler in ['inverse_sqrt']: # Fixed variable name lr_schedule to scheduler
+                print("Cooldown epochs, steps and total tokens all set to negative values, stopping training.")
+                sys.exit(1) # Changed
+            else:
+                args.cooldown_steps = math.ceil(args.cooldown_tokens * 1e9 / ((args.num_input_tokens + args.num_target_tokens) * args.batch_size * args.num_tasks)) # utils.get_world_size() became args.num_tasks
+        
+        # Frozen
+        if args.frozen_model_epochs <= 0:
+            if args.frozen_model_tokens > 0:
+                train_dataset_size = args.epoch_size # or len(dataset_train)
+                args.frozen_model_epochs = math.ceil(args.frozen_model_tokens * 1e9 / ((args.num_input_tokens + args.num_target_tokens) * train_dataset_size))
+            # else: # Removed print("No frozen models during training.") to match original structure if epochs is 0
         else:
-            args.cooldown_steps = math.ceil(args.cooldown_tokens * 1e9 / ((args.num_input_tokens + args.num_target_tokens) * args.batch_size * utils.get_world_size()))
-    
-    # Frozen
-    if args.frozen_model_epochs <= 0:
-        if args.frozen_model_tokens > 0:
-            train_dataset_size = args.epoch_size # or len(dataset_train)
-            args.frozen_model_epochs = math.ceil(args.frozen_model_tokens * 1e9 / ((args.num_input_tokens + args.num_target_tokens) * train_dataset_size))
-        else:
-            print("No frozen models during training.")
-    else:
-        if args.frozen_model_tokens > 0:
-            print("Frozen_model_epochs and frozen_model_tokens are both non-negative, stopping training.")
-            exit(1)
+            if args.frozen_model_tokens > 0:
+                print("Frozen_model_epochs and frozen_model_tokens are both non-negative, stopping training.")
+                sys.exit(1) # Changed
+    # else: for local_debug, epochs is already 1, skip these complex calculations
 
     print(args)
 
@@ -619,61 +717,115 @@ def main(args):
         else:
             checkpoint = torch.load(args.finetune, map_location='cpu')
 
-        # Remove pos_emb
-        # TODO: In the future, find a way to not have to store the pos_embs here
-        checkpoint['model'] = {k: v for k, v in checkpoint['model'].items() if ".pos_emb" not in k}
+        checkpoint_model = checkpoint.get('model_ema', checkpoint.get('model', checkpoint)) # Handle EMA models
+        if 'model' not in checkpoint and 'model_ema' not in checkpoint and 'state_dict' in checkpoint: # More robust checkpoint key search
+            checkpoint_model = checkpoint['state_dict']
+        
+        # Remove pos_emb if they cause size mismatches
+        # It's better to handle this inside model.load_state_dict if possible, or make it configurable
+        # For now, retain original logic but be aware of its potential issues.
+        # checkpoint_model = {k: v for k, v in checkpoint_model.items() if ".pos_emb" not in k}
 
-        msg = model.load_state_dict(checkpoint['model'], strict=False)
-        print(msg)
+
+        # Create a new state_dict that only contains keys present in the current model
+        model_state_dict = model.state_dict()
+        filtered_checkpoint_model = {}
+        for k, v in checkpoint_model.items():
+            if k in model_state_dict and model_state_dict[k].shape == v.shape:
+                filtered_checkpoint_model[k] = v
+            elif k.replace("module.", "") in model_state_dict and model_state_dict[k.replace("module.","")].shape == v.shape: # Handle DDP prefix
+                filtered_checkpoint_model[k.replace("module.","")] = v
+            else:
+                print(f"Skipping layer {k} from checkpoint due to mismatch or absence in current model.")
+
+
+        msg = model.load_state_dict(filtered_checkpoint_model, strict=False)
+        print(f"Loaded finetuning checkpoint from {args.finetune}. Load message: {msg}")
+
 
     model.to(device)
-    model_without_ddp = model
+    model_without_ddp = model # Start with model_without_ddp as the base model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print(f"Model = %s" % str(model_without_ddp))
+    print(f"Model = %s" % str(model_without_ddp)) # Log the model structure
     print(f"Number of params: {n_parameters / 1e6} M")
 
-    batch_size_no_accum = args.batch_size * utils.get_world_size()
-    total_batch_size = args.batch_size * args.accum_iter * utils.get_world_size()
-    args.lr = args.blr * total_batch_size / 256
-    args.min_lr = args.min_blr * total_batch_size / 256
-    if args.frozen_model_blr > 0:
-        args.frozen_model_lr = args.frozen_model_blr * total_batch_size / 256
-    else:
-        args.frozen_model_lr = args.blr * total_batch_size / 256
+    # batch_size_no_accum is batch_size per GPU * num_gpus
+    # For local_debug, num_tasks (world_size) is 1.
+    batch_size_no_accum = args.batch_size * args.num_tasks 
+    total_batch_size = args.batch_size * args.accum_iter * args.num_tasks
+    
+    # LR scaling should be based on the effective total batch size relative to a base (e.g., 256)
+    # args.lr is calculated based on args.blr and this total_batch_size
+    if not args.local_debug: # Keep original LR calculation for DDP
+        args.lr = args.blr * total_batch_size / 256
+        args.min_lr = args.min_blr * total_batch_size / 256
+        if args.frozen_model_blr > 0:
+            args.frozen_model_lr = args.frozen_model_blr * total_batch_size / 256
+        else:
+            args.frozen_model_lr = args.blr * total_batch_size / 256 # Default to main blr for frozen part
+    else: # For local debug, batch_size is small, avoid overly tiny LR. Use blr directly or a small scale.
+        args.lr = args.blr 
+        args.min_lr = args.min_blr
+        args.frozen_model_lr = args.frozen_model_blr if args.frozen_model_blr > 0 else args.blr
+
 
     print("LR = %.8f" % args.lr)
     print("Min LR = %.8f" % args.min_lr)
     print("Total (effective) batch size = %d" % total_batch_size)
     print("Accumulate grad iterations = %d" % args.accum_iter)
+    # num_training_steps_per_epoch might be 0 if epoch_size is small, handle this
+    if num_training_steps_per_epoch == 0 and args.epoch_size > 0 and total_batch_size > 0 :
+        num_training_steps_per_epoch = math.ceil(args.epoch_size / total_batch_size) * args.accum_iter
+        print(f"Recalculated num_training_steps_per_epoch for local debug: {num_training_steps_per_epoch} (epoch_size {args.epoch_size}, total_batch_size {total_batch_size})")
+    elif num_training_steps_per_epoch == 0 :
+        num_training_steps_per_epoch = 1 # Ensure at least one step for very small local tests
+        print(f"Warning: num_training_steps_per_epoch is 0. Setting to 1 for local debug.")
+
+
     print("Number of training steps = %d" % num_training_steps_per_epoch)
-    print("Number of training examples per epoch = %d" % (batch_size_no_accum * num_training_steps_per_epoch))
+    # Calculate examples per epoch based on effective items processed by data_loader_train
+    # For iterable datasets, len(data_loader_train) is not directly available.
+    # num_training_steps_per_epoch * batch_size_no_accum / accum_iter
+    # The number of examples is epoch_size for WebDatasets.
+    # For local debug, epoch_size is already adjusted.
+    print("Number of training examples per epoch (approx) = %d" % (args.epoch_size if args.epoch_size is not None else "Unknown (IterableDataset)"))
 
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
-    model_without_ddp = model.module
 
-    optimizer = create_optimizer(args, model_without_ddp)
-    loss_scaler = NativeScaler(enabled=dtype == torch.float16)
+    # Conditional DDP wrapping
+    if args.distributed: # This will be False if args.local_debug is True
+        # device_ids should be [args.gpu] as set by utils.init_distributed_mode
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
+        model_without_ddp = model.module
+    # else: model is already model_without_ddp and on the correct device (set by model.to(device))
+
+    optimizer = create_optimizer(args, model_without_ddp) # Always pass model_without_ddp
+    loss_scaler = NativeScaler(enabled=(dtype == torch.float16 and not args.local_debug)) # Disable scaler for local CPU debug if using fp16/bf16 conceptually
 
     ## LR and WD schedules
     if args.weight_decay_end is None:
         args.weight_decay_end = args.weight_decay
 
-    if args.frozen_model_epochs > 0:
+    # Schedule calculations should adapt to args.epochs which is 1 for local_debug
+    if args.frozen_model_epochs > 0 and not args.local_debug : # No frozen epochs in local_debug override
         frozen_lr_schedule_values = utils.constant_scheduler(args.frozen_model_lr, args.frozen_model_epochs, num_training_steps_per_epoch)
         frozen_wd_schedule_values = utils.constant_scheduler(args.weight_decay, args.frozen_model_epochs, num_training_steps_per_epoch)
         main_schedule_epochs = args.epochs - args.frozen_model_epochs
     else:
         frozen_lr_schedule_values = np.array([]) 
         frozen_wd_schedule_values = np.array([])
-        main_schedule_epochs = args.epochs
+        main_schedule_epochs = args.epochs # Will be 1 for local_debug
+
+    # Ensure main_schedule_epochs is at least 1 for scheduler calculations
+    main_schedule_epochs = max(1, main_schedule_epochs)
 
     if args.scheduler == 'cosine':
         main_lr_schedule_values = utils.cosine_scheduler(
             args.lr, args.min_lr, main_schedule_epochs, num_training_steps_per_epoch, 
-            warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps
+            warmup_epochs=args.warmup_epochs if not args.local_debug else 0, # No warmup for 1 epoch local
+            warmup_steps=args.warmup_steps if not args.local_debug else 0   # No warmup for 1 epoch local
         )
-        wd_schedule_values = utils.cosine_scheduler(
+        wd_schedule_values = utils.cosine_scheduler( # WD schedule for the main part
             args.weight_decay, args.weight_decay_end, main_schedule_epochs, num_training_steps_per_epoch
         )
     elif 'inverse_sqrt' in args.scheduler:
@@ -683,13 +835,16 @@ def main(args):
             timescale = 10_000
         main_lr_schedule_values = utils.inverse_sqrt_scheduler(
             args.lr, args.min_lr, main_schedule_epochs, num_training_steps_per_epoch, 
-            warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
-            cooldown_epochs=args.cooldown_epochs, cooldown_steps=args.cooldown_steps,
+            warmup_epochs=args.warmup_epochs if not args.local_debug else 0, 
+            warmup_steps=args.warmup_steps if not args.local_debug else 0,
+            cooldown_epochs=args.cooldown_epochs if not args.local_debug else 0, # No cooldown for 1 epoch local
+            cooldown_steps=args.cooldown_steps if not args.local_debug else 0,
             timescale=timescale
         )
-        wd_schedule_values = utils.inverse_sqrt_scheduler(
+        wd_schedule_values = utils.inverse_sqrt_scheduler( # WD schedule for the main part
             args.weight_decay, args.weight_decay_end, main_schedule_epochs, num_training_steps_per_epoch,
-            cooldown_epochs=args.cooldown_epochs, cooldown_steps=args.cooldown_steps,
+            cooldown_epochs=args.cooldown_epochs if not args.local_debug else 0,
+            cooldown_steps=args.cooldown_steps if not args.local_debug else 0,
             timescale=timescale
         )
     else:
@@ -697,19 +852,30 @@ def main(args):
     
     lr_schedule_values = np.concatenate((frozen_lr_schedule_values, main_lr_schedule_values))
     wd_schedule_values = np.concatenate((frozen_wd_schedule_values, wd_schedule_values))
-    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
+    
+    # Ensure schedules are not empty if num_training_steps_per_epoch is very small
+    if len(lr_schedule_values) == 0 and num_training_steps_per_epoch > 0:
+        lr_schedule_values = np.full(num_training_steps_per_epoch * main_schedule_epochs, args.lr)
+        print("Warning: LR schedule was empty, filled with constant LR.")
+    if len(wd_schedule_values) == 0 and num_training_steps_per_epoch > 0:
+        wd_schedule_values = np.full(num_training_steps_per_epoch * main_schedule_epochs, args.weight_decay)
+        print("Warning: WD schedule was empty, filled with constant WD.")
+
+    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values, default=args.weight_decay), min(wd_schedule_values,default=args.weight_decay_end if args.weight_decay_end is not None else args.weight_decay)))
+
 
     # Auto-load from checkpoint
-    utils.auto_load_model(
-        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+    # Skip auto-resume for local debug to ensure a fresh quick test, unless specifically requested
+    if not args.local_debug or (args.local_debug and args.resume): 
+        utils.auto_load_model(
+            args=args, model=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler) # Pass model_without_ddp
 
-
-    ## Eval (on trained model)
-    if args.eval:
+    ## Eval (on trained model) - Skip for local_debug by default unless --eval is also passed
+    if args.eval and not args.local_debug: # Or add a specific flag like --local_eval
         if data_loaders_val is not None:
             for dataset_name, data_loader_val in data_loaders_val.items():
                 prefix = '[Eval] ' if not dataset_name else f'[Eval ({dataset_name})] '
-                eval_stats = evaluate(model, data_loader_val, device,
+                eval_stats = evaluate(model_without_ddp, data_loader_val, device, # Pass model_without_ddp
                                     num_input_tokens=args.num_input_tokens,
                                     num_target_tokens=args.num_target_tokens,
                                     all_domains=args.all_domains, dtype=dtype,
@@ -719,11 +885,10 @@ def main(args):
                 print(eval_stats)
                 print()
 
-
         if data_loaders_fixed_eval is not None:
             for dataset_name, data_loader_fixed_eval in data_loaders_fixed_eval.items():
                 prefix = '[Fixed Eval] ' if not dataset_name else f'[Fixed Eval ({dataset_name})] '
-                fixed_eval_stats = evaluate(model, data_loader_fixed_eval, device,
+                fixed_eval_stats = evaluate(model_without_ddp, data_loader_fixed_eval, device, # Pass model_without_ddp
                                             num_input_tokens=args.fixed_eval_input_tokens,
                                             num_target_tokens=args.fixed_eval_target_tokens,
                                             all_domains=args.all_domains, dtype=dtype,
@@ -731,80 +896,92 @@ def main(args):
                 print("Fixed Eval Stats:" if not dataset_name else f"Fixed Eval Stats ({dataset_name}):")
                 print(fixed_eval_stats)
                 print()
+        sys.exit(0) # Exit after eval if --eval is true
 
-        exit(0)
 
     ## Training
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
-        if log_writer is not None:
-            log_writer.set_step(epoch * num_training_steps_per_epoch)
+    for epoch in range(args.start_epoch, args.epochs): # args.epochs will be 1 for local_debug
+        if log_writer is not None and global_rank == 0: # Check global_rank for logging
+            # For local debug, step might be small, ensure it increments if num_training_steps_per_epoch is small
+            log_writer.set_step(epoch * num_training_steps_per_epoch if num_training_steps_per_epoch > 0 else epoch)
+        
+        # For DDP, set epoch for sampler if data_loader_train has a sampler
+        if hasattr(data_loader_train, 'sampler') and hasattr(data_loader_train.sampler, 'set_epoch') and args.distributed:
+            data_loader_train.sampler.set_epoch(epoch)
+
         train_stats = train_one_epoch(
-            model=model,
+            model=model, # Pass DDP model if distributed, else base model
             data_loader=data_loader_train,
             optimizer=optimizer,
             device=device,
             epoch=epoch,
-            frozen_model_epochs=args.frozen_model_epochs,
+            frozen_model_epochs=args.frozen_model_epochs if not args.local_debug else 0, # No frozen for local debug
             loss_scaler=loss_scaler,
             accum_iter=args.accum_iter,
             max_norm=args.clip_grad,
             max_skip_norm=args.skip_grad,
-            log_writer=log_writer,
-            start_steps=epoch * num_training_steps_per_epoch,
+            log_writer=log_writer if global_rank == 0 else None, # Only log for rank 0
+            start_steps=epoch * num_training_steps_per_epoch if num_training_steps_per_epoch > 0 else epoch,
             lr_schedule_values=lr_schedule_values,
             wd_schedule_values=wd_schedule_values,
             num_input_tokens=args.num_input_tokens,
             num_target_tokens=args.num_target_tokens,
             all_domains=args.all_domains,
             dtype=dtype,
-            loader_len=num_training_steps_per_epoch,
+            loader_len=num_training_steps_per_epoch, # Pass adjusted loader_len
             output_dir=args.output_dir,
             compute_grad_norm=args.compute_grad_norm,
             loss_type=args.loss_type,
             total_batch_size=total_batch_size,
+            is_local_debug=args.local_debug # Pass local_debug flag
         )
-        if args.output_dir:
+        if args.output_dir and not args.local_debug : # Only save checkpoints if not local_debug or if explicitly enabled
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
                 utils.save_model(
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch)
-                if epoch + 1 == args.epochs:
-                    use_s3 = len(args.s3_save_dir) > 0
+                if epoch + 1 == args.epochs: # Final checkpoint
+                    use_s3 = len(args.s3_save_dir) > 0 and not args.local_debug
                     utils.save_model(
                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                         loss_scaler=loss_scaler, epoch=epoch, ckpt_name='final', use_s3=use_s3)
+        elif args.output_dir and args.local_debug:
+             print(f"Local Debug: Skipping checkpoint saving for epoch {epoch}.")
                     
 
         log_stats = {**{k: v for k, v in train_stats.items()},
                      'epoch': epoch,
-                     'n_parameters': n_parameters,
+                     'n_parameters': n_parameters}
+        if not args.local_debug : # Only log token counts if not local_debug to avoid tiny numbers
+            log_stats.update({
                      'input_tokens_seen_b': (epoch + 1) * num_training_steps_per_epoch * (total_batch_size / args.accum_iter) * args.num_input_tokens / 1e9,
                      'target_tokens_seen_b': (epoch + 1) * num_training_steps_per_epoch * (total_batch_size / args.accum_iter) * args.num_target_tokens / 1e9,
                      'total_tokens_seen_b': (epoch + 1) * num_training_steps_per_epoch * (total_batch_size / args.accum_iter) * (args.num_input_tokens + args.num_target_tokens) / 1e9,
-                    }
+            })
 
-        if data_loaders_val is not None and ((epoch + 1) % args.eval_freq == 0 or epoch + 1 == args.epochs):
+        # Evaluation during training - skip for local_debug unless explicitly requested
+        if not args.local_debug and data_loaders_val is not None and ((epoch + 1) % args.eval_freq == 0 or epoch + 1 == args.epochs):
             for dataset_name, data_loader_val in data_loaders_val.items():
                 prefix = '[Eval] ' if not dataset_name else f'[Eval ({dataset_name})] '
-                eval_stats = evaluate(model, data_loader_val, device, num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens,
+                eval_stats = evaluate(model_without_ddp, data_loader_val, device, num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens, # Pass model_without_ddp
                                     all_domains=args.all_domains, dtype=dtype, prefix=prefix, loss_type=args.loss_type)
                 extra_stats = {**{k: v for k, v in eval_stats.items()}}
                 log_stats.update(extra_stats)
 
-        if data_loaders_fixed_eval is not None and ((epoch + 1) % args.eval_freq == 0 or epoch + 1 == args.epochs):
+        if not args.local_debug and data_loaders_fixed_eval is not None and ((epoch + 1) % args.eval_freq == 0 or epoch + 1 == args.epochs):
             for dataset_name, data_loader_fixed_eval in data_loaders_fixed_eval.items():
                 prefix = '[Fixed Eval] ' if not dataset_name else f'[Fixed Eval ({dataset_name})] '
-                fixed_eval_stats = evaluate(model, data_loader_fixed_eval, device, num_input_tokens=args.fixed_eval_input_tokens, num_target_tokens=args.fixed_eval_target_tokens,
+                fixed_eval_stats = evaluate(model_without_ddp, data_loader_fixed_eval, device, num_input_tokens=args.fixed_eval_input_tokens, num_target_tokens=args.fixed_eval_target_tokens, # Pass model_without_ddp
                                             all_domains=args.all_domains, dtype=dtype, prefix=prefix, loss_type=args.loss_type)
                 extra_stats = {**{k: v for k, v in fixed_eval_stats.items()}}
                 log_stats.update(extra_stats)
 
-        if log_writer is not None:
+        if log_writer is not None and global_rank == 0: # Check global_rank
             log_writer.update(log_stats)
 
-        if args.output_dir and utils.is_main_process():
+        if args.output_dir and utils.is_main_process(): # utils.is_main_process() is DDP-aware
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
@@ -818,7 +995,7 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
                     loss_scaler, accum_iter, max_norm: float = None, max_skip_norm: float = None, log_writer=None,
                     lr_scheduler=None, start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
                     all_domains: List[str] = [], dtype: torch.dtype = torch.float16, loader_len: Optional[int] = None,
-                    output_dir=None, compute_grad_norm=True, total_batch_size=None):
+                    output_dir=None, compute_grad_norm=True, total_batch_size=None, is_local_debug=False):
     
     model.train()
     if frozen_model_epochs > 0 and epoch < frozen_model_epochs:

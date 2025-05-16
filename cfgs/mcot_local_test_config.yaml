@@ -1,0 +1,106 @@
+# cfgs/mcot_local_test_config.yaml
+
+# Inherit defaults from your main MCoT config if you have one, or copy relevant sections
+# For example, if your mcot_data_config.yaml has 'defaults:', you might include it:
+# defaults:
+#   - default/training # or whatever your base default is
+#   - _self_ # ensures these settings override
+
+# --- Key overrides for local testing ---
+output_dir: "tmp_local_output" # Store outputs locally and temporarily
+log_wandb: false # Disable wandb logging for local tests
+
+epochs: 1        # Run for only 1 epoch
+num_workers: 0   # Use 0 or 1 worker for easier debugging
+batch_size: 2    # Use a very small batch size
+
+# --- Dataset configuration for a small test ---
+# This assumes you're using the Hugging Face setup as per recent discussions.
+# Modify data_path and other settings if you revert to WebDataset for local tests.
+train:
+  datasets:
+    coco_planning:
+      type: "huggingface"
+      data_path: "shunk031/MSCOCO"
+      year: 2017
+      coco_task: ["captions", "instances"]
+      in_domains: "caption-rgb@224"
+      out_domains: "caption-det"
+      epoch_size: 10 # Drastically reduce epoch size for testing
+      split: "train[:10]" # Use a small slice of the training data (Hugging Face specific slice)
+      hflip: false # Optional: disable augmentations for speed
+      # Remove wds_shuffle_buffer_* if not using WebDataset for local test
+
+    coco_acting:
+      type: "huggingface"
+      data_path: "shunk031/MSCOCO"
+      year: 2017
+      coco_task: ["captions", "instances"]
+      in_domains: "caption-rgb@224"
+      out_domains: "caption"
+      epoch_size: 10
+      split: "train[:10]"
+      hflip: false
+      # Remove wds_shuffle_buffer_*
+
+  weights: [0.5, 0.5]
+
+val: # Optional: you can comment out the entire 'val' section for very fast startup
+  datasets:
+    coco_planning_val:
+      type: "huggingface"
+      data_path: "shunk031/MSCOCO"
+      year: 2017
+      coco_task: ["captions", "instances"]
+      in_domains: "caption-rgb@224"
+      out_domains: "caption-det"
+      epoch_size: 4
+      split: "validation[:4]" # Small slice of validation
+      hflip: false
+    coco_acting_val:
+      type: "huggingface"
+      data_path: "shunk031/MSCOCO"
+      year: 2017
+      coco_task: ["captions", "instances"]
+      in_domains: "caption-rgb@224"
+      out_domains: "caption"
+      epoch_size: 4
+      split: "validation[:4]"
+      hflip: false
+  weights: [0.5, 0.5]
+
+# Keep your modality_info and other essential parameters from mcot_data_config.yaml
+# Or ensure they are loaded via 'defaults' if your main config uses that.
+modality_info:
+  rgb@224:
+    type: img
+    num_channels: 3
+    input_size: 224 # Make sure this matches what your model expects
+    patch_size: 16  # And this
+    max_tokens: 256
+    is_input_modality: true
+  caption:
+    type: seq
+    max_tokens: 512
+    token_type: text
+    is_input_modality: true
+    is_output_modality: true
+  det:
+    type: seq
+    max_tokens: 256
+    token_type: text
+    coord_bins: 1000
+    is_output_modality: true
+
+# Other minimal training params if not inherited
+text_tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
+# num_input_tokens, num_target_tokens, etc. should be defined either here or in defaults
+
+# Ensure these are small or match your test setup
+# These might be overridden by command-line args in your SLURM script, but good to set locally
+# gradient_accumulation_steps: 1 # (or accum_iter from your script)
+# learning_rate: 3e-5 # (or blr from your script)
+# warmup_steps: 10
+# max_steps: 20 # Limit total steps for a very quick test
+# save_steps: 10
+# eval_steps: 10

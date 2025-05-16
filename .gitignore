@@ -11,3 +11,21 @@ wandb/
 tokenizer_ckpts/
 *pkl
 *.egg-info
+
+# General Python
+*.pyc
+*.log
+*.logs
+
+# Local test outputs
+tmp_local_output/
+
+# Virtual environments
+.env
+env/
+venv/
+.venv/
+
+# Add your heavy dataset directory below, e.g.:
+# path/to/your/heavy_dataset/
+data/

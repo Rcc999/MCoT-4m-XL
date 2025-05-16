@@ -17,7 +17,7 @@ import itertools
 import os
 import re
 from functools import partial
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import braceexpand
 import numpy as np
@@ -29,6 +29,31 @@ from torch.utils.data._utils.collate import default_collate
 from torchvision import transforms
 from webdataset.filters import pipelinefilter, reraise_exception
 from webdataset.handlers import warn_and_continue
+import json
+
+# Standard COCO 2017 Categories (91 classes, though typically only 80 are used in detections)
+# This mapping is commonly used. IDs are as per COCO standard.
+COCO_CATEGORIES_2017_ID_TO_NAME = {
+    1: 'person', 2: 'bicycle', 3: 'car', 4: 'motorcycle', 5: 'airplane',
+    6: 'bus', 7: 'train', 8: 'truck', 9: 'boat', 10: 'traffic light',
+    11: 'fire hydrant', 13: 'stop sign', 14: 'parking meter', 15: 'bench',
+    16: 'bird', 17: 'cat', 18: 'dog', 19: 'horse', 20: 'sheep',
+    21: 'cow', 22: 'elephant', 23: 'bear', 24: 'zebra', 25: 'giraffe',
+    27: 'backpack', 28: 'umbrella', 31: 'handbag', 32: 'tie',
+    33: 'suitcase', 34: 'frisbee', 35: 'skis', 36: 'snowboard',
+    37: 'sports ball', 38: 'kite', 39: 'baseball bat', 40: 'baseball glove',
+    41: 'skateboard', 42: 'surfboard', 43: 'tennis racket', 44: 'bottle',
+    46: 'wine glass', 47: 'cup', 48: 'fork', 49: 'knife', 50: 'spoon',
+    51: 'bowl', 52: 'banana', 53: 'apple', 54: 'sandwich', 55: 'orange',
+    56: 'broccoli', 57: 'carrot', 58: 'hot dog', 59: 'pizza', 60: 'donut',
+    61: 'cake', 62: 'chair', 63: 'couch', 64: 'potted plant', 65: 'bed',
+    67: 'dining table', 70: 'toilet', 72: 'tv', 73: 'laptop', 74: 'mouse',
+    75: 'remote', 76: 'keyboard', 77: 'cell phone', 78: 'microwave',
+    79: 'oven', 80: 'toaster', 81: 'sink', 82: 'refrigerator', 84: 'book',
+    85: 'clock', 86: 'vase', 87: 'scissors', 88: 'teddy bear',
+    89: 'hair drier', 90: 'toothbrush'
+    # IDs 12, 26, 29, 30, 45, 66, 68, 69, 71, 83, 91 are typically not in common detection sets.
+}
 
 try:
     # Optionally load huggingface datasets
@@ -40,108 +65,309 @@ except ImportError:
 from fourm.data.masking import TransferMasking, UnifiedMasking
 from fourm.data.modality_transforms import (CropSettingsTransform, IdentityTransform,
                                       MaskTransform, UnifiedDataTransform,
-                                      get_transform_key)
+                                      get_transform_key,
+                                      RGBTransform, DepthTransform, CaptionTransform, DetectionTransform, TokTransform)
 from fourm.data.multimodal_dataset_folder import MultiModalDatasetFolder
 from fourm.utils.dist import get_rank, get_world_size
+
+# REMOVE THE CIRCULAR IMPORT
+# from .unified_datasets import get_mcot_planning_data_pipeline, get_mcot_acting_data_pipeline
+
+# The get_mcot_planning_data_pipeline and get_mcot_acting_data_pipeline functions are defined later in this file
 
 # Assume access to the MCoT special token IDs, perhaps passed via text_tokenizer or a config
 # For now, defining them here as placeholders. These should be obtained from the tokenizer.
 # Example: PLANNING_START_TOKEN_ID = text_tokenizer.token_to_id("[PLANNING_START]")
 # These would ideally be part of a shared config or loaded with the tokenizer.
 
+def _tokenize_bboxes_for_planning(bbox_data, image_width, image_height, text_tokenizer, coord_bins=1000):
+    """
+    Tokenizes bounding box data for the planning stage.
+    Assumes bbox_data is a list of lists: [[x_abs, y_abs, w_abs, h_abs, category_id], ...]
+    Assumes text_tokenizer has COCO category names and coord bin tokens ("<coord_0>"..."<coord_N-1>")
+    """
+    bbox_tokens = []
+    coco_categories = {} # In a real scenario, load this from COCO metadata or config
+    # Example mapping - this should be comprehensive for COCO
+    # For now, assume category_id is directly a string name or can be mapped.
+    # If category_id is an int, it needs to be mapped to a name first.
+    # This is a placeholder: You'll need a proper mapping from COCO category_id to category_name
+    # that exists in your text_tokenizer.
+    # E.g., if text_tokenizer was trained with "person", "car", etc.
+
+    # Placeholder: coco_category_id_to_name = {1: "person", 2: "bicycle", ...}
+    # This mapping should be available, e.g. passed in or loaded from a file.
+    # For this example, let's assume category_id is already a name string in bbox_data
+    # or that text_tokenizer can handle integer IDs if they are special tokens.
+
+    for bbox in bbox_data:
+        if len(bbox) < 5: continue # Basic validation
+
+        x_abs, y_abs, w_abs, h_abs = bbox[0], bbox[1], bbox[2], bbox[3]
+        category_name_or_id = bbox[4] # This needs to be a string like "person" or "cat"
+
+        # Convert to x_min, y_min, x_max, y_max and normalize
+        x_min_norm = x_abs / image_width
+        y_min_norm = y_abs / image_height
+        x_max_norm = (x_abs + w_abs) / image_width
+        y_max_norm = (y_abs + h_abs) / image_height
+
+        # Digitize to bins
+        x_min_bin = int(x_min_norm * (coord_bins -1))
+        y_min_bin = int(y_min_norm * (coord_bins -1))
+        x_max_bin = int(x_max_norm * (coord_bins -1))
+        y_max_bin = int(y_max_norm * (coord_bins -1))
+        
+        try:
+            # Attempt to get token ID for category name
+            # This assumes category_name_or_id is a string like "person"
+            # If it's an int ID that's already a token, this would need adjustment
+            # or a direct mapping to a token_id if text_tokenizer.token_to_id expects strings
+            cat_token_id = text_tokenizer.token_to_id(str(category_name_or_id))
+            if cat_token_id is None:
+                # Fallback or error if category not in tokenizer
+                # For now, skip if not found, but ideally handle this (e.g., map to <UNK> or error)
+                print(f"Warning: Category '{category_name_or_id}' not found in tokenizer. Skipping box.")
+                continue
+
+            bbox_tokens.extend([
+                cat_token_id,
+                text_tokenizer.token_to_id(f"<coord_{max(0, min(x_min_bin, coord_bins-1))}>"),
+                text_tokenizer.token_to_id(f"<coord_{max(0, min(y_min_bin, coord_bins-1))}>"),
+                text_tokenizer.token_to_id(f"<coord_{max(0, min(x_max_bin, coord_bins-1))}>"),
+                text_tokenizer.token_to_id(f"<coord_{max(0, min(y_max_bin, coord_bins-1))}>"),
+            ])
+        except Exception as e:
+            print(f"Error tokenizing bbox for category {category_name_or_id}: {e}")
+            continue # Skip this bounding box
+            
+    # Filter out None tokens that might result from missing coord tokens
+    # (though this shouldn't happen if coord_bins tokens are guaranteed)
+    valid_bbox_tokens = [token for token in bbox_tokens if token is not None]
+    return valid_bbox_tokens
+
+
 def load_and_preprocess_planning_sample(raw_sample, text_tokenizer, modality_info):
     """
-    Processes a raw sample (e.g., from MS-COCO webdataset) for the Planning MCoT stage.
-    Output: A dictionary of tokenized modalities for UnifiedMasking.
+    Processes a raw sample from MS-COCO webdataset for the Planning MCoT stage.
+    Output: A dictionary of modalities for UnifiedMasking.
             The [PLANNING_START] token is prefixed to the input caption/prompt.
+    Expects raw_sample to contain:
+    - 'image.jpg' or 'image.png': PIL Image (after wds.decode)
+    - 'caption_prompt.txt': Raw text for the input prompt (string)
+    - 'target_plan_text.txt': Raw text for the target textual part of the plan (string)
+    - 'bboxes.json': JSON string containing list of bboxes [x,y,w,h, category_name_or_id] and image_width, image_height
+                     e.g. {"image_width": 640, "image_height": 480, "annotations": [[x,y,w,h,"cat"], ...]}
+    - '__key__': Sample key (string)
     """
-    # 1. Extract caption (prompt) and layout data from the raw_sample
-    #    This depends on the structure of raw_sample from MS-COCO.
-    #    Example: raw_sample might be {'caption.txt': 'a description', 'bboxes.json': [[...]]}
-    raw_caption_text = raw_sample.get("caption.txt", "") # Default to empty if not found
-    # raw_layout_data = raw_sample.get("bboxes.json") # Assuming JSON list of bboxes
-    # For this example, let's assume layout data becomes target tokens directly.
-    raw_target_layout_data = raw_sample.get("layout_data_for_target") # Placeholder key
+    # 1. Extract image, caption prompt, target plan text, and bounding box data
+    pil_image = raw_sample.get("image.jpg") or raw_sample.get("image.png") # PIL Image
+    input_prompt_text = raw_sample.get("caption_prompt.txt", "")
+    target_plan_text = raw_sample.get("target_plan_text.txt", "")
+    
+    bbox_json_str = raw_sample.get("bboxes.json", "{}")
+    try:
+        bbox_content = json.loads(bbox_json_str)
+        # It's common for COCO annotations to be under an "annotations" key,
+        # and image dimensions might be separate or within the image file itself.
+        # Assuming bboxes.json provides dimensions.
+        image_width = bbox_content.get("image_width", pil_image.width if pil_image else 1) # Default if not in json
+        image_height = bbox_content.get("image_height", pil_image.height if pil_image else 1) # Default if not in json
+        # Check if annotations are nested (common in COCO original format)
+        # or if bbox_content is directly the list of bboxes.
+        # For this example, assume "annotations" key holds the list of bbox data.
+        raw_bbox_data = bbox_content.get("annotations", []) 
+        if not isinstance(raw_bbox_data, list): # If "annotations" is not there, maybe bbox_content is the list
+             if isinstance(bbox_content, list): raw_bbox_data = bbox_content
+             else: raw_bbox_data = []
+
+    except json.JSONDecodeError:
+        print(f"Warning: Could not decode bboxes.json for sample {raw_sample.get('__key__')}")
+        raw_bbox_data = []
+        image_width, image_height = (pil_image.width if pil_image else 1), (pil_image.height if pil_image else 1)
+
 
     # 2. Get [PLANNING_START] token ID
     planning_start_token_id = text_tokenizer.token_to_id("[PLANNING_START]")
     if planning_start_token_id is None:
         raise ValueError("[PLANNING_START] token not found in tokenizer.")
 
-    # 3. Tokenize the input caption/prompt and prefix with [PLANNING_START]
-    #    This sequence will be used by UnifiedMasking.determine_mcot_stage()
-    prompt_tokens = text_tokenizer.encode(raw_caption_text).ids
-    # The key for this must match what UnifiedMasking.determine_mcot_stage expects, e.g., 'caption_tokens'
-    # It also needs to match what UnifiedMasking.forward uses in input_modalities_for_stage['planning']
-    input_caption_with_prefix = [planning_start_token_id] + prompt_tokens
-
-    # 4. Prepare target dense caption tokens (placeholder)
-    #    This would be the ground truth dense caption for the planning stage.
-    #    Assume raw_sample contains 'dense_caption.txt'
-    raw_target_dense_caption = raw_sample.get("dense_caption.txt", "")
-    target_dense_caption_tokens = text_tokenizer.encode(raw_target_dense_caption).ids
-
-    # 5. Prepare target layout tokens (placeholder)
-    #    This would be the ground truth layout tokens for the planning stage.
-    #    Encoding of bboxes into token sequence needs a specific function.
-    #    def encode_bboxes_to_token_sequence(bboxes, ...): return [...] 
-    #    target_layout_tokens = encode_bboxes_to_token_sequence(raw_target_layout_data)
-    target_layout_tokens = [] # Placeholder for actual layout tokenization
-    if raw_target_layout_data: # Example if layout data is simple list of ints
-        if isinstance(raw_target_layout_data, list) and all(isinstance(x, int) for x in raw_target_layout_data):
-            target_layout_tokens = raw_target_layout_data 
-        else:
-            # Placeholder for actual layout tokenization logic
-            # e.g. target_layout_tokens = ModalityInfo['bbox']['tokenizer'](raw_target_layout_data)
-            pass 
-
-    # Return a dictionary with keys expected by UnifiedMasking.forward for the 'planning' stage.
-    processed_sample = {
-        # Input for planning stage (used by determine_mcot_stage and as input)
-        'caption_tokens': torch.tensor(input_caption_with_prefix, dtype=torch.long),
-        
-        # Targets for planning stage
-        'target_dense_caption': torch.tensor(target_dense_caption_tokens, dtype=torch.long),
-        'target_layout_tokens': torch.tensor(target_layout_tokens, dtype=torch.long), # Ensure this is correctly tokenized
-        
-        # Other modalities from raw_sample if they are needed as part of input context for planning
-        # e.g., if an image is also an input to planning:
-        # 'image_patches': tokenize_image_from_raw_sample(raw_sample.get('image.png')) # Placeholder
-    }
-    return processed_sample
-
-
-def load_and_preprocess_acting_sample(raw_sample, text_tokenizer, image_vqvae_tokenizer, modality_info):
-    """
-    Processes a raw sample for the Acting MCoT stage.
-    [ACTING_START] token is prefixed.
-    """
-    acting_start_token_id = text_tokenizer.token_to_id("[ACTING_START]")
-    if acting_start_token_id is None: raise ValueError("[ACTING_START] token not found.")
-
-    # Inputs for Acting: original image, plan tokens (from planning output)
-    # raw_original_image = raw_sample.get('image.png') # Path or bytes
-    # original_image_tokens = image_vqvae_tokenizer.encode(raw_original_image) # Placeholder
-    original_image_tokens = [] # Placeholder
-
-    # plan_tokens = raw_sample.get('plan_tokens') # Already tokenized sequence from planning output
-    plan_tokens = [] # Placeholder
+    # 3. Tokenize the input prompt and prefix with [PLANNING_START]
+    prompt_tokens = text_tokenizer.encode(input_prompt_text).ids
+    # Key for this should match modality_info for caption, e.g. 'caption'
+    # And what UnifiedMasking.determine_mcot_stage expects.
+    # Assuming 'caption' is the modality name for text sequences.
+    input_prompt_with_prefix = [planning_start_token_id] + prompt_tokens
     
-    # Prefix for determine_mcot_stage and as part of input
-    # UnifiedMasking.forward for 'acting' expects 'acting_prefix_tokens'
-    acting_prefix_tokens = [acting_start_token_id]
+    # 4. Tokenize target plan text (this will be one of the target modalities)
+    # Assuming 'caption' is also used for this target text modality name.
+    target_plan_text_tokens = text_tokenizer.encode(target_plan_text).ids
 
-    # Target for Acting: generated image tokens (ground truth for training)
-    # raw_target_image = raw_sample.get('target_image.png')
-    # generated_image_tokens = image_vqvae_tokenizer.encode(raw_target_image) # Placeholder
-    generated_image_tokens = [] # Placeholder
+    # 5. Tokenize target bounding boxes (this will be another target modality)
+    # Assuming 'det' is the modality name for bbox sequences.
+    # The coord_bins should ideally come from modality_info['det'] or config.
+    coord_bins = modality_info.get('det', {}).get('coord_bins', 1000) # Example: get from modality_info if defined
+    target_bbox_layout_tokens = _tokenize_bboxes_for_planning(raw_bbox_data, image_width, image_height, text_tokenizer, coord_bins)
+    
+    processed_sample = {
+        # Input for planning stage
+        # The key 'caption' should match a modality name in modality_info
+        'caption': torch.tensor(input_prompt_with_prefix, dtype=torch.long),
+        
+        # Target modalities for planning stage
+        # Using 'target_caption' and 'target_det' to distinguish from input 'caption' if UnifiedMasking needs it,
+        # or could reuse 'caption' and 'det' if UnifiedMasking handles input/target distinction.
+        # For now, let's assume UnifiedMasking uses the dict structure and can differentiate.
+        # The actual target keys will depend on how UnifiedMasking is configured for 'planning' stage.
+        # Let's assume the modality names themselves are used, and UnifiedMasking sorts out targets.
+        # The `out_domains` in the config will specify 'caption-det' for planning.
+        # `UnifiedMasking` will select these as targets.
 
-    return {
-        'acting_prefix_tokens': torch.tensor(acting_prefix_tokens, dtype=torch.long),
-        'original_image_tokens': torch.tensor(original_image_tokens, dtype=torch.long),
-        'plan_tokens': torch.tensor(plan_tokens, dtype=torch.long),
-        'generated_image_tokens': torch.tensor(generated_image_tokens, dtype=torch.long),
+        # These are the actual outputs of the planning stage
+        # Key name 'caption' for textual plan, 'det' for layout plan
+        # This is a bit confusing. Let's clarify:
+        # Input to Planning: 'caption_prompt' (text) + 'image' (implicitly via 'rgb@224')
+        # Output of Planning: 'plan_text' (text) + 'plan_bboxes' (det tokens)
+
+        # Revised structure based on common patterns:
+        # Input modalities are named directly by their modality type (e.g. 'rgb@224', 'caption')
+        # Target modalities are also named by their type. UnifiedMasking uses in_domains/out_domains.
+        
+        # Input for the model (passed to UnifiedDataTransform then UnifiedMasking)
+        # 'rgb@224' or 'rgb': PIL Image, to be processed by UnifiedDataTransform
+        # 'caption': Tokenized input prompt with [PLANNING_START]
     }
+    if pil_image:
+        # Use the actual image modality key from modality_info, e.g., 'rgb@224'
+        image_mod_key = next((k for k, v in modality_info.items() if v.get('type') == 'img' and 'rgb' in k), 'rgb@224')
+        processed_sample[image_mod_key] = pil_image
+    
+    processed_sample[modality_info.get('caption', {}).get('name', 'caption')] = torch.tensor(input_prompt_with_prefix, dtype=torch.long)
+
+    # These are the targets for the planning stage, as specified by 'out_domains' = 'caption-det' (example)
+    # We need to ensure these keys match the modality names for caption and det.
+    # Assuming target text uses 'caption' modality and target bboxes use 'det' modality.
+    # To avoid key collision if input prompt is also 'caption', we might need a convention.
+    # However, UnifiedMasking.forward receives a single sample dict.
+    # It splits it into input_dict and target_dict based on in_domains and out_domains.
+    # So, if 'caption' is in out_domains, it will be treated as a target.
+    # If 'caption' is in in_domains, it's an input. If in both, it's input & target.
+    
+    # Let's ensure distinct keys for clarity if necessary, or rely on UnifiedMasking.
+    # For MCoT, the initial input 'caption' (prompt with [PLANNING_START]) is for stage determination
+    # and also part of the input to the first stage.
+    # Targets for planning:
+    processed_sample['mcot_target_for_caption'] = torch.tensor(target_plan_text_tokens, dtype=torch.long) # This should map to 'caption' for target.
+    processed_sample['mcot_target_for_det'] = torch.tensor(target_bbox_layout_tokens, dtype=torch.long) # This should map to 'det' for target.
+
+    # The keys in processed_sample should be actual modality names for UnifiedDataTransform.
+    # Then UnifiedMasking will use in_domains/out_domains to pick inputs/targets.
+    # Let's structure `processed_sample` with keys that are modality names.
+    # `mcot_target_for_caption` should be placed under the key for the 'caption' modality IF 'caption' is an out_domain.
+    # `mcot_target_for_det` should be placed under the key for the 'det' modality IF 'det' is an out_domain.
+
+    # Final refined structure for what `load_and_preprocess_planning_sample` returns:
+    # This dict is then passed to UnifiedDataTransform and then to UnifiedMasking collate_fn.
+    final_sample = {}
+    if pil_image:
+        # Find the primary RGB image key from modality_info
+        img_key = next((k for k, v in modality_info.items() if v.get('type') == 'img' and 'rgb' in k), 'rgb@224')
+        final_sample[img_key] = pil_image
+    
+    # Input text prompt (with MCoT prefix)
+    # This will be used as input if 'caption' is in in_domains.
+    # If 'caption' is also in out_domains, then `mcot_target_for_caption` are its target.
+    final_sample['caption'] = torch.tensor(input_prompt_with_prefix, dtype=torch.long)
+
+    # If 'caption' is an output domain, these are its target tokens.
+    # This assumes UnifiedMasking collate_fn can handle providing separate targets
+    # for a modality that is also an input. Often, for seq2seq, the input sequence
+    # itself becomes the target sequence for teacher forcing after masking.
+    # For MCoT planning, the output plan text is DIFFERENT from input prompt.
+    # So we need a way to provide these mcot_target_for_caption to 'caption' modality for loss calculation.
+    #
+    # A robust way: UnifiedMasking receives the full dict.
+    # `in_domains` (e.g. ['caption_prompt', 'rgb@224']) are model inputs.
+    # `out_domains` (e.g. ['plan_text', 'plan_bboxes']) are model outputs.
+    # This requires modality_info to have entries like 'caption_prompt', 'plan_text', 'plan_bboxes'.
+    # 'caption_prompt' and 'plan_text' can share vocab with 'caption'.
+    # 'plan_bboxes' can share vocab with 'det'.
+
+    # Let's assume a simpler model for now where out_domains are 'caption' and 'det',
+    # and UnifiedMasking knows that for 'planning' stage:
+    # - input 'caption' is the prompt.
+    # - target for 'caption' modality is `mcot_target_for_caption`.
+    # - target for 'det' modality is `mcot_target_for_det`.
+    # This might be achieved by `load_and_preprocess_planning_sample` adding specific keys
+    # that `UnifiedMasking` then uses for this stage:
+    final_sample['mcot_target_for_caption'] = torch.tensor(target_plan_text_tokens, dtype=torch.long)
+    final_sample['mcot_target_for_det'] = torch.tensor(target_bbox_layout_tokens, dtype=torch.long)
+    # And `UnifiedMasking` for 'planning' stage would know to use these for loss calculation
+    # against outputs of 'caption' and 'det' modalities respectively.
+
+    return final_sample
+
+
+def load_and_preprocess_acting_sample(raw_sample, text_tokenizer, modality_info):
+    """
+    Processes a raw sample from MS-COCO webdataset for the Acting MCoT stage.
+    Assumes acting stage takes image, a textual plan, and a bbox plan (from planning stage output)
+    and generates a final detailed caption.
+    
+    Expects raw_sample to contain:
+    - 'image.jpg' or 'image.png': PIL Image
+    - 'plan_text.txt': Textual part of the plan (string)
+    - 'plan_bboxes.json': JSON string for bbox part of the plan {"image_width": w, "image_height": h, "annotations": [[x,y,w,h,cat],...]}
+    - 'target_final_caption.txt': Ground truth final caption for the acting stage (string)
+    - '__key__': Sample key (string)
+    """
+    pil_image = raw_sample.get("image.jpg") or raw_sample.get("image.png")
+    plan_text = raw_sample.get("plan_text.txt", "")
+    plan_bboxes_json_str = raw_sample.get("plan_bboxes.json", "{}")
+    target_final_caption_text = raw_sample.get("target_final_caption.txt", "")
+
+    try:
+        bbox_content = json.loads(plan_bboxes_json_str)
+        image_width = bbox_content.get("image_width", pil_image.width if pil_image else 1)
+        image_height = bbox_content.get("image_height", pil_image.height if pil_image else 1)
+        raw_plan_bbox_data = bbox_content.get("annotations", [])
+        if not isinstance(raw_plan_bbox_data, list):
+            if isinstance(bbox_content, list): raw_plan_bbox_data = bbox_content
+            else: raw_plan_bbox_data = []
+    except json.JSONDecodeError:
+        print(f"Warning: Could not decode plan_bboxes.json for acting sample {raw_sample.get('__key__')}")
+        raw_plan_bbox_data = []
+        image_width, image_height = (pil_image.width if pil_image else 1), (pil_image.height if pil_image else 1)
+
+    acting_start_token_id = text_tokenizer.token_to_id("[ACTING_START]")
+    if acting_start_token_id is None: 
+        raise ValueError("[ACTING_START] token not found in tokenizer.")
+
+    coord_bins = modality_info.get('det', {}).get('coord_bins', 1000) # Reuse from det modality
+    # Tokenize the input plan (text + bboxes)
+    # This combined plan is the primary sequence input to the acting stage.
+    # The key for this input sequence should be 'caption' or a similar sequence modality name.
+    tokenized_plan_input = _tokenize_plan_for_acting(plan_text, raw_plan_bbox_data, image_width, image_height, text_tokenizer, coord_bins)
+    acting_input_sequence_with_prefix = [acting_start_token_id] + tokenized_plan_input
+
+    # Tokenize the target final caption
+    target_final_caption_tokens = text_tokenizer.encode(target_final_caption_text).ids
+
+    output_dict = {}
+    if pil_image:
+        img_key = next((k for k, v in modality_info.items() if v.get('type') == 'img' and 'rgb' in k and '@' in k), 'rgb@224')
+        output_dict[img_key] = pil_image
+
+    # Input sequence for acting (plan with prefix)
+    # This uses the 'caption' modality as it's a sequence of text and bbox tokens.
+    output_dict['caption'] = torch.tensor(acting_input_sequence_with_prefix, dtype=torch.long)
+
+    # Target for the acting stage (final caption)
+    # This also uses the 'caption' modality for its output.
+    # UnifiedMasking needs to handle this based on 'acting' stage context.
+    output_dict['mcot_target_for_caption'] = torch.tensor(target_final_caption_tokens, dtype=torch.long)
+    
+    return output_dict
 
 
 def load_and_preprocess_reflection_sample(raw_sample, text_tokenizer, semantic_seg_vqvae_tokenizer, modality_info):
@@ -1062,75 +1288,187 @@ class UnifiedMasking(TransferMasking):
 
 
 def get_mcot_planning_data_pipeline(
-    data_path, text_tokenizer, modality_info, image_augmenter, 
-    input_tokens_range, target_tokens_range,
-    num_gpus, num_workers, batch_size, epoch_size, # Common WebDataset args
-    # ... other args like sampling_weights, shuffle_buffer_load, etc.
-    # ... VQ-VAE tokenizers if planning directly outputs/inputs some VQ tokens beyond text/bbox
+    data_path: str, # Path to webdataset shards for COCO planning
+    text_tokenizer, # Pre-configured text tokenizer with MCoT, COCO class, and coord tokens
+    modality_info: Dict[str, Any],
+    # image_augmenter is usually part of UnifiedDataTransform, applied later
+    # input_tokens_range, target_tokens_range are for UnifiedMasking, applied later
+    # Common WebDataset args:
+    num_gpus: int,
+    num_workers: int,
+    batch_size: int, # Per GPU batch size
+    epoch_size: Optional[int] = None, # Number of samples per epoch
+    shuffle_buffer_load: int = 1000,
+    shuffle_buffer_repeat: int = 5000,
+    # Other MCoT specific args might be needed by load_and_preprocess_planning_sample if not via modality_info
+    # e.g. keys for image, caption, bbox in the webdataset sample
+    image_file_key: str = "image.jpg", # Or "image.png"
+    caption_prompt_key: str = "caption_prompt.txt",
+    target_plan_text_key: str = "target_plan_text.txt",
+    bbox_json_key: str = "bboxes.json", # Expects {"image_width": w, "image_height": h, "annotations": [[x,y,w,h,cat_name],...]}
+    handler: Callable = wds.warn_and_continue,
+    **kwargs # To catch other dataset_config args
     ):
     """
     Constructs a WebDataset pipeline for MCoT Planning data from MS-COCO.
-    Output from this pipeline's mapped functions should feed into load_and_preprocess_planning_sample,
-    which then feeds into UnifiedMasking.
+    Output from this pipeline's mapped functions feeds into load_and_preprocess_planning_sample.
+    The result of this function (a WebDataset IterableDataset) will then typically be wrapped by:
+    1. UnifiedDataTransform (applies image_augmenter, modality-specific transforms)
+    2. UnifiedMasking (as a collate_fn for the DataLoader, handles MCoT logic, masking)
     """
     print(f"Setting up MCoT Planning pipeline from: {data_path}")
-    # 1. Basic WebDataset setup (ResampledShards, multi_tarfile_samples, shuffle, decode)
-    #    This will depend on how your MS-COCO webdataset is structured.
-    #    datapipe = wds.DataPipeline(
-    #        wds.ResampledShards(data_path),
-    #        # ... other wds components
-    #    )
 
-    # 2. Map to a function that extracts relevant fields from MS-COCO sample and calls load_and_preprocess_planning_sample
-    #    def _process_raw_planning_sample(raw_coco_sample):
-    #        # Extract caption_text, bbox_data, target_dense_caption_text, target_layout_data from raw_coco_sample
-    #        # This is highly dependent on your MS-COCO webdataset structure
-    #        planning_input_data = {
-    #            "caption.txt": raw_coco_sample.get("caption.txt"), 
-    #            "layout_data_for_target": raw_coco_sample.get("bboxes_for_layout_target"), # Example key
-    #            "dense_caption.txt": raw_coco_sample.get("dense_caption.txt") # Example key
-    #            # Potentially 'image.png' if planning uses image context
-    #        }
-    #        return load_and_preprocess_planning_sample(planning_input_data, text_tokenizer, modality_info)
-    #
-    #    datapipe = datapipe.map(_process_raw_planning_sample)
+    if not data_path:
+        raise ValueError("data_path for MCoT Planning must be provided.")
     
-    # 3. The UnifiedMasking itself is usually applied *after* batching if it's a collate_fn,
-    #    or as the final step in the item transform if applied per sample.
-    #    Given UnifiedMasking.forward takes a single sample, it's likely applied per-sample before batching.
-    #    So, the _process_raw_planning_sample would produce a dict, and UnifiedMasking.forward would be called on that.
-    #    OR, if load_and_preprocess_planning_sample already returns the structure UnifiedMasking expects,
-    #    then UnifiedMasking might be part of a later transform or collate step if not integrated into load_and_preprocess.
-    #
-    #    For simplicity with current UnifiedMasking structure, assume load_and_preprocess_planning_sample
-    #    returns the dict of tokenized modalities that UnifiedMasking.forward then consumes.
-    #    The collate_fn for the WebLoader would then be UnifiedMasking instance itself.
+    # Expand brace notation for data_path if used (e.g., 'path/to/shards-{0000..0099}.tar')
+    if isinstance(data_path, str):
+        shard_urls = list(braceexpand.braceexpand(data_path))
+    elif isinstance(data_path, list):
+        shard_urls = data_path
+    else:
+        raise TypeError(f"data_path must be a string or list of strings, got {type(data_path)}")
 
-    # This is a STUB. Full implementation needed.
-    # Returning None will cause issues if not handled in run_training_4m.py
-    # For now, let's return an empty list to avoid immediate crashes,
-    # but this needs to be replaced with a real dataloader.
-    print("WARNING: MCoT Planning pipeline is a STUB and will not load data.")
-    return [] # Placeholder for the actual WebLoader or DataPipeline
+    if not shard_urls:
+        raise ValueError(f"No shards found for data_path: {data_path}")
+
+    dataset_size = epoch_size # If None, WebDataset will iterate indefinitely or until shards end.
+    
+    # Create a partial function for load_and_preprocess_planning_sample
+    # to pass fixed arguments like text_tokenizer and modality_info,
+    # and to ensure it uses the correct keys from the webdataset sample.
+    # The webdataset sample `x` will be passed as the first argument.
+    def _custom_planning_processor(sample):
+        # Adapt raw_sample keys here before passing to the main processor
+        # This allows flexibility if webdataset keys differ from what load_and_preprocess_planning_sample expects
+        adapted_sample = {
+            'image.jpg': sample.get(image_file_key.replace('.png', '.jpg')), # Prefer jpg, then png
+            'image.png': sample.get(image_file_key.replace('.jpg', '.png')),
+            'caption_prompt.txt': sample.get(caption_prompt_key),
+            'target_plan_text.txt': sample.get(target_plan_text_key),
+            'bboxes.json': sample.get(bbox_json_key),
+            '__key__': sample.get('__key__'),
+        }
+        # Ensure text fields are decoded if they are bytes
+        for key in ['caption_prompt.txt', 'target_plan_text.txt', 'bboxes.json']:
+            if isinstance(adapted_sample[key], bytes):
+                adapted_sample[key] = adapted_sample[key].decode('utf-8')
+        
+        return load_and_preprocess_planning_sample(adapted_sample, text_tokenizer, modality_info)
+
+    pipeline = [
+        wds.ResampledShards(shard_urls), # Resamples shards for multiple epochs
+        wds.tarfile_to_samples(handler=handler),
+        wds.shuffle(shuffle_buffer_load, initial=shuffle_buffer_load, handler=handler),
+        # Decode necessary files: images to PIL, text to string, json to string (for later json.loads)
+        wds.decode(
+            wds.handle_extension(image_file_key.split('.')[-1], "pilrgb"), # "pilrgb" for PIL RGB
+            wds.handle_extension("txt", "txt"), # .txt to string
+            wds.handle_extension("json", "txt"), # .json to string, to be parsed by json.loads
+            handler=handler
+        ),
+        wds.map(_custom_planning_processor, handler=handler),
+        # The output of _custom_planning_processor is a dict of PIL images and torch.LongTensors.
+        # This is ready for UnifiedDataTransform and then UnifiedMasking (collate_fn).
+    ]
+    
+    # Create the IterableDataset
+    dataset = wds.DataPipeline(*pipeline)
+
+    if dataset_size is not None:
+        dataset = dataset.with_epoch(dataset_size // (num_gpus * num_workers) if num_gpus * num_workers > 0 else dataset_size)
+
+
+    # Note: DataLoader will be created by the caller (e.g., in run_training_4m.py)
+    # The caller will also provide UnifiedDataTransform and UnifiedMasking (as collate_fn).
+    # Example:
+    # dataloader = wds.WebLoader(
+    #     dataset,
+    #     batch_size=batch_size,
+    #     num_workers=num_workers,
+    #     collate_fn=unified_masking_instance, # UnifiedMasking instance
+    #     persistent_workers=num_workers > 0,
+    # )
+    # dataloader = dataloader.ddp_equalize(dataset_size // batch_size if dataset_size else None)
+    
+    return dataset # Returns the wds.DataPipeline IterableDataset
 
 
 def get_mcot_acting_data_pipeline(
-    data_path, text_tokenizer, image_vqvae_tokenizer, modality_info, image_augmenter,
-    input_tokens_range, target_tokens_range,
-    num_gpus, num_workers, batch_size, epoch_size,
-    # ... other args
+    data_path: str, # Path to webdataset shards for COCO acting
+    text_tokenizer, 
+    modality_info: Dict[str, Any],
+    # image_vqvae_tokenizer, # Not used if acting output is text
+    # image_augmenter, input_tokens_range, target_tokens_range are handled by caller
+    num_gpus: int,
+    num_workers: int,
+    batch_size: int,
+    epoch_size: Optional[int] = None,
+    shuffle_buffer_load: int = 1000,
+    shuffle_buffer_repeat: int = 5000,
+    # Keys for data in webdataset samples for acting stage
+    image_file_key: str = "image.jpg",
+    plan_text_key: str = "plan_text.txt",
+    plan_bboxes_json_key: str = "plan_bboxes.json",
+    target_final_caption_key: str = "target_final_caption.txt",
+    handler: Callable = wds.warn_and_continue,
+    **kwargs # To catch other dataset_config args
     ):
     """
-    Constructs a WebDataset pipeline for MCoT Acting data.
+    Constructs a WebDataset pipeline for MCoT Acting data from MS-COCO.
+    Acting stage takes image, plan (text+bboxes), and generates a final caption.
     """
     print(f"Setting up MCoT Acting pipeline from: {data_path}")
-    # Similar structure to get_mcot_planning_data_pipeline
-    # 1. WDS setup for MS-COCO (or derived dataset with plan tokens)
-    # 2. Map to a function that calls load_and_preprocess_acting_sample
-    #    - Needs raw original image, plan tokens, raw target generated image.
-    #    - image_vqvae_tokenizer will be used inside load_and_preprocess_acting_sample.
-    print("WARNING: MCoT Acting pipeline is a STUB and will not load data.")
-    return [] # Placeholder
+
+    if not data_path:
+        raise ValueError("data_path for MCoT Acting must be provided.")
+
+    if isinstance(data_path, str):
+        shard_urls = list(braceexpand.braceexpand(data_path))
+    elif isinstance(data_path, list):
+        shard_urls = data_path
+    else:
+        raise TypeError(f"data_path must be a string or list of strings, got {type(data_path)}")
+
+    if not shard_urls:
+        raise ValueError(f"No shards found for data_path: {data_path}")
+
+    dataset_size = epoch_size
+
+    def _custom_acting_processor(sample):
+        adapted_sample = {
+            'image.jpg': sample.get(image_file_key.replace('.png', '.jpg')),
+            'image.png': sample.get(image_file_key.replace('.jpg', '.png')),
+            'plan_text.txt': sample.get(plan_text_key),
+            'plan_bboxes.json': sample.get(plan_bboxes_json_key),
+            'target_final_caption.txt': sample.get(target_final_caption_key),
+            '__key__': sample.get('__key__'),
+        }
+        for key in ['plan_text.txt', 'plan_bboxes.json', 'target_final_caption.txt']:
+            if isinstance(adapted_sample[key], bytes):
+                adapted_sample[key] = adapted_sample[key].decode('utf-8')
+        
+        return load_and_preprocess_acting_sample(adapted_sample, text_tokenizer, modality_info)
+
+    pipeline = [
+        wds.ResampledShards(shard_urls),
+        wds.tarfile_to_samples(handler=handler),
+        wds.shuffle(shuffle_buffer_load, initial=shuffle_buffer_load, handler=handler),
+        wds.decode(
+            wds.handle_extension(image_file_key.split('.')[-1], "pilrgb"),
+            wds.handle_extension("txt", "txt"),
+            wds.handle_extension("json", "txt"), 
+            handler=handler
+        ),
+        wds.map(_custom_acting_processor, handler=handler),
+    ]
+    
+    dataset = wds.DataPipeline(*pipeline)
+
+    if dataset_size is not None:
+        dataset = dataset.with_epoch(dataset_size // (num_gpus * num_workers) if num_gpus * num_workers > 0 else dataset_size)
+    
+    return dataset
 
 
 def get_mcot_reflection_data_pipeline(
@@ -1177,29 +1515,621 @@ def get_mcot_correction_data_pipeline(
 # iterators and weights to the MixtureDataset.
 # ... (rest of the file, e.g., main dataloader functions like get_train_dataloader)
 
+def modality_info_to_transforms_dict(modality_info, phase='train'):
+    """Convert modality_info to transforms_dict for UnifiedDataTransform"""
+    transforms_dict = {}
+    for mod_name, info in modality_info.items():
+        if info['type'] == 'img' and not info.get('pretokenized', False):
+            transforms_dict[mod_name] = RGBTransform()
+        elif info['type'] == 'depth' and not info.get('pretokenized', False):
+            transforms_dict[mod_name] = DepthTransform()
+        elif info['type'] == 'seq' or info['type'] == 'seq_token':
+            transforms_dict[mod_name] = CaptionTransform()
+        elif info['type'] == 'det':
+            transforms_dict[mod_name] = DetectionTransform()
+        elif info['type'] == 'tok':
+            transforms_dict[mod_name] = TokTransform()
+    return transforms_dict
+
 def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_tokenizer, input_size, 
                          num_input_tokens, num_target_tokens, min_input_tokens, min_target_tokens,
                          num_tasks, num_workers, dataset_batch_size, epoch_size, is_val=False):
-    # ... existing code for get_train_dataloader ...
-    # This function's body should be here and was not meant to be commented out or removed.
-    # For the purpose of this edit, we assume its original content remains.
-    # If it was accidentally removed by the previous edit, it would need to be restored.
-    # For now, adding a pass statement to make it syntactically valid if empty.
-    pass 
+    
+    in_domains = sorted(list(dataset_config['in_domains'].split('-')))
+    out_domains = sorted(list(dataset_config['out_domains'].split('-')))
+    all_domains = sorted(list(set(in_domains) | set(out_domains)))
+
+    modality_transforms = modality_info_to_transforms_dict(modality_info, phase='train' if not is_val else 'val')
+
+    # Determine input and target token ranges for UnifiedMasking
+    current_num_input_tokens = dataset_config.get('num_input_tokens', num_input_tokens)
+    current_num_target_tokens = dataset_config.get('num_target_tokens', num_target_tokens)
+    current_min_input_tokens = dataset_config.get('min_input_tokens', min_input_tokens) 
+    current_min_target_tokens = dataset_config.get('min_target_tokens', min_target_tokens)
+    # Ensure defaults if None
+    current_min_input_tokens = current_num_input_tokens if current_min_input_tokens is None else current_min_input_tokens
+    current_min_target_tokens = current_num_target_tokens if current_min_target_tokens is None else current_min_target_tokens
+    input_tokens_range = (current_min_input_tokens, current_num_input_tokens)
+    target_tokens_range = (current_min_target_tokens, current_num_target_tokens)
+
+    # Get common arguments for WebDataset based loaders
+    world_size = get_world_size()
+    global_rank = get_rank()
+
+    data_loader = None
+    dataset = None
+
+    if dataset_config['type'] == 'mcot_planning':
+        print(f"Creating MCoT Planning DataLoader for {dataset_config.get('data_path')}")
+        
+        # Configure image augmenter
+        if any([modality_info[mod].get('pretokenized', False) for mod in all_domains if mod in modality_info]):
+            image_augmenter = PreTokenizedImageAugmenter(
+                target_size=input_size, 
+                no_aug=(not dataset_config.get('tok_train_aug', True)), 
+                main_domain=dataset_config.get('main_augment_domain')
+            )
+        else:
+            image_augmenter = RandomCropImageAugmenter(
+                target_size=input_size, 
+                hflip=dataset_config.get('hflip', True if not is_val else False), 
+                crop_scale=tuple(dataset_config.get('crop_scale', (0.5, 1.0))),
+                crop_ratio=tuple(dataset_config.get('crop_ratio', (0.75, 1.33))),
+            )
+            
+        # Set up the masking
+        unified_masking_instance = UnifiedMasking(
+            modality_info=modality_info,
+            text_tokenizer=text_tokenizer,
+            input_tokens_range=input_tokens_range,
+            target_tokens_range=target_tokens_range,
+        )
+        
+        # Set up the data transforms
+        unified_data_transform_instance = UnifiedDataTransform(
+            transforms_dict=modality_transforms,
+            image_augmenter=image_augmenter
+        )
+        
+        dataset = get_mcot_planning_data_pipeline(
+            data_path=dataset_config['data_path'],
+            text_tokenizer=text_tokenizer,
+            modality_info=modality_info,
+            num_gpus=world_size,
+            num_workers=num_workers,
+            batch_size=dataset_batch_size,
+            epoch_size=dataset_config.get('epoch_size', epoch_size),
+            shuffle_buffer_load=dataset_config.get('wds_shuffle_buffer_tar', 1000),
+            shuffle_buffer_repeat=dataset_config.get('wds_shuffle_buffer_repeat', 5000),
+            image_file_key=dataset_config.get('image_file_key', 'image.jpg'),
+            caption_prompt_key=dataset_config.get('caption_prompt_key', 'caption_prompt.txt'),
+            target_plan_text_key=dataset_config.get('target_plan_text_key', 'target_plan_text.txt'),
+            bbox_json_key=dataset_config.get('bbox_json_key', 'bboxes.json'),
+        )
+        
+        # Apply transforms to the dataset items
+        dataset = dataset.map(unified_data_transform_instance)
+        
+        data_loader = wds.WebLoader(
+            dataset,
+            batch_size=dataset_batch_size,
+            num_workers=num_workers,
+            collate_fn=unified_masking_instance,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
+
+    elif dataset_config['type'] == 'mcot_acting':
+        print(f"Creating MCoT Acting DataLoader for {dataset_config.get('data_path')}")
+        
+        # Configure image augmenter
+        if any([modality_info[mod].get('pretokenized', False) for mod in all_domains if mod in modality_info]):
+            image_augmenter = PreTokenizedImageAugmenter(
+                target_size=input_size, 
+                no_aug=(not dataset_config.get('tok_train_aug', True)), 
+                main_domain=dataset_config.get('main_augment_domain')
+            )
+        else:
+            image_augmenter = RandomCropImageAugmenter(
+                target_size=input_size, 
+                hflip=dataset_config.get('hflip', True if not is_val else False), 
+                crop_scale=tuple(dataset_config.get('crop_scale', (0.5, 1.0))),
+                crop_ratio=tuple(dataset_config.get('crop_ratio', (0.75, 1.33))),
+            )
+            
+        # Set up the masking
+        unified_masking_instance = UnifiedMasking(
+            modality_info=modality_info,
+            text_tokenizer=text_tokenizer,
+            input_tokens_range=input_tokens_range,
+            target_tokens_range=target_tokens_range,
+        )
+        
+        # Set up the data transforms
+        unified_data_transform_instance = UnifiedDataTransform(
+            transforms_dict=modality_transforms,
+            image_augmenter=image_augmenter
+        )
+        
+        dataset = get_mcot_acting_data_pipeline(
+            data_path=dataset_config['data_path'],
+            text_tokenizer=text_tokenizer,
+            modality_info=modality_info,
+            num_gpus=world_size,
+            num_workers=num_workers,
+            batch_size=dataset_batch_size,
+            epoch_size=dataset_config.get('epoch_size', epoch_size),
+            shuffle_buffer_load=dataset_config.get('wds_shuffle_buffer_tar', 1000),
+            shuffle_buffer_repeat=dataset_config.get('wds_shuffle_buffer_repeat', 5000),
+            image_file_key=dataset_config.get('image_file_key', 'image.jpg'),
+            plan_text_key=dataset_config.get('plan_text_key', 'plan_text.txt'),
+            plan_bboxes_json_key=dataset_config.get('plan_bboxes_json_key', 'plan_bboxes.json'),
+            target_final_caption_key=dataset_config.get('target_final_caption_key', 'target_final_caption.txt'),
+        )
+        
+        dataset = dataset.map(unified_data_transform_instance)
+        
+        data_loader = wds.WebLoader(
+            dataset,
+            batch_size=dataset_batch_size,
+            num_workers=num_workers,
+            collate_fn=unified_masking_instance,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
+
+    elif dataset_config['type'] == 'multimodal':
+        # Original multimodal handling code
+        data_path = dataset_config['data_path']
+        
+        # Setup image augmenter based on dataset type
+        is_pretokenized = any([modality_info[mod].get('pretokenized', False) for mod in all_domains])
+        if is_pretokenized:
+            image_augmenter = PreTokenizedImageAugmenter(
+                target_size=input_size, 
+                no_aug=(not dataset_config.get('tok_train_aug', True)), 
+                main_domain=dataset_config.get('main_augment_domain')
+            )
+        else:
+            image_augmenter = RandomCropImageAugmenter(
+                target_size=input_size, 
+                hflip=dataset_config.get('hflip', True if not is_val else False), 
+                crop_scale=tuple(dataset_config.get('crop_scale', (0.5, 1.0))),
+                crop_ratio=tuple(dataset_config.get('crop_ratio', (0.75, 1.33))),
+            )
+
+        # Use webdataset if data_path is provided and has .tar extension
+        if data_path is not None and ('tar' in data_path or '{' in data_path):
+            print(f"Loading multimodal data from {data_path}")
+            if dataset_config.get('modality_name_map', None) is not None:
+                modality_name_map = {y: x for x, y in dataset_config['modality_name_map'].items()}
+            else:
+                modality_name_map = None
+                
+            if dataset_config.get('from_huggingface_hub', False):
+                return build_huggingface_pretraining_dataloader(
+                    data_path=data_path, all_domains=all_domains, modality_info=modality_info, 
+                    modality_transforms=modality_transforms, image_augmenter=image_augmenter, 
+                    text_tokenizer=text_tokenizer, input_tokens_range=input_tokens_range, 
+                    target_tokens_range=target_tokens_range, num_gpus=world_size, num_workers=num_workers, 
+                    batch_size=dataset_batch_size, epoch_size=dataset_config.get('epoch_size', epoch_size),
+                    split=dataset_config.get('split', 'train'),
+                    streaming=dataset_config.get('streaming', True),
+                    rename_text_to_caption=dataset_config.get('rename_text_to_caption', True),
+                    shuffle_buffer_load=dataset_config.get('wds_shuffle_buffer_tar', 10_000),
+                    shuffle_seed=dataset_config.get('shuffle_seed', 0)
+                )
+            else:
+                return build_wds_fm_pretraining_dataloader(
+                    data_path=data_path, all_domains=all_domains, modality_info=modality_info, 
+                    modality_transforms=modality_transforms, image_augmenter=image_augmenter,
+                    text_tokenizer=text_tokenizer, input_tokens_range=input_tokens_range,
+                    target_tokens_range=target_tokens_range, num_gpus=world_size, num_workers=num_workers, 
+                    batch_size=dataset_batch_size, epoch_size=dataset_config.get('epoch_size', epoch_size),
+                    sampling_weights=sampling_weights, modality_name_map=modality_name_map,
+                    shuffle_buffer_load=dataset_config.get('wds_shuffle_buffer_tar', 1000),
+                    shuffle_buffer_repeat=dataset_config.get('wds_shuffle_buffer_repeat', 5000),
+                    n_repeats=dataset_config.get('n_repeats', 5)
+                )
+        # Use MultiModalDatasetFolder for direct folder loading
+        else:
+            val_transform = UnifiedMasking(modality_info=modality_info, text_tokenizer=text_tokenizer,
+                           input_tokens_range=input_tokens_range, target_tokens_range=target_tokens_range,
+                           sampling_weights=sampling_weights)
+            transform = transforms.Compose([
+                UnifiedDataTransform(transforms_dict=modality_transforms, image_augmenter=image_augmenter),
+                val_transform])
+            dataset = build_fm_pretraining_dataset(
+                data_path=dataset_config['data_path'], all_domains=all_domains,
+                modality_info=modality_info, modality_transforms=modality_transforms,
+                image_augmenter=image_augmenter, text_tokenizer=text_tokenizer,
+                input_tokens_range=input_tokens_range, target_tokens_range=target_tokens_range,
+                sampling_weights=sampling_weights
+            )
+            sampler = None
+            data_loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=dataset_batch_size,
+                shuffle=(sampler is None and not is_val),
+                num_workers=num_workers,
+                pin_memory=True,
+                sampler=sampler,
+                drop_last=not is_val
+            )
+
+    elif dataset_config['type'] == 'mcot_planning_huggingface':
+        # Your new HF-based pipeline code here
+        dataset = get_mcot_planning_huggingface_pipeline(
+            data_path=dataset_config['data_path'],
+            text_tokenizer=text_tokenizer,
+            modality_info=modality_info,
+            num_gpus=world_size,
+            num_workers=num_workers,
+            batch_size=dataset_batch_size,
+            year=dataset_config.get('year', 2017),
+            # Other HF-specific params
+        )
+        
+        # Then similar handling as with WebDataset
+
+    elif dataset_config['type'] == 'huggingface':
+        print(f"Creating Hugging Face DataLoader for {dataset_config['data_path']}")
+        
+        # Configure image augmenter (reuse your existing code)
+        image_augmenter = RandomCropImageAugmenter(
+            target_size=input_size, 
+            hflip=dataset_config.get('hflip', True if not is_val else False), 
+            crop_scale=tuple(dataset_config.get('crop_scale', (0.5, 1.0))),
+            crop_ratio=tuple(dataset_config.get('crop_ratio', (0.75, 1.33))),
+        )
+        
+        # Set up masking 
+        unified_masking_instance = UnifiedMasking(
+            modality_info=modality_info,
+            text_tokenizer=text_tokenizer,
+            input_tokens_range=input_tokens_range,
+            target_tokens_range=target_tokens_range,
+        )
+        
+        # Set up transforms
+        unified_data_transform_instance = UnifiedDataTransform(
+            transforms_dict=modality_transforms,
+            image_augmenter=image_augmenter
+        )
+        
+        # Load and process HuggingFace dataset
+        data_loader = build_huggingface_pretraining_dataloader(
+            data_path=dataset_config['data_path'],
+            all_domains=all_domains,
+            modality_info=modality_info,
+            modality_transforms=modality_transforms,
+            image_augmenter=image_augmenter,
+            text_tokenizer=text_tokenizer,
+            input_tokens_range=input_tokens_range,
+            target_tokens_range=target_tokens_range,
+            num_gpus=world_size,
+            num_workers=num_workers,
+            batch_size=dataset_batch_size,
+            epoch_size=dataset_config.get('epoch_size', epoch_size),
+            split=dataset_config.get('split', 'train'),
+            year=dataset_config.get('year', 2017),
+            coco_task=dataset_config.get('coco_task', ['captions', 'instances']),
+            streaming=dataset_config.get('streaming', True),
+        )
+
+    return data_loader
 
 
-# Helper to convert modality_info to the transforms_dict format for UnifiedDataTransform
-# This was moved down to avoid issues with the previous edit merging, ensure it's defined before use if called by MCoT pipelines.
-def modality_info_to_transforms_dict(modality_info):
-    # This would iterate through modality_info and create the necessary
-    # PIL.Image.open, np.load, or custom transforms for each modality type.
-    # Placeholder for now.
-    # Example:
-    # transforms = {}
-    # for mod_name, info in modality_info.items():
-    #     if info['type'] == 'img':
-    #         transforms[mod_name] = [transforms.PILToTensor()] # Simplified
-    #     elif info['type'] == 'text': # Assuming text is already tokenized by this point by MCoT funcs
-    #         transforms[mod_name] = [] 
-    # return transforms
-    return {}
+def _tokenize_plan_for_acting(plan_text, plan_bbox_data, image_width, image_height, text_tokenizer, coord_bins=1000):
+    """
+    Tokenizes a plan (text + bboxes) to serve as input for the acting stage.
+    """
+    plan_text_tokens = text_tokenizer.encode(plan_text).ids
+    # For bboxes, reuse the planning tokenizer logic for consistency
+    plan_bbox_tokens = _tokenize_bboxes_for_planning(plan_bbox_data, image_width, image_height, text_tokenizer, coord_bins)
+    
+    # Combine them, perhaps with a separator if needed, or just concatenate.
+    # For now, concatenate. This combined sequence becomes an input to acting.
+    # The tokenizer should have a general <SEP> token if explicit separation is desired.
+    # sep_token_id = text_tokenizer.token_to_id("[SEP_PLAN]") # Example separator
+    # combined_tokens = plan_text_tokens + [sep_token_id] + plan_bbox_tokens
+    combined_tokens = plan_text_tokens + plan_bbox_tokens
+    return combined_tokens
+
+
+def get_mcot_planning_huggingface_pipeline(
+    data_path: str,  # HF dataset path
+    all_domains: List[str], 
+    modality_info: Dict[str, Any],
+    modality_transforms: Dict, 
+    image_augmenter, 
+    text_tokenizer,
+    input_tokens_range, 
+    target_tokens_range, 
+    num_gpus: int,
+    num_workers: int,
+    batch_size: int, # Note: batch_size here is for context, not applied directly by this func
+    epoch_size: Optional[int] = None,
+    split: Optional[str] = None,
+    year: int = 2017,
+    coco_task: Union[str, List[str]] = "instances",
+    streaming: bool = True,
+    shuffle_buffer_load: int = 10_000,
+    shuffle_seed: int = 0,
+    **kwargs
+):
+    actual_coco_task = coco_task
+    if isinstance(coco_task, list):
+        if "instances" in coco_task:
+            actual_coco_task = "instances"
+        elif coco_task:
+            actual_coco_task = coco_task[0]
+        else:
+            actual_coco_task = "instances" 
+            print(f"Warning: coco_task list was empty or problematic: {coco_task}. Defaulting to 'instances'.")
+
+    hf_config_name = f"{year}-{actual_coco_task}"
+    print(f"INFO: Loading Hugging Face dataset {data_path} with config_name='{hf_config_name}', split='{split}'")
+
+    try:
+        dataset = load_dataset(data_path, name=hf_config_name, split=split, streaming=streaming, trust_remote_code=True)
+    except Exception as e:
+        print(f"ERROR: Failed to load Hugging Face dataset {data_path} with config {hf_config_name}, split {split}. Error: {e}")
+        # Return an empty datapipe or raise error to prevent downstream issues
+        return wds.DataPipeline(iter([])) # Empty datapipe
+
+    dataset = split_dataset_by_node(dataset, rank=get_rank(), world_size=get_world_size())
+    if streaming:
+        dataset = dataset.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer_load)
+
+    def _mcot_hf_planning_processor(raw_hf_sample):
+        # Uses prepare_hf_sample_for_domains to get base image/caption domains
+        # Then adds MCoT-specific 'det' domain.
+        
+        # `all_domains` passed to this pipeline should be specific to this dataset's config (in_domains + out_domains)
+        processed_sample = prepare_hf_sample_for_domains(raw_hf_sample, all_domains)
+
+        if processed_sample is None:
+            # print(f"DEBUG: prepare_hf_sample_for_domains returned None for sample {raw_hf_sample.get('image_id', 'unknown')}")
+            return None
+
+        det_domain_key = next((d for d in all_domains if modality_info[d]['type'] == 'seq' and modality_info[d].get('is_output_modality') and d == 'det'), None)
+
+        if det_domain_key: # If 'det' is an expected domain for this dataset part
+            if 'objects' in raw_hf_sample and 'bbox' in raw_hf_sample['objects'] and \
+               'category' in raw_hf_sample['objects'] and \
+               raw_hf_sample.get('width') and raw_hf_sample.get('height'):
+                
+                img_width = raw_hf_sample['width']
+                img_height = raw_hf_sample['height']
+                annotations_for_tokenizer = []
+                
+                for i in range(len(raw_hf_sample['objects']['bbox'])):
+                    bbox_xywh = raw_hf_sample['objects']['bbox'][i] 
+                    category_id = raw_hf_sample['objects']['category'][i] # This is an int ID from COCO
+                    
+                    category_name = COCO_CATEGORIES_2017_ID_TO_NAME.get(category_id)
+                    
+                    if category_name is None:
+                        # print(f"WARN: Unknown COCO category ID {category_id} for sample (ID: {raw_hf_sample.get('image_id', 'unknown')}). Skipping this bbox.")
+                        continue # Skip this bounding box if its category is not in our map
+                        
+                    annotations_for_tokenizer.append([bbox_xywh[0], bbox_xywh[1], bbox_xywh[2], bbox_xywh[3], category_name])
+
+                if annotations_for_tokenizer:
+                    bbox_data_for_tok = {
+                        "image_width": img_width, 
+                        "image_height": img_height, 
+                        "annotations": annotations_for_tokenizer
+                    }
+                    try:
+                        tokenized_det_string = _tokenize_bboxes_for_planning(
+                            bbox_data_for_tok, img_width, img_height, text_tokenizer, 
+                            coord_bins=modality_info[det_domain_key].get('coord_bins', 1000)
+                        )
+                        processed_sample[det_domain_key] = tokenized_det_string
+                    except Exception as e:
+                        print(f"WARN: Error tokenizing bboxes for sample (ID: {raw_hf_sample.get('image_id', 'unknown')}), task {actual_coco_task}: {e}. 'det' domain might be missing. Check category name mapping and tokenizer.")
+                        pass 
+            # else:
+                # print(f"DEBUG: Missing 'objects' or image dimensions for 'det' processing in sample {raw_hf_sample.get('image_id', 'unknown')}")
+
+
+        # Ensure all keys declared in `all_domains` (for this dataset part) exist in processed_sample,
+        # filling with a default or special value if not produced. This is important for UnifiedMasking.
+        # However, UnifiedMasking itself should handle missing keys by creating empty/padded tensors.
+        # So, just returning the sample as is, after processing.
+        return processed_sample
+
+    # This is for transforms like ToTensor, Normalize for images, etc.
+    # It does NOT include MCoT specific tokenization or UnifiedMasking's main logic.
+    unified_data_transform = transforms.Compose([
+        UnifiedDataTransform(transforms_dict=modality_transforms, image_augmenter=image_augmenter),
+    ])
+
+    def filter_none(sample):
+        return sample is not None
+
+    datapipe = wds.DataPipeline(
+        dataset,
+        map(_mcot_hf_planning_processor),
+        wds.select(filter_none), # Filter out samples that failed critical processing
+        map(unified_data_transform), # Apply image transforms, etc.
+    )
+    # This datapipe yields individual, processed (but unbatched) samples.
+    # Epoch setting and batching will be handled by build_mixture_dataloader.
+    return datapipe
+
+
+### Multi-dataset loading utils
+def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_tokenizer, input_size, 
+                         num_input_tokens, num_target_tokens, min_input_tokens, min_target_tokens,
+                         num_tasks, num_workers, dataset_batch_size, epoch_size, is_val=False):
+    
+    modality_transforms = modality_info_to_transforms_dict(modality_info, phase='train' if not is_val else 'val')
+    image_augmenter = None # Initialize if/as needed by your UnifiedDataTransform config
+    
+    all_dataset_pipes = [] # Stores unbatched datapipes or WebLoader instances
+    
+    input_tokens_range = (min_input_tokens, num_input_tokens)
+    target_tokens_range = (min_target_tokens, num_target_tokens)
+
+    for i, ds_cfg_i in enumerate(dataset_config.datasets):
+        dataset_name = list(ds_cfg_i.keys())[0]
+        cfg = ds_cfg_i[dataset_name]
+        
+        current_epoch_size = cfg.get("epoch_size", epoch_size) 
+        current_batch_size = cfg.get("batch_size", dataset_batch_size) 
+        current_split = cfg.get("split", "train" if not is_val else "validation")
+        
+        # Determine domains for this specific dataset config from its in_domains/out_domains
+        current_in_domains = [d.strip() for d in cfg.get("in_domains", "").split(',') if d.strip()]
+        current_out_domains = [d.strip() for d in cfg.get("out_domains", "").split(',') if d.strip()]
+        current_all_domains = list(set(current_in_domains + current_out_domains))
+        
+        if not current_all_domains: # Fallback if not specified in config (should be specified)
+            print(f"Warning: in_domains/out_domains not specified for dataset {dataset_name}. Using all known modalities.")
+            current_all_domains = list(modality_info.keys())
+
+        if cfg.type == "webdataset":
+            loader_fn = None
+            # MCoT specific webdataset pipelines
+            if dataset_name.startswith("coco_planning"): # coco_planning_val
+                loader_fn = get_mcot_planning_data_pipeline
+            elif dataset_name.startswith("coco_acting"): # coco_acting_val
+                loader_fn = get_mcot_acting_data_pipeline
+            # Add other MCoT WDS pipelines here (e.g., reflection, correction)
+            # elif dataset_name.startswith("coco_reflection"):
+            #     loader_fn = get_mcot_reflection_data_pipeline
+            # elif dataset_name.startswith("coco_correction"):
+            #     loader_fn = get_mcot_correction_data_pipeline
+            else:
+                # Generic WebDataset pretraining dataloader (if you have one)
+                # loader_fn = build_wds_fm_pretraining_dataloader # Example
+                print(f"Warning: No specific MCoT WebDataset loader for {dataset_name} of type {cfg.type}. Skipping.")
+                continue 
+            
+            # These WDS pipelines typically return a WebLoader instance, which is iterable and handles its own workers/batching.
+            # MixtureDataset should be able to handle iterating these WebLoaders.
+            wds_loader_kwargs = {
+                k: v for k, v in cfg.items() if k not in [
+                    'type', 'data_path', 'epoch_size', 'batch_size', 'split', 
+                    'in_domains', 'out_domains', 'year', 'coco_task', # Common / HF specific
+                    'wds_shuffle_buffer_load', 'wds_shuffle_buffer_repeat', # WDS specific handled by loader_fn
+                    'image_file_key', 'caption_prompt_key', 'target_plan_text_key', 'bbox_json_key' # MCoT WDS specific
+                ]
+            }
+
+            data_iterable = loader_fn(
+                data_path=cfg.data_path,
+                text_tokenizer=text_tokenizer,
+                modality_info=modality_info, # Global modality_info
+                num_gpus=get_world_size(), 
+                num_workers=num_workers, # Workers for this WebLoader instance
+                batch_size=current_batch_size, 
+                epoch_size=current_epoch_size, 
+                # WDS specific args from cfg, ensure they are named as expected by the pipeline
+                shuffle_buffer_load=cfg.get("wds_shuffle_buffer_load", 1000),
+                shuffle_buffer_repeat=cfg.get("wds_shuffle_buffer_repeat", 5000),
+                # MCoT specific args from cfg for WDS pipelines
+                image_file_key=cfg.get("image_file_key", "image.jpg"), # Example default
+                caption_prompt_key=cfg.get("caption_prompt_key", "caption_prompt.txt"), # Example
+                target_plan_text_key=cfg.get("target_plan_text_key", "target_plan_text.txt"), # Example
+                bbox_json_key=cfg.get("bbox_json_key", "bboxes.json"), # Example
+                **wds_loader_kwargs # Pass remaining cfg items
+            )
+            all_dataset_pipes.append(data_iterable)
+
+        elif cfg.type == "huggingface":
+            print(f"INFO: Setting up HuggingFace dataset {dataset_name} (split: {current_split}, tasks: {cfg.get('coco_task', 'N/A')})")
+            loader_fn = None
+            # MCoT specific HuggingFace pipelines
+            if "planning" in dataset_name.lower(): # e.g., coco_planning, coco_planning_val
+                loader_fn = get_mcot_planning_huggingface_pipeline
+            # elif "acting" in dataset_name.lower():
+            #     loader_fn = get_mcot_acting_huggingface_pipeline # Define if needed
+            else:
+                # Generic HuggingFace pretraining dataloader (if you have one)
+                # loader_fn = build_huggingface_pretraining_dataloader # Example, ensure it returns unbatched pipe
+                print(f"Warning: No specific MCoT HuggingFace loader for {dataset_name} of type {cfg.type}. Skipping.")
+                continue
+
+            hf_pipeline_kwargs = {
+                k: v for k, v in cfg.items() if k not in [
+                    'type', 'data_path', 'epoch_size', 'batch_size', 'split', 
+                    'in_domains', 'out_domains', 'year', 'coco_task', 'streaming',
+                    'hf_shuffle_buffer_load', 'hf_shuffle_seed' # Handled by loader_fn
+                ]
+            }
+
+            # This datapipe from HF pipeline yields *unbatched* samples.
+            # It will be consumed by MixtureDataset, then batched by build_mixture_dataloader.
+            datapipe = loader_fn(
+                data_path=cfg.data_path,
+                all_domains=current_all_domains, 
+                modality_info=modality_info, 
+                modality_transforms=modality_transforms, 
+                image_augmenter=image_augmenter, 
+                text_tokenizer=text_tokenizer,
+                input_tokens_range=input_tokens_range,
+                target_tokens_range=target_tokens_range,
+                num_gpus=get_world_size(), 
+                num_workers=num_workers, # These workers are for the WebLoader created by build_mixture_dataloader
+                batch_size=current_batch_size, # Passed for context, not applied by HF pipe itself
+                epoch_size=current_epoch_size, # Total samples for this dataset part for the epoch
+                split=current_split,
+                year=cfg.get("year", 2017), 
+                coco_task=cfg.get("coco_task", "instances"), 
+                streaming=cfg.get("streaming", True),
+                shuffle_buffer_load=cfg.get("hf_shuffle_buffer_load", 10_000), # For HF streaming shuffle
+                shuffle_seed=cfg.get("hf_shuffle_seed", 0), # For HF streaming shuffle
+                **hf_pipeline_kwargs # Pass remaining cfg items
+            )
+            all_dataset_pipes.append(datapipe)
+            
+        else:
+            print(f"Warning: Unknown dataset type '{cfg.type}' for {dataset_name}. Skipping.")
+            continue
+
+    if not all_dataset_pipes:
+        if not is_val: # For training, this is usually an error.
+            print("ERROR: No valid training data iterators/pipes were created. Check dataset configurations and types.")
+        else: # For validation, it might be acceptable to have no val sets.
+            print("INFO: No validation datasets configured or loaded.")
+        # build_mixture_dataloader can handle empty all_dataset_pipes and return an empty loader.
+        # So, we let it proceed. The training loop should handle an empty dataloader.
+        
+    unified_masking_instance = UnifiedMasking(
+        modality_info=modality_info, text_tokenizer=text_tokenizer,
+        input_tokens_range=input_tokens_range, target_tokens_range=target_tokens_range,
+        # Add other UnifiedMasking params from config if they exist e.g. force_end_of_generation_token_for_text_target
+    )
+
+    final_dataloader = build_mixture_dataloader(
+        data_iters=all_dataset_pipes, 
+        weights=sampling_weights, 
+        modality_info=modality_info, 
+        batch_size=dataset_batch_size, # Global batch size per GPU for the mixed data
+        num_workers=num_workers, # Workers for the final WebLoader created by build_mixture_dataloader
+        epoch_size=epoch_size, # Overall epoch_size for the mixed dataset
+        num_gpus=get_world_size(),
+        collate_fn=unified_masking_instance 
+    )
+    
+    # Calculate num_training_steps_per_epoch based on the final dataloader
+    num_training_steps_per_epoch = 0
+    if hasattr(final_dataloader, '__len__') and len(final_dataloader) > 0:
+        num_training_steps_per_epoch = len(final_dataloader)
+    elif epoch_size is not None and dataset_batch_size > 0 and get_world_size() > 0 and sum(sampling_weights) > 0 : # Ensure there's data to be loaded
+        # Fallback calculation if __len__ is not set (e.g. if epoch_size was None for build_mixture_dataloader but set globally)
+        num_training_steps_per_epoch = epoch_size // (dataset_batch_size * get_world_size())
+        if num_training_steps_per_epoch == 0 and epoch_size > 0 : # If total epoch size is very small
+             print(f"Warning: num_training_steps_per_epoch calculated as 0. epoch_size={epoch_size}, global_batch_size={dataset_batch_size * get_world_size()}. Ensure epoch_size is sufficient.")
+
+
+    if not is_val:
+        print(f"INFO: Created training dataloader. Estimated steps per epoch: {num_training_steps_per_epoch}")
+    else:
+        print(f"INFO: Created validation dataloader. Estimated steps per epoch: {num_training_steps_per_epoch}")
+
+    return final_dataloader, num_training_steps_per_epoch
