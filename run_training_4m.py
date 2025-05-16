@@ -32,6 +32,13 @@ from tokenizers import Tokenizer
 
 import fourm.utils as utils
 from fourm.data import build_mixture_dataloader, get_train_dataloader, get_val_dataloader, setup_sampling_mod_info
+from fourm.data.unified_datasets import (
+    get_mcot_planning_data_pipeline,
+    get_mcot_acting_data_pipeline,
+    get_mcot_reflection_data_pipeline,
+    get_mcot_correction_data_pipeline,
+    UnifiedMasking,
+)
 from fourm.models import fm
 from fourm.data.modality_info import MODALITY_INFO
 from fourm.utils import NativeScalerWithGradNormCount as NativeScaler
@@ -261,58 +268,179 @@ def setup_data(args):
         args.min_target_tokens = args.num_target_tokens
 
     # Load text tokenizer
+    print(f"Loading text tokenizer from: {args.text_tokenizer_path}")
+    if not os.path.exists(args.text_tokenizer_path):
+        args.text_tokenizer_path = utils.s3_download_file(args.s3_endpoint, args.text_tokenizer_path, args.output_dir)
     text_tokenizer = Tokenizer.from_file(args.text_tokenizer_path)
-    
+    mcot_special_tokens = ["[PLANNING_START]", "[ACTING_START]", "[REFLECTION_START]", "[CORRECTION_START]"]
+    num_added_toks = text_tokenizer.add_special_tokens(mcot_special_tokens)
+    if num_added_toks > 0:
+        print(f"Added {num_added_toks} MCoT special tokens to the tokenizer.")
+        args.tokenizer_object_for_resize = text_tokenizer
+    else:
+        print("MCoT special tokens already exist in the tokenizer.")
+        args.tokenizer_object_for_resize = text_tokenizer
+
+    # Placeholder: Load other VQ-VAE tokenizers needed for MCoT stages
+    # These paths should come from args or a config
+    # Example:
+    # image_vqvae_tokenizer_path = getattr(args, 'image_vqvae_tokenizer_path', None)
+    # semantic_seg_vqvae_tokenizer_path = getattr(args, 'semantic_seg_vqvae_tokenizer_path', None)
+    image_vqvae_tokenizer = None # Replace with actual loading
+    semantic_seg_vqvae_tokenizer = None # Replace with actual loading
+    # if image_vqvae_tokenizer_path:
+    #     print(f"Loading image VQ-VAE tokenizer from: {image_vqvae_tokenizer_path}")
+    #     # image_vqvae_tokenizer = YourImageVQVAELoader(image_vqvae_tokenizer_path)
+    # if semantic_seg_vqvae_tokenizer_path:
+    #     print(f"Loading semantic segmentation VQ-VAE tokenizer from: {semantic_seg_vqvae_tokenizer_path}")
+    #     # semantic_seg_vqvae_tokenizer = YourSemanticVQVAELoader(semantic_seg_vqvae_tokenizer_path)
+
+
     print(f"Loading data config from: {args.data_config}")
     with open(args.data_config, "r") as f:
         data_config = yaml.safe_load(f)
     
-    # Train
     train_config = data_config['train']['datasets']
 
-    # All input and output domains from potentially multiple datasets
     args.in_domains = sorted(set.union(*[set(cfg['in_domains'].split('-')) for cfg in train_config.values()]))
     args.out_domains = sorted(set.union(*[set(cfg['out_domains'].split('-')) for cfg in train_config.values()]))
     args.all_domains = sorted(list(set(args.in_domains) | set(args.out_domains)))
 
-    # Set up shared modality info
     modality_info = setup_modality_info(args)
 
-    # Initialize (multiple) train loaders
-    # Each train loader needs to be split by node if there are multiple
     if any([cfg['data_path'].startswith('s3') for cfg in train_config.values()]):
         utils.s3_utils.override_wds_s3_tar_loading(args.s3_data_endpoint, args.s3_multipart_threshold_mb, args.s3_multipart_chunksize_mb, args.s3_max_io_queue)
-    num_trainsets = len(train_config)
+    
     train_iters = []
-    shards_per_dataset = [] # For computing max number of workers
+    shards_per_dataset = [] 
+
+    # Define a map for MCoT pipeline functions or use if/elif
+    DATA_LOADER_FN_MAP = {
+        "mcot_planning": get_mcot_planning_data_pipeline,
+        "mcot_acting": get_mcot_acting_data_pipeline,
+        "mcot_reflection": get_mcot_reflection_data_pipeline,
+        "mcot_correction": get_mcot_correction_data_pipeline,
+        "default_train": get_train_dataloader, # For VQA or other non-MCoT tasks
+    }
+
     for dataset_name, dataset_cfg in train_config.items():
         print(f'Setting up dataset {dataset_name} / train')
         dataset_mod_info, sampling_weights = setup_sampling_mod_info(dataset_cfg, modality_info)
-        dataset_batch_size = None #args.batch_size if num_trainsets == 1 else None
-        epoch_size = None #args.epoch_size if num_trainsets == 1 else None
-        dataiter = get_train_dataloader(
-            dataset_config=dataset_cfg, modality_info=dataset_mod_info, 
-            sampling_weights=sampling_weights, text_tokenizer=text_tokenizer, input_size=args.input_size, 
-            num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens,
-            min_input_tokens=args.min_input_tokens, min_target_tokens=args.min_target_tokens,
-            num_tasks=args.num_tasks, num_workers=args.num_workers, dataset_batch_size=dataset_batch_size,
-            epoch_size=epoch_size
-        )
+        
+        # Determine which dataloader function to use
+        # Assumes dataset_cfg has a 'type' field like "mcot_planning", "vqa", etc.
+        # Or uses a 'data_loader_fn_name' as suggested in YAML example
+        loader_fn_key = dataset_cfg.get("type", "default_train") 
+        # Fallback to "default_train" if type is not MCoT specific or not defined
+        if loader_fn_key not in DATA_LOADER_FN_MAP:
+            print(f"Warning: No specific loader for type '{loader_fn_key}', falling back to default_train for {dataset_name}.")
+            loader_fn_key = "default_train"
+        
+        loader_fn = DATA_LOADER_FN_MAP[loader_fn_key]
+        
+        common_loader_args = {
+            "data_path": dataset_cfg['data_path'], # Specific to MCoT loaders, get_train_dataloader uses dataset_config
+            "text_tokenizer": text_tokenizer,
+            "modality_info": dataset_mod_info, # Or modality_info if MCoT loaders expect the global one
+            "image_augmenter": None, # Initialize your image augmenter, pass if needed
+            "input_tokens_range": (args.min_input_tokens, args.num_input_tokens),
+            "target_tokens_range": (args.min_target_tokens, args.num_target_tokens),
+            "num_gpus": args.num_tasks, # Renamed from num_tasks in some stubs
+            "num_workers": args.num_workers,
+            "batch_size": args.batch_size, # MCoT loaders might take this directly
+            "epoch_size": args.epoch_size, # MCoT loaders might take this directly
+        }
+
+        if loader_fn_key == "default_train":
+            dataiter = loader_fn(
+                dataset_config=dataset_cfg, modality_info=dataset_mod_info, 
+                sampling_weights=sampling_weights, text_tokenizer=text_tokenizer, input_size=args.input_size, 
+                num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens,
+                min_input_tokens=args.min_input_tokens, min_target_tokens=args.min_target_tokens,
+                num_tasks=args.num_tasks, num_workers=args.num_workers, 
+                dataset_batch_size=None, # build_mixture_dataloader handles final batch_size
+                epoch_size=None # build_mixture_dataloader handles final epoch_size
+            )
+        elif loader_fn_key == "mcot_planning":
+             dataiter = loader_fn(**common_loader_args) # image_vqvae_tokenizer not typically needed for planning text/bbox
+        elif loader_fn_key == "mcot_acting":
+            dataiter = loader_fn(image_vqvae_tokenizer=image_vqvae_tokenizer, **common_loader_args)
+        elif loader_fn_key == "mcot_reflection":
+            dataiter = loader_fn(semantic_seg_vqvae_tokenizer=semantic_seg_vqvae_tokenizer, **common_loader_args)
+        elif loader_fn_key == "mcot_correction":
+            dataiter = loader_fn(image_vqvae_tokenizer=image_vqvae_tokenizer, **common_loader_args)
+        else:
+            # Should not happen due to fallback logic, but as a safeguard
+            raise ValueError(f"Unknown data loader type for {dataset_name}: {loader_fn_key}")
+
         train_iters.append(dataiter)
-        if hasattr(dataiter, 'n_shards'):
+        if hasattr(dataiter, 'n_shards'): # WebDataset typically has this
             shards_per_dataset.append(dataiter.n_shards)
+        elif isinstance(dataiter, list) and not dataiter: # Empty list from STUB
+             print(f"Warning: Data iterator for {dataset_name} is an empty list (likely a STUB). Training may fail if weights are non-zero.")
+             # Optionally, don't add to shards_per_dataset or handle appropriately
+        # else: HuggingFace dataset might not have n_shards in the same way
 
     num_workers = min(min(shards_per_dataset), args.num_workers) if shards_per_dataset else args.num_workers
+    
+    # Filter out empty iterators from STUBS before passing to MixtureDataset
+    # This is a temporary fix. Real iterators should be returned by pipeline functions.
+    valid_train_iters = [it for it in train_iters if not (isinstance(it, list) and not it)]
+    if len(valid_train_iters) != len(train_iters):
+        print("WARNING: Some MCoT data pipelines are STUBS and returned empty iterators. They will be excluded from the mixture.")
+        # Adjust weights accordingly if you have a sophisticated setup.
+        # For now, MixtureDataset will fail if it gets an empty list of iterators and non-zero weights.
+        # A simple fix: if valid_train_iters is empty but weights are not, this will error later.
+        # Ensure your YAML weights correspond to the *actual* number of loaders you expect to run.
 
-    # When there are multiple train loaders, create a wrapper to sample from all of them
-    weights = data_config['train'].get('weights', [1.0] * num_trainsets) # Default is equal weighting
+    weights = data_config['train'].get('weights', [1.0] * len(valid_train_iters)) # Adjust weights if iterators were skipped
+    if len(weights) != len(valid_train_iters) and valid_train_iters:
+        print(f"Warning: Number of weights ({len(weights)}) does not match number of valid data iterators ({len(valid_train_iters)}). Using equal weights for valid iterators.")
+        weights = [1.0] * len(valid_train_iters)
+    elif not valid_train_iters and any(w > 0 for w in weights):
+         raise ValueError("No valid data iterators found, but weights are specified. Check MCoT pipeline stubs.")
+    elif not valid_train_iters:
+        print("Warning: No valid data iterators to train on.")
+        # Handle this case: maybe raise error, or return None for data_loader_train if this is acceptable.
+        # For now, build_mixture_dataloader might handle an empty list of iterators if weights are also empty or not provided.
+        
     epoch_size = args.epoch_size
-    data_loader_train = build_mixture_dataloader(
-        data_iters=train_iters, weights=weights, modality_info=modality_info, 
-        batch_size=args.batch_size, num_workers=num_workers, 
-        epoch_size=epoch_size, num_gpus=args.num_tasks
+    # Ensure UnifiedMasking is used as the collate_fn in build_mixture_dataloader or that
+    # individual MCoT pipelines are already structured to output what the model expects
+    # directly after their own batching (if any).
+    # The current MCoT pipeline stubs return [], not dataloaders, so build_mixture_dataloader will need actual iterables.
+
+    # One crucial point: UnifiedMasking is currently a transform applied per-sample *before* batching
+    # in some examples, or as a collate_fn *after* batching in others.
+    # If your MCoT pipeline functions (get_mcot_*) are intended to return batch_size=None WebLoaders
+    # (i.e. unbatched iterators of single processed samples), then UnifiedMasking
+    # should ideally be the collate_fn for the *final* build_mixture_dataloader.
+    # Let's assume for now the MCoT pipeline stubs will eventually return iterators of single samples
+    # and build_mixture_dataloader will use UnifiedMasking as collate_fn.
+
+    # Instantiate UnifiedMasking to be used as the collate function
+    unified_masker_for_collate = UnifiedMasking(
+        modality_info=modality_info, # Global modality_info for all possible modalities
+        text_tokenizer=text_tokenizer,
+        input_tokens_range=(args.min_input_tokens, args.num_input_tokens),
+        target_tokens_range=(args.min_target_tokens, args.num_target_tokens),
+        # sampling_weights and type_probs are not needed here as stage determination is by token
+        force_end_of_generation_token_for_text_target=getattr(args, 'force_eos_for_text_target', True), # Add as arg if configurable
+        force_target_mask_for_padding=getattr(args, 'force_target_mask_for_padding', False) # Add as arg if configurable
     )
-    num_training_steps_per_epoch = epoch_size // (args.batch_size * args.num_tasks)
+
+    data_loader_train = build_mixture_dataloader(
+        data_iters=valid_train_iters, 
+        weights=weights, 
+        modality_info=modality_info, 
+        batch_size=args.batch_size, 
+        num_workers=num_workers, 
+        epoch_size=epoch_size, 
+        num_gpus=args.num_tasks,
+        collate_fn=unified_masker_for_collate # Pass the UnifiedMasking instance here
+    )
+
+    num_training_steps_per_epoch = epoch_size // (args.batch_size * args.num_tasks) if epoch_size and args.batch_size and args.num_tasks else 0
 
     # Val
     if 'val' in data_config:
@@ -383,6 +511,18 @@ def get_model(args, modality_info):
         modality_info=modality_info,
         num_register_tokens=args.num_register_tokens,
     )
+
+    # Resize token embeddings if MCoT tokens were added
+    if hasattr(args, 'tokenizer_object_for_resize') and args.tokenizer_object_for_resize is not None:
+        print(f"Resizing token embeddings for model. Old vocab size: {model.vocab_size if hasattr(model, 'vocab_size') else 'N/A'}")
+        # Ensure model has vocab_size attribute or similar before attempting to access it.
+        # This check might need to be more specific depending on the model architecture.
+        # For now, we assume resize_token_embeddings handles cases where vocab_size isn't directly on model.
+        model.resize_token_embeddings(len(args.tokenizer_object_for_resize))
+        print(f"New vocab size: {model.vocab_size if hasattr(model, 'vocab_size') else 'N/A'}. New tokenizer length: {len(args.tokenizer_object_for_resize)}")
+        # Clean up to prevent it from being passed around unintentionally
+        delattr(args, 'tokenizer_object_for_resize')
+
 
     return model
 
