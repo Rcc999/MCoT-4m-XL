@@ -50,22 +50,25 @@ MODALITY_INFO = {
         'path': 'rgb',
     },
     'caption': {
-        'vocab_size': 30_000,
-        'encoder_embedding': partial(SequenceEncoderEmbedding, vocab_size=30_000, max_length=256, padding_idx=0),
-        'decoder_embedding': partial(SequenceDecoderEmbedding, vocab_size=30_000, max_length=256, padding_idx=0),
+        'vocab_size': 'YOUR_MCOT_TOKENIZER_VOCAB_SIZE', # IMPORTANT: Update with actual MCOT tokenizer vocab_size
+        'encoder_embedding': partial(SequenceEncoderEmbedding, vocab_size='YOUR_MCOT_TOKENIZER_VOCAB_SIZE', max_length=256, padding_idx='YOUR_MCOT_PAD_TOKEN_ID'),
+        'decoder_embedding': partial(SequenceDecoderEmbedding, vocab_size='YOUR_MCOT_TOKENIZER_VOCAB_SIZE', max_length=256, padding_idx='YOUR_MCOT_PAD_TOKEN_ID'),
         'min_tokens': 0,
-        'max_tokens': 256,
+        'max_tokens': 256, # Or your desired max caption length
         'type': 'seq',
         'id': generate_uint15_hash('caption'),
+        'path': 'caption', # Assumes captions are loaded from 'my_mscoco_for_4m/caption/'
     },
     'det': { 
-        'vocab_size': 30_000,
-        'encoder_embedding': partial(SequenceEncoderEmbedding, vocab_size=30_000, max_length=256, padding_idx=0),
-        'decoder_embedding': partial(SequenceDecoderEmbedding, vocab_size=30_000, max_length=256, padding_idx=0),
+        'vocab_size': 'YOUR_MCOT_TOKENIZER_VOCAB_SIZE', # IMPORTANT: Update with actual MCOT tokenizer vocab_size
+        'encoder_embedding': partial(SequenceEncoderEmbedding, vocab_size='YOUR_MCOT_TOKENIZER_VOCAB_SIZE', max_length=256, padding_idx='YOUR_MCOT_PAD_TOKEN_ID'),
+        'decoder_embedding': partial(SequenceDecoderEmbedding, vocab_size='YOUR_MCOT_TOKENIZER_VOCAB_SIZE', max_length=256, padding_idx='YOUR_MCOT_PAD_TOKEN_ID'),
         'min_tokens': 0,
-        'max_tokens': 256,
+        'max_tokens': 256, # Or your desired max bbox string length
         'type': 'seq',
         'id': generate_uint15_hash('det'),
+        'shared_vocab': ['caption'], # Shares vocab
+        'path': 'det', # Assumes bbox data is loaded from 'my_mscoco_for_4m/det/'
     },
     'tok_rgb@224': {
         'input_size': 224,
@@ -78,6 +81,7 @@ MODALITY_INFO = {
         'type': 'img',
         'id': generate_uint15_hash('tok_rgb@224'),
         'pretokenized': True,
+        'path': 'tok_rgb@224', # Assumes tokenized images are in 'my_mscoco_for_4m/tok_rgb@224/'
     },
     'tok_depth@224': {
         'input_size': 224,
@@ -379,6 +383,25 @@ MODALITY_INFO = {
         'type': 'img',
         'id': generate_uint15_hash('tok_clip@448'),
         'pretokenized': True,
+    },
+
+    # MCOT Modalities
+    'plan_sequence': {
+        'vocab_size': 'YOUR_MCOT_TOKENIZER_VOCAB_SIZE',  # IMPORTANT: Update with actual MCOT tokenizer vocab_size
+        'encoder_embedding': partial(SequenceEncoderEmbedding,
+                                     vocab_size='YOUR_MCOT_TOKENIZER_VOCAB_SIZE', 
+                                     max_length=512,   # Max length for plan_sequence (caption + bboxes + start_token)
+                                     padding_idx='YOUR_MCOT_PAD_TOKEN_ID'),   # IMPORTANT: Update with actual MCOT PAD ID
+        'decoder_embedding': partial(SequenceDecoderEmbedding,
+                                     vocab_size='YOUR_MCOT_TOKENIZER_VOCAB_SIZE', 
+                                     max_length=512,
+                                     padding_idx='YOUR_MCOT_PAD_TOKEN_ID'), # IMPORTANT: Update with actual MCOT PAD ID
+        'min_tokens': 1,          # Minimum one token (e.g., [PLANNING_START])
+        'max_tokens': 512,        # Adjust based on: 1 (for [PLANNING_START]) + max_caption_len + max_bbox_string_len
+        'type': 'seq',
+        'id': generate_uint15_hash('plan_sequence'), # Ensures a unique ID for this modality
+        'shared_vocab': ['caption'], # Indicates it uses the same tokenizer vocabulary as 'caption' and 'det'
+        # 'path': 'plan_sequence' # Not strictly needed if generated on-the-fly
     },
 }
 
