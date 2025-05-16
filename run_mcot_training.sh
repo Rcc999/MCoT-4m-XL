@@ -22,17 +22,29 @@ set -x # Print commands before executing them
 cat $0 # Print the script itself to the output log
 export MASTER_PORT=25678 # Use a specific port
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1) # Get master node hostname
+
+# Setup WandB configuration
+USE_WANDB="false"
 if [ ! -z "$WANDB_KEY" ]; then
   export WANDB_API_KEY=$WANDB_KEY
+  export WANDB_ENTITY=${WANDB_ENTITY:-"rayane-charifchefchaouni-epfl"}
+  USE_WANDB="true"
+else
+  echo "No WandB API key provided, WandB logging will be disabled"
 fi
+
 export NCCL_DEBUG=INFO
 export OMP_NUM_THREADS=1 # Recommended for multi-process torch
 
 # Set the config file to our MCoT config
 export CONFIG_FILE="cfgs/mcot_data_config.yaml"
-export WANDB_ENTITY="rayane-charifchefchaouni-epfl"
 
-echo "Config file: $CONFIG_FILE, WANDB_ENTITY: $WANDB_ENTITY"
+echo "Config file: $CONFIG_FILE"
+if [ "$USE_WANDB" = "true" ]; then
+  echo "WandB logging enabled with entity: $WANDB_ENTITY"
+else
+  echo "WandB logging disabled"
+fi
 echo "Master Addr: $MASTER_ADDR"
 echo "Master Port: $MASTER_PORT"
 echo "Node list: $SLURM_JOB_NODELIST"
@@ -57,15 +69,23 @@ srun --label bash -c "
   # Change to the project directory
   cd \"/home/rcharif/MCoT-4m-XL\"
 
-  # Run the training with MCoT configuration
-  torchrun \${TORCHRUN_ARGS} run_training_4m.py \
-    --config \${CONFIG_FILE} \
-    --output_dir outputs/mcot_training \
-    --batch_size 2 \
-    --accum_iter 2 \
-    --epochs 1 \
-    --blr 3e-5 \
-    --log_wandb \
-    --wandb_entity \${WANDB_ENTITY} \
-    --num_workers 5
+  # Build command based on whether WandB is enabled
+  CMD=\"torchrun \${TORCHRUN_ARGS} run_training_4m.py \\
+    --data_config \${CONFIG_FILE} \\
+    --output_dir outputs/mcot_training \\
+    --batch_size 2 \\
+    --accum_iter 2 \\
+    --epochs 1 \\
+    --blr 3e-5 \\
+    --num_workers 5\"
+  
+  # Add WandB parameters if enabled
+  if [ \"$USE_WANDB\" = \"true\" ]; then
+    CMD=\"\${CMD} --log_wandb --wandb_entity \${WANDB_ENTITY}\"
+  else
+    CMD=\"\${CMD} --no_log_wandb\"
+  fi
+  
+  # Execute the command
+  eval \$CMD
 " 
