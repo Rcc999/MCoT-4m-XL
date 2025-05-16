@@ -353,9 +353,11 @@ def setup_data(args):
 
         if dataset_type == "huggingface": # For MCoT datasets specified via Hugging Face
             print(f"Using MCoT unified dataloader for Hugging Face dataset: {dataset_name}")
+            # Wrap the single dataset_cfg to match the structure expected by get_train_dataloader
+            # which iterates over dataset_config.datasets, where each item is a dict like {name: config}
+            dataset_config_wrapper = {'datasets': [{dataset_name: dataset_cfg}]}
             dataiter = get_mcot_unified_train_dataloader(
-                config=dataset_cfg, # Contains data_path, year, coco_task, mcot_task_type etc.
-                all_domains=current_all_domains,
+                dataset_config=dataset_config_wrapper, # Pass the wrapped config
                 modality_info=dataset_mod_info,
                 text_tokenizer=text_tokenizer,
                 input_size=args.input_size,
@@ -363,10 +365,11 @@ def setup_data(args):
                 num_target_tokens=args.num_target_tokens,
                 min_input_tokens=args.min_input_tokens,
                 min_target_tokens=args.min_target_tokens,
-                num_gpus=args.num_tasks,
+                num_tasks=args.num_tasks,
                 num_workers=args.num_workers,
-                batch_size=None, # For mixture dataloader (unbatched)
-                epoch_size=None, # For mixture dataloader (unbatched)
+                dataset_batch_size=None, 
+                epoch_size=None, 
+                sampling_weights=sampling_weights 
             )
         elif dataset_type in DATA_LOADER_FN_MAP_MCOT_SPECIFIC:
             loader_fn = DATA_LOADER_FN_MAP_MCOT_SPECIFIC[dataset_type]
@@ -1094,7 +1097,7 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
                 log_writer.update(
                     {
                         'input_tokens_seen_b': it * (total_batch_size / accum_iter) * num_input_tokens / 1e9,
-                        'target_tokens_seen_b': it * (total_batch_size /accum_iter) * num_target_tokens / 1e9,
+                        'target_tokens_seen_b': it * (total_batch_size / accum_iter) * num_target_tokens / 1e9,
                         'total_tokens_seen_b': it * (total_batch_size / accum_iter) * (num_input_tokens + num_target_tokens) / 1e9,
                     }
                 )

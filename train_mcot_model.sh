@@ -57,4 +57,16 @@ torchrun \
     --log_wandb
 
 echo "MCoT training completed!"
-echo "Model checkpoints are saved in: $OUTPUT_DIR" 
+echo "Model checkpoints are saved in: $OUTPUT_DIR"
+
+#SBATCH --job-name=mcot_training
+#SBATCH --time=9:00:00
+#SBATCH --account=com-304
+#SBATCH --qos=normal
+#SBATCH --gres=gpu:2
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64G
+#SBATCH --output=mcot_training_%j.out
+#SBATCH --error=mcot_training_%j.err 
