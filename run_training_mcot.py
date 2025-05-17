@@ -409,7 +409,7 @@ def train_one_epoch(model, data_loader, optimizer, device, criterion, epoch,
     step = 0
     optimizer.zero_grad()
     
-    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, 10, header=header)):
         # Determine if we're on the last step or should accumulate gradients
         is_last_step_in_batch = (data_iter_step + 1) % accum_iter == 0
         do_optimizer_step = is_last_step_in_batch
@@ -984,8 +984,8 @@ def main(args):
                 DecoderBlock
             }
         )
-        
-        # Wrap model with FSDP
+    
+    # Wrap model with FSDP
         model = FSDP(
             model,
             auto_wrap_policy=auto_wrap_policy,

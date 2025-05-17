@@ -75,7 +75,7 @@ class MCoTDataset(Dataset):
 
         # Load tokenizer with robust fallbacks
         try:
-            self.tokenizer = load_mcot_tokenizer(self.tokenizer_path)
+        self.tokenizer = load_mcot_tokenizer(self.tokenizer_path)
         except Exception as e:
             logger.warning(f"Failed to load tokenizer from {self.tokenizer_path}: {e}")
             # Try alternate paths if the first one fails
@@ -96,7 +96,7 @@ class MCoTDataset(Dataset):
             else:
                 # If all attempts fail, raise the original error
                 raise ValueError(f"Could not load tokenizer from any path. Original error: {e}")
-
+        
         actual_split_name = 'validation' if self.split == 'val' else self.split
         logger.info(f"Using actual split directory name: {actual_split_name} for input split '{self.split}'")
 
