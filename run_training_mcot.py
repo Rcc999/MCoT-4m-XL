@@ -419,8 +419,75 @@ def train_one_epoch(model, data_loader, optimizer, device, criterion, epoch,
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device, non_blocking=True)
         
+        # Create a mod_dict structure for the FourM model
+        mod_dict = {}
+        
+        # For encoder (input) modality: tok_rgb@224
+        if 'planning_input_image_tokens' in batch:
+            mod_dict['tok_rgb@224'] = {
+                'tensor': batch['planning_input_image_tokens'],
+                'input_mask': torch.zeros_like(batch['planning_input_image_tokens'], dtype=torch.bool),
+                'target_mask': torch.ones_like(batch['planning_input_image_tokens'], dtype=torch.bool),
+                'decoder_attention_mask': torch.zeros_like(batch['planning_input_image_tokens'], dtype=torch.int),
+            }
+        
+        # For decoder (output) modalities:
+        # 1. plan_sequence (planning stage output)
+        if 'planning_target_sequence' in batch:
+            plan_target = batch['planning_target_sequence']
+            mod_dict['plan_sequence'] = {
+                'tensor': plan_target,
+                'input_mask': torch.ones_like(plan_target, dtype=torch.bool),
+                'target_mask': torch.zeros_like(plan_target, dtype=torch.bool),
+                'decoder_attention_mask': torch.zeros_like(plan_target, dtype=torch.int),
+            }
+            # Set first position in attention mask to sequence length (for causal masking)
+            batch_size = plan_target.size(0)
+            seq_len = plan_target.size(1)
+            mod_dict['plan_sequence']['decoder_attention_mask'][:, 0] = seq_len
+        
+        # 2. tok_rgb@224 (acting stage output - image reconstruction)
+        if 'acting_target_image_tokens' in batch:
+            act_target = batch['acting_target_image_tokens']
+            if 'tok_rgb@224' not in mod_dict:
+                # If not already created for input
+                mod_dict['tok_rgb@224'] = {
+                    'tensor': act_target,
+                    'input_mask': torch.ones_like(act_target, dtype=torch.bool),
+                    'target_mask': torch.zeros_like(act_target, dtype=torch.bool),
+                    'decoder_attention_mask': torch.zeros_like(act_target, dtype=torch.int),
+                }
+                # Set first position in attention mask to sequence length
+                mod_dict['tok_rgb@224']['decoder_attention_mask'][:, 0] = act_target.size(1)
+        
+        # Calculate the number of encoder and decoder tokens
+        # Use all available tokens for the encoder
+        num_encoder_tokens = 0
+        if 'planning_input_image_tokens' in batch:
+            num_encoder_tokens = batch['planning_input_image_tokens'].size(1)
+        else:
+            # Default to a reasonable value if input not available
+            num_encoder_tokens = 256
+        
+        # For decoder, count tokens from all output modalities
+        num_decoder_tokens = 0
+        if 'planning_target_sequence' in batch:
+            num_decoder_tokens += batch['planning_target_sequence'].size(1)
+        if 'acting_target_image_tokens' in batch:
+            num_decoder_tokens += batch['acting_target_image_tokens'].size(1)
+        
+        if num_decoder_tokens == 0:
+            # Default to a reasonable value
+            num_decoder_tokens = 512
+        
         # Forward pass - model should return a dict of logits for each output modality
-        outputs = model(batch)
+        outputs = model(mod_dict, num_encoder_tokens=num_encoder_tokens, num_decoder_tokens=num_decoder_tokens, return_logits=True)
+        
+        # Print output keys and shapes for debugging
+        print(f"Model output keys: {list(outputs.keys())}")
+        for k, v in outputs.items():
+            if isinstance(v, torch.Tensor):
+                print(f"Output '{k}' shape: {v.shape}")
         
         # Calculate losses
         task_losses = {}
@@ -432,11 +499,22 @@ def train_one_epoch(model, data_loader, optimizer, device, criterion, epoch,
             plan_logits = outputs['plan_sequence']
             plan_targets = batch['planning_target_sequence']
             
-            # Handle shape for cross entropy calculation
-            loss_planning = criterion(
-                plan_logits.view(-1, plan_logits.size(-1)), 
-                plan_targets.view(-1)
-            )
+            # Handle autoregressive sequence prediction
+            if plan_logits.dim() == 3 and plan_targets.dim() == 2:
+                # Standard case - reshape for loss calculation
+                # Slice logits to match target sequence length
+                seq_len_targets = plan_targets.size(1)
+                plan_logits_sliced = plan_logits[:, :seq_len_targets, :]
+
+                # Explicitly reshape before passing to criterion
+                reshaped_plan_logits = plan_logits_sliced.reshape(-1, plan_logits_sliced.size(-1))
+                reshaped_plan_targets = plan_targets.reshape(-1)
+
+                loss_planning = criterion(reshaped_plan_logits, reshaped_plan_targets)
+            else:
+                # Skip this batch if shapes are incompatible
+                print(f"Warning: Skipping planning loss due to incompatible shapes: {plan_logits.shape} vs {plan_targets.shape}")
+                raise ValueError(f"Incompatible shapes for planning: plan_logits {plan_logits.shape}, plan_targets {plan_targets.shape}")
             
             # Get alpha weight for this modality
             plan_alpha = 1.0  # Default if not specified
@@ -453,11 +531,22 @@ def train_one_epoch(model, data_loader, optimizer, device, criterion, epoch,
             acting_logits = outputs['tok_rgb@224']
             acting_targets = batch['acting_target_image_tokens']
             
-            # Handle shape for cross entropy calculation
-            loss_acting = criterion(
-                acting_logits.view(-1, acting_logits.size(-1)), 
-                acting_targets.view(-1)
-            )
+            # Handle image token prediction
+            if acting_logits.dim() == 3 and acting_targets.dim() == 2:
+                # Standard case - reshape for loss calculation
+                # Slice logits to match target sequence length
+                seq_len_targets_acting = acting_targets.size(1)
+                acting_logits_sliced = acting_logits[:, :seq_len_targets_acting, :]
+                
+                # Explicitly reshape before passing to criterion
+                reshaped_acting_logits = acting_logits_sliced.reshape(-1, acting_logits_sliced.size(-1))
+                reshaped_acting_targets = acting_targets.reshape(-1)
+
+                loss_acting = criterion(reshaped_acting_logits, reshaped_acting_targets)
+            else:
+                # Skip this batch if shapes are incompatible
+                print(f"Warning: Skipping acting loss due to incompatible shapes: {acting_logits.shape} vs {acting_targets.shape}")
+                raise ValueError(f"Incompatible shapes for acting: acting_logits {acting_logits.shape}, acting_targets {acting_targets.shape}")
             
             # Get alpha weight for this modality
             acting_alpha = 1.0  # Default if not specified
@@ -538,8 +627,69 @@ def evaluate(model, data_loader, device, criterion, prefix=""):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device, non_blocking=True)
                 
+        # Create a mod_dict structure for the FourM model
+        mod_dict = {}
+        
+        # For encoder (input) modality: tok_rgb@224
+        if 'planning_input_image_tokens' in batch:
+            mod_dict['tok_rgb@224'] = {
+                'tensor': batch['planning_input_image_tokens'],
+                'input_mask': torch.zeros_like(batch['planning_input_image_tokens'], dtype=torch.bool),
+                'target_mask': torch.ones_like(batch['planning_input_image_tokens'], dtype=torch.bool),
+                'decoder_attention_mask': torch.zeros_like(batch['planning_input_image_tokens'], dtype=torch.int),
+            }
+        
+        # For decoder (output) modalities:
+        # 1. plan_sequence (planning stage output)
+        if 'planning_target_sequence' in batch:
+            plan_target = batch['planning_target_sequence']
+            mod_dict['plan_sequence'] = {
+                'tensor': plan_target,
+                'input_mask': torch.ones_like(plan_target, dtype=torch.bool),
+                'target_mask': torch.zeros_like(plan_target, dtype=torch.bool),
+                'decoder_attention_mask': torch.zeros_like(plan_target, dtype=torch.int),
+            }
+            # Set first position in attention mask to sequence length (for causal masking)
+            batch_size = plan_target.size(0)
+            seq_len = plan_target.size(1)
+            mod_dict['plan_sequence']['decoder_attention_mask'][:, 0] = seq_len
+        
+        # 2. tok_rgb@224 (acting stage output - image reconstruction)
+        if 'acting_target_image_tokens' in batch:
+            act_target = batch['acting_target_image_tokens']
+            if 'tok_rgb@224' not in mod_dict:
+                # If not already created for input
+                mod_dict['tok_rgb@224'] = {
+                    'tensor': act_target,
+                    'input_mask': torch.ones_like(act_target, dtype=torch.bool),
+                    'target_mask': torch.zeros_like(act_target, dtype=torch.bool),
+                    'decoder_attention_mask': torch.zeros_like(act_target, dtype=torch.int),
+                }
+                # Set first position in attention mask to sequence length
+                mod_dict['tok_rgb@224']['decoder_attention_mask'][:, 0] = act_target.size(1)
+        
+        # Calculate the number of encoder and decoder tokens
+        # Use all available tokens for the encoder
+        num_encoder_tokens = 0
+        if 'planning_input_image_tokens' in batch:
+            num_encoder_tokens = batch['planning_input_image_tokens'].size(1)
+        else:
+            # Default to a reasonable value if input not available
+            num_encoder_tokens = 256
+        
+        # For decoder, count tokens from all output modalities
+        num_decoder_tokens = 0
+        if 'planning_target_sequence' in batch:
+            num_decoder_tokens += batch['planning_target_sequence'].size(1)
+        if 'acting_target_image_tokens' in batch:
+            num_decoder_tokens += batch['acting_target_image_tokens'].size(1)
+        
+        if num_decoder_tokens == 0:
+            # Default to a reasonable value
+            num_decoder_tokens = 512
+        
         # Forward pass
-        outputs = model(batch)
+        outputs = model(mod_dict, num_encoder_tokens=num_encoder_tokens, num_decoder_tokens=num_decoder_tokens, return_logits=True)
         
         # Calculate metrics
         batch_size = next(iter(batch.values())).size(0)
@@ -550,11 +700,22 @@ def evaluate(model, data_loader, device, criterion, prefix=""):
             plan_logits = outputs['plan_sequence']
             plan_targets = batch['planning_target_sequence']
             
-            # Calculate loss
-            loss_planning = criterion(
-                plan_logits.view(-1, plan_logits.size(-1)), 
-                plan_targets.view(-1)
-            )
+            # Handle autoregressive sequence prediction
+            if plan_logits.dim() == 3 and plan_targets.dim() == 2:
+                # Standard case - reshape for loss calculation
+                # Slice logits to match target sequence length
+                seq_len_targets = plan_targets.size(1)
+                plan_logits_sliced = plan_logits[:, :seq_len_targets, :]
+
+                # Explicitly reshape before passing to criterion
+                reshaped_plan_logits = plan_logits_sliced.reshape(-1, plan_logits_sliced.size(-1))
+                reshaped_plan_targets = plan_targets.reshape(-1)
+
+                loss_planning = criterion(reshaped_plan_logits, reshaped_plan_targets)
+            else:
+                # Skip this batch if shapes are incompatible
+                print(f"Warning: Skipping planning loss due to incompatible shapes: {plan_logits.shape} vs {plan_targets.shape}")
+                continue
             
             # Update planning metrics
             task_metrics['planning']['loss'] += loss_planning.item() * batch_size
@@ -568,11 +729,22 @@ def evaluate(model, data_loader, device, criterion, prefix=""):
             acting_logits = outputs['tok_rgb@224']
             acting_targets = batch['acting_target_image_tokens']
             
-            # Calculate loss
-            loss_acting = criterion(
-                acting_logits.view(-1, acting_logits.size(-1)), 
-                acting_targets.view(-1)
-            )
+            # Handle image token prediction
+            if acting_logits.dim() == 3 and acting_targets.dim() == 2:
+                # Standard case - reshape for loss calculation
+                # Slice logits to match target sequence length
+                seq_len_targets_acting = acting_targets.size(1)
+                acting_logits_sliced = acting_logits[:, :seq_len_targets_acting, :]
+                
+                # Explicitly reshape before passing to criterion
+                reshaped_acting_logits = acting_logits_sliced.reshape(-1, acting_logits_sliced.size(-1))
+                reshaped_acting_targets = acting_targets.reshape(-1)
+
+                loss_acting = criterion(reshaped_acting_logits, reshaped_acting_targets)
+            else:
+                # Skip this batch if shapes are incompatible
+                print(f"Warning: Skipping acting loss due to incompatible shapes: {acting_logits.shape} vs {acting_targets.shape}")
+                continue
             
             # Update acting metrics
             task_metrics['acting']['loss'] += loss_acting.item() * batch_size
@@ -583,9 +755,16 @@ def evaluate(model, data_loader, device, criterion, prefix=""):
             
             # Calculate reconstruction accuracy (percentage of correctly predicted tokens)
             pred_tokens = torch.argmax(acting_logits, dim=-1)
+            
+            # Ensure shapes match for accuracy calculation
+            if pred_tokens.shape != acting_targets.shape:
+                pred_tokens = pred_tokens[:acting_targets.size(0), :acting_targets.size(1)]
+                
+            # Calculate accuracy only on non-padding tokens
             mask = acting_targets != PAD_TOKEN_ID
             correct = (pred_tokens == acting_targets) & mask
             total = mask.sum()
+            
             if total > 0:
                 accuracy = correct.sum().float() / total
                 metric_logger.update(acting_accuracy=accuracy.item())
@@ -903,7 +1082,7 @@ def main(args):
         
         # Assign the step update function to lr_scheduler
         lr_scheduler = type('lr_scheduler', (object,), {
-            'step_update': lambda s, step: lr_step_update(optimizer, step)
+            'step_update': lambda current_step_value: lr_step_update(optimizer, current_step_value)
         })
     else:
         lr_scheduler = None
