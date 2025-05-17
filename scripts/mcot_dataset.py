@@ -73,8 +73,30 @@ class MCoTDataset(Dataset):
         if not self.data_root.exists():
             raise FileNotFoundError(f"Data root directory not found: {self.data_root}")
 
-        self.tokenizer = load_mcot_tokenizer(self.tokenizer_path)
-        
+        # Load tokenizer with robust fallbacks
+        try:
+            self.tokenizer = load_mcot_tokenizer(self.tokenizer_path)
+        except Exception as e:
+            logger.warning(f"Failed to load tokenizer from {self.tokenizer_path}: {e}")
+            # Try alternate paths if the first one fails
+            alternate_paths = [
+                "./tokenizer_ckpts/text_tokenizer_4m_mcot.json",
+                "./fourm/utils/tokenizer/trained/text_tokenizer_4m_mcot.json",
+                "/home/rcharif/MCoT-4m-XL/tokenizer_ckpts/text_tokenizer_4m_mcot.json"
+            ]
+            
+            for alt_path in alternate_paths:
+                try:
+                    logger.info(f"Trying alternate tokenizer path: {alt_path}")
+                    self.tokenizer = load_mcot_tokenizer(alt_path)
+                    logger.info(f"Successfully loaded tokenizer from {alt_path}")
+                    break
+                except Exception as e2:
+                    logger.warning(f"Failed to load from {alt_path}: {e2}")
+            else:
+                # If all attempts fail, raise the original error
+                raise ValueError(f"Could not load tokenizer from any path. Original error: {e}")
+
         actual_split_name = 'validation' if self.split == 'val' else self.split
         logger.info(f"Using actual split directory name: {actual_split_name} for input split '{self.split}'")
 

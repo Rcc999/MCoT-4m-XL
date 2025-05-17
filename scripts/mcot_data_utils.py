@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+import os
 
 from tokenizers import Tokenizer
 
@@ -14,11 +15,54 @@ DEFAULT_COORD_BINS = 1000 # Should match the --coord_bins used for training the 
 # --- Tokenizer Loading ---
 
 def load_mcot_tokenizer(tokenizer_path: str = MCOT_TOKENIZER_PATH) -> Tokenizer:
-    """Loads the MCOT text tokenizer."""
-    if not Path(tokenizer_path).exists():
-        raise FileNotFoundError(f"MCOT Tokenizer not found at {tokenizer_path}. Please ensure it's trained and at the correct path.")
-    tokenizer = Tokenizer.from_file(tokenizer_path)
-    return tokenizer
+    """
+    Loads the MCOT tokenizer from a given file path.
+    
+    Args:
+        tokenizer_path (str): Path to the tokenizer JSON file.
+        
+    Returns:
+        Tokenizer: The loaded tokenizer.
+    """
+    print(f"Attempting to load tokenizer from: {tokenizer_path}")
+    print(f"Absolute path: {os.path.abspath(tokenizer_path)}")
+    print(f"File exists: {os.path.exists(tokenizer_path)}")
+    
+    try:
+        tokenizer = Tokenizer.from_file(tokenizer_path)
+        print(f"Successfully loaded tokenizer with vocab size: {len(tokenizer.get_vocab())}")
+        return tokenizer
+    except Exception as e:
+        print(f"Error loading tokenizer: {str(e)}")
+        # Try with absolute path from pwd
+        alt_path = os.path.join(os.getcwd(), tokenizer_path)
+        print(f"Trying alternative path: {alt_path}")
+        if os.path.exists(alt_path):
+            try:
+                tokenizer = Tokenizer.from_file(alt_path)
+                print(f"Successfully loaded tokenizer from alternative path with vocab size: {len(tokenizer.get_vocab())}")
+                return tokenizer
+            except Exception as e2:
+                print(f"Failed to load from alternative path: {str(e2)}")
+        
+        # Try looking in a few common locations
+        common_locations = [
+            "./tokenizer_ckpts/text_tokenizer_4m_mcot.json",
+            "../tokenizer_ckpts/text_tokenizer_4m_mcot.json",
+            "fourm/utils/tokenizer/trained/text_tokenizer_4m_mcot.json"
+        ]
+        
+        for loc in common_locations:
+            print(f"Trying common location: {loc}")
+            if os.path.exists(loc):
+                try:
+                    tokenizer = Tokenizer.from_file(loc)
+                    print(f"Successfully loaded tokenizer from common location with vocab size: {len(tokenizer.get_vocab())}")
+                    return tokenizer
+                except Exception as e3:
+                    print(f"Failed to load from common location: {str(e3)}")
+        
+        raise ValueError(f"Could not load tokenizer from path: {tokenizer_path} or any common locations.")
 
 # --- Planning Stage Data Transformation ---
 

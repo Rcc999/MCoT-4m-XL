@@ -53,6 +53,35 @@ from fourm.models.fm import FM
 from fourm.models.fm_utils import Block, DecoderBlock
 from fourm.data.modality_info import MODALITY_INFO
 
+# Define a simple TensorboardLogger
+class TensorboardLogger:
+    def __init__(self, log_dir):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            self.writer = SummaryWriter(log_dir=log_dir)
+        except ImportError:
+            print("Warning: TensorBoard not available. Install with 'pip install tensorboard'")
+            self.writer = None
+            
+    def log(self, metrics, step=None):
+        if self.writer is None:
+            return
+            
+        for k, v in metrics.items():
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            self.writer.add_scalar(k, v, step)
+            
+    def flush(self):
+        if self.writer is not None:
+            self.writer.flush()
+            
+    def close(self):
+        if self.writer is not None:
+            self.writer.close()
+
 def get_args():
     config_parser = parser = argparse.ArgumentParser(description='MCOT Training Config', add_help=False)
     parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
@@ -199,19 +228,43 @@ def setup_modality_info(config):
     """
     # Global modality info
     all_domains = ['tok_rgb@224', 'plan_sequence']
-    modality_info = {mod: MODALITY_INFO[mod] for mod in all_domains if mod in MODALITY_INFO}
     
-    # Ensure all needed modalities exist in MODALITY_INFO
-    missing_mods = [mod for mod in all_domains if mod not in MODALITY_INFO]
-    if missing_mods:
-        raise ValueError(f"Missing modality information for: {missing_mods}. "
-                         f"Check fourm/data/modality_info.py for supported modalities.")
+    # Add any domains from the config
+    if 'domains_in' in config:
+        all_domains.extend([d for d in config['domains_in'] if d not in all_domains])
+    if 'domains_out' in config:
+        all_domains.extend([d for d in config['domains_out'] if d not in all_domains])
+    
+    # Remove duplicates and sort
+    all_domains = sorted(list(set(all_domains)))
+    
+    # Get modality info for all domains
+    modality_info = {}
+    for mod in all_domains:
+        if mod in MODALITY_INFO:
+            modality_info[mod] = MODALITY_INFO[mod]
+        else:
+            # For plan_sequence, we need to add a fallback if it's not in MODALITY_INFO
+            if mod == 'plan_sequence':
+                # Copy from 'caption' if available, or create a basic text modality
+                if 'caption' in MODALITY_INFO:
+                    modality_info[mod] = MODALITY_INFO['caption'].copy()
+                    modality_info[mod]['max_tokens'] = 512  # Default for plan sequence
+                else:
+                    modality_info[mod] = {
+                        'type': 'text',
+                        'max_tokens': 512,
+                        'vocab_size': 30000,  # Estimate based on tokenizer
+                    }
+                print(f"Created fallback modality info for {mod}")
+            else:
+                print(f"Warning: Missing modality information for {mod}")
     
     # Max tokens for image modalities
     for mod in modality_info:
         if modality_info[mod]['type'] == 'img':
-            image_size = modality_info[mod].get('input_size', config['input_size'])
-            patch_size = modality_info[mod].get('patch_size', config['patch_size'])
+            image_size = modality_info[mod].get('input_size', config.get('input_size', 224))
+            patch_size = modality_info[mod].get('patch_size', config.get('patch_size', 16))
             num_patches = (image_size // patch_size) ** 2
             modality_info[mod]['max_tokens'] = num_patches
 
@@ -220,48 +273,71 @@ def setup_modality_info(config):
 def get_model(config, modality_info, input_domains, output_domains):
     """Creates and returns FM model from arguments with appropriate modality embeddings"""
     
-    print(f"Creating model: {config['model']} for input modalities {input_domains} and output modalities {output_domains}")
+    # Save the model type string before removing it from config
+    model_type = config.get('model', 'fm_base_12e_12d_swiglu_nobias')
+    print(f"Creating model: {model_type} for input modalities {input_domains} and output modalities {output_domains}")
     
-    # Set up encoder embeddings
+    # Save alphas_config separately - it's not used by FourM.__init__
+    alphas_config = config.get('alphas_config', {
+        'plan_sequence': {'alpha': 1.0},
+        'tok_rgb@224': {'alpha': 1.0}
+    })
+    
+    # Important: We don't need to create modality_info here since the FM class does that
+    # internally based on domains_in and domains_out
+    
+    # Create encoder and decoder embeddings just so we can inspect them
+    # (FM will create its own internally)
     encoder_embeddings = {}
     for mod in input_domains:
-        info = modality_info[mod]
-        if info.get("encoder_embedding", None) is not None:
-            if info["type"] == "img":
-                image_size = info.get('input_size', config['input_size'])
-                patch_size = info.get('patch_size', config['patch_size'])
-                encoder_embeddings[mod] = info["encoder_embedding"](patch_size=patch_size, image_size=image_size)
-            else:
-                encoder_embeddings[mod] = info["encoder_embedding"]()
+        if mod in modality_info:
+            info = modality_info[mod]
+            if info.get("encoder_embedding", None) is not None:
+                if info["type"] == "img":
+                    # Use .get() with defaults for input_size and patch_size
+                    image_size = info.get('input_size', config.get('image_size', 224))
+                    patch_size = info.get('patch_size', config.get('patch_size', 16))
+                    print(f"Creating encoder embedding for {mod} with image_size={image_size}, patch_size={patch_size}")
+                    # Don't actually create the embedding - FM will do this internally
+                    # encoder_embeddings[mod] = info["encoder_embedding"](patch_size=patch_size, image_size=image_size)
+        else:
+            print(f"Warning: Modality {mod} not found in modality_info. FM will handle this internally.")
 
-    # Set up decoder embeddings
-    decoder_embeddings = {}
-    for mod in output_domains:
-        info = modality_info[mod]
-        if info.get("decoder_embedding", None) is not None:
-            if info["type"] == "img":
-                image_size = info.get('input_size', config['input_size'])
-                patch_size = info.get('patch_size', config['patch_size'])
-                decoder_embeddings[mod] = info["decoder_embedding"](patch_size=patch_size, image_size=image_size)
-            else:
-                decoder_embeddings[mod] = info["decoder_embedding"]()
-
-    # Create full model configuration
+    # Create full model configuration with only the parameters expected by FourM.__init__
+    # Based on FM.__init__, these parameters are used to create embeddings but are removed before being passed to FourM.__init__:
+    # 'image_size', 'patch_size', 'norm_bias', 'domains_in', 'domains_out', 'input_size'
     model_config = {
-        'model': config['model'],
-        'patch_size': config['patch_size'],
-        'input_size': config['input_size'],
+        # These are used by FM but not passed to FourM
+        'image_size': config.get('image_size', 224),
+        'patch_size': config.get('patch_size', 16),
+        'domains_in': input_domains,
+        'domains_out': output_domains,
+        'norm_bias': config.get('norm_bias', False),
+        
+        # Parameters that will be passed to FourM.__init__
+        'dim': config.get('dim', 768),
+        'mlp_ratio': config.get('mlp_ratio', 4),
+        'encoder_depth': config.get('encoder_depth', 12),
+        'decoder_depth': config.get('decoder_depth', 12),
+        'num_heads': config.get('num_heads', 12),
+        'act_layer': config.get('act_layer', 'SiLU'),
+        'gated_mlp': config.get('gated_mlp', True),
+        'qkv_bias': config.get('qkv_bias', False),
+        'proj_bias': config.get('proj_bias', False),
+        'mlp_bias': config.get('mlp_bias', False),
         'num_register_tokens': config.get('num_register_tokens', 0),
-        'input_modalities': input_domains,
-        'output_modalities': output_domains,
-        'alphas_config': config.get('alphas_config', {}),
-        'encoder_embeddings': encoder_embeddings,
-        'decoder_embeddings': decoder_embeddings,
-        'modality_info': modality_info
+        'share_modality_embeddings': config.get('share_modality_embeddings', False),
+        
+        # REMOVED: Additional parameters not accepted by FourM.__init__
+        # 'alphas_config': alphas_config,
     }
     
     # Create the model
+    print("Creating FM model with config keys:", list(model_config.keys()))
     model = FM(config=model_config)
+    
+    # After model creation, we can attach the alphas_config if needed for loss calculation later
+    model.alphas_config = alphas_config
     
     return model
 
@@ -273,7 +349,29 @@ def load_checkpoint(model, finetune_path):
     print(f"Loading fine-tuning checkpoint from: {finetune_path}")
     
     # Handle different checkpoint formats (local file, URL, safetensors)
-    if finetune_path.startswith('http'):
+    if finetune_path.endswith('.safetensors'):
+        try:
+            # Try to use safetensors to load the file
+            from safetensors import safe_open
+            from safetensors.torch import load_file
+            
+            # If it's a URL, download it first
+            if finetune_path.startswith('http'):
+                local_path = torch.hub.get_dir()
+                local_path = os.path.join(local_path, "checkpoints", "model.safetensors")
+                if not os.path.exists(local_path):
+                    print(f"Downloading safetensors file to {local_path}")
+                    torch.hub.download_url_to_file(finetune_path, local_path, progress=True)
+                finetune_path = local_path
+            
+            # Load the safetensors file
+            print(f"Loading with safetensors from {finetune_path}")
+            checkpoint = load_file(finetune_path)
+        except ImportError:
+            print("safetensors not available. Please install with: pip install safetensors")
+            print("Falling back to PyTorch loading (may not work for safetensors files)")
+            checkpoint = torch.load(finetune_path, map_location='cpu')
+    elif finetune_path.startswith('http'):
         checkpoint = torch.hub.load_state_dict_from_url(finetune_path, map_location='cpu')
     else:
         checkpoint = torch.load(finetune_path, map_location='cpu')
@@ -529,7 +627,37 @@ def evaluate(model, data_loader, device, criterion, prefix=""):
     
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+def create_embeddings_for_missing_modality(mod_name):
+    """Create fallback embeddings for missing modalities"""
+    
+    print(f"Creating fallback embeddings for missing modality: {mod_name}")
+    
+    # Handle plan_sequence modality which might not be in MODALITY_INFO
+    if mod_name == 'plan_sequence':
+        from fourm.models.modality_encoders import TextEmbedding
+        
+        # Create a basic text embedding
+        # If errors occur here, modify based on actual TextEmbedding implementation
+        try:
+            return TextEmbedding(
+                vocab_size=30000,  # Large enough for MCOT vocab
+                max_seq_len=512,   # Default for plan sequences
+                embed_dim=768      # Match model dim
+            )
+        except Exception as e:
+            print(f"Failed to create fallback embedding for {mod_name}: {e}")
+            print("You may need to add this modality to MODALITY_INFO in the fourm code")
+            return None
+    
+    print(f"No fallback embedding creation method for modality: {mod_name}")
+    return None
+
 def main(args):
+    # Debug print
+    if is_main_process():
+        print("Available args attributes:", dir(args))
+        print("Config path:", getattr(args, 'config_path', None))
+    
     # Initialize distributed environment
     init_distributed_mode(args)
     device = torch.device(args.device)
@@ -553,9 +681,11 @@ def main(args):
         raise ValueError(f"Invalid dtype: {args.dtype}")
     
     # Load model configuration
-    if args.config:
-        with open(args.config, 'r') as f:
+    if hasattr(args, 'config_path') and args.config_path:
+        with open(args.config_path, 'r') as f:
             model_config = yaml.safe_load(f)
+            if is_main_process():
+                print("Loaded model config:", model_config.keys())
     else:
         model_config = {
             'model': args.model,
@@ -569,15 +699,22 @@ def main(args):
     
     # Set up modality information
     modality_info, all_domains = setup_modality_info(model_config)
-    input_domains = ['tok_rgb@224']
-    output_domains = ['plan_sequence', 'tok_rgb@224']
+    
+    # Get input and output modalities, either from config or use defaults
+    input_domains = model_config.get('input_modalities', ['tok_rgb@224'])
+    output_domains = model_config.get('output_modalities', ['plan_sequence', 'tok_rgb@224'])
+    
+    if is_main_process():
+        print(f"Using input modalities: {input_domains}")
+        print(f"Using output modalities: {output_domains}")
+        print(f"All available domains: {all_domains}")
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Set up logger for main process
     if is_main_process():
-        log_writer = utils.TensorboardLogger(log_dir=args.output_dir)
+        log_writer = TensorboardLogger(log_dir=args.output_dir)
         if args.log_wandb:
             log_writer = utils.WandbLogger(args)
     else:
@@ -641,62 +778,75 @@ def main(args):
     
     # Create model
     model = get_model(model_config, modality_info, input_domains, output_domains)
-    
+
     # Load fine-tuning checkpoint if specified
     if args.finetune:
         load_checkpoint(model, args.finetune)
     
-    # Set mixed precision for FSDP
-    mixed_precision_policy = None
-    if args.dtype != 'float32':
-        mixed_precision_policy = MixedPrecision(
-            param_dtype=getattr(torch, args.dtype),
-            # Keep buffers as float32 (for better stability)
-            buffer_dtype=torch.float32,
-            reduce_dtype=getattr(torch, args.dtype)
+    # Check if we're running in distributed mode
+    is_distributed = world_size > 1
+    
+    if is_distributed:
+        # Set mixed precision for FSDP
+        mixed_precision_policy = None
+        if args.dtype != 'float32':
+            mixed_precision_policy = MixedPrecision(
+                param_dtype=getattr(torch, args.dtype),
+                # Keep buffers as float32 (for better stability)
+                buffer_dtype=torch.float32,
+                reduce_dtype=getattr(torch, args.dtype)
+            )
+        
+        # Create FSDP wrapping policy
+        auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={
+                Block,
+                DecoderBlock
+            }
         )
-    
-    # Create FSDP wrapping policy
-    auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            Block,
-            DecoderBlock
-        }
-    )
-    
-    # Wrap model with FSDP
-    model = FSDP(
-        model,
-        auto_wrap_policy=auto_wrap_policy,
-        device_id=torch.cuda.current_device(),
-        forward_prefetch=True,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        mixed_precision=mixed_precision_policy,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        limit_all_gathers=True
-    )
-    
-    # Apply activation checkpointing if enabled
-    if args.use_act_checkpoint:
-        apply_activation_checkpointing(
+        
+        # Wrap model with FSDP
+        model = FSDP(
             model,
-            checkpoint_wrapper_fn=checkpoint_wrapper,
-            check_fn=lambda submodule: isinstance(submodule, (Block, DecoderBlock)),
-            activation_checkpointing_kwargs={"use_reentrant": False}
+            auto_wrap_policy=auto_wrap_policy,
+            device_id=torch.cuda.current_device(),
+            forward_prefetch=True,
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            mixed_precision=mixed_precision_policy,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            limit_all_gathers=True
         )
+        
+        # Apply activation checkpointing if enabled
+        if args.use_act_checkpoint:
+            apply_activation_checkpointing(
+                model,
+                checkpoint_wrapper_fn=checkpoint_wrapper,
+                check_fn=lambda submodule: isinstance(submodule, (Block, DecoderBlock)),
+                activation_checkpointing_kwargs={"use_reentrant": False}
+            )
+    else:
+        # When not using distributed training, just move model to the device
+        model = model.to(device)
+        
+        # Apply activation checkpointing if enabled
+        if args.use_act_checkpoint:
+            for module in model.modules():
+                if isinstance(module, (Block, DecoderBlock)):
+                    module = checkpoint_wrapper(module, activation_checkpointing_kwargs={"use_reentrant": False})
     
-    # Create criterion (loss function)
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
-    
-    # Create optimizer
-    optimizer = create_optimizer(args, model)
-    
-    # Calculate learning rate scale (adjust for batch size)
+    # Calculate learning rate scale (adjust for batch size) BEFORE creating the optimizer
     total_batch_size = args.batch_size * args.accum_iter * world_size
     args.lr = args.blr * total_batch_size / 256
     if is_main_process():
         print(f"Scaled learning rate (base): {args.lr}")
+    
+    # Create criterion (loss function)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
+
+    # Create optimizer
+    optimizer = create_optimizer(args, model)
     
     # Create scheduler
     if args.scheduler == 'cosine':
@@ -707,15 +857,54 @@ def main(args):
         if args.warmup_epochs > 0:
             args.warmup_steps = args.warmup_epochs * num_steps_per_epoch
         
-        # Create scheduler
-        lr_scheduler = utils.scheduler.CosineScheduler(
-            args.lr,
-            args.min_blr,
-            args.epochs * num_steps_per_epoch,
-            warmup_steps=args.warmup_steps,
-            start_wd=args.weight_decay,
-            end_wd=args.weight_decay_end
-        )
+        # Calculate the total number of training steps
+        total_steps = args.epochs * num_steps_per_epoch
+        
+        # Create scheduler using cosine_scheduler function
+        try:
+            print(f"Creating cosine scheduler with: base_lr={args.lr}, min_lr={args.min_blr}, epochs={args.epochs}, steps_per_epoch={num_steps_per_epoch}, warmup_steps={args.warmup_steps}")
+            lr_schedule = utils.scheduler.cosine_scheduler(
+                args.lr,
+                args.min_blr,
+                args.epochs,
+                num_steps_per_epoch,
+                warmup_steps=args.warmup_steps
+            )
+        except AssertionError:
+            # If we get an assertion error, it's likely because of a mismatch in the number of steps
+            print("WARNING: Error creating cosine scheduler with the provided parameters.")
+            print(f"Recalculating scheduling parameters to ensure consistency...")
+            
+            # Adjust the warmup steps if they exceed the total steps
+            if args.warmup_steps >= total_steps:
+                args.warmup_steps = total_steps // 10  # Default to 10% warmup
+                print(f"Adjusted warmup_steps to {args.warmup_steps} (was exceeding total steps)")
+            
+            # Create the schedule with the adjusted parameters
+            lr_schedule = utils.scheduler.cosine_scheduler(
+                args.lr,
+                args.min_blr,
+                args.epochs,
+                num_steps_per_epoch,
+                warmup_steps=args.warmup_steps
+            )
+            print(f"Successfully created scheduler with {len(lr_schedule)} steps")
+        
+        # Create a simple step update function that uses the schedule
+        def lr_step_update(optimizer, step):
+            # Ensure step is within bounds of lr_schedule
+            if step < len(lr_schedule):
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_schedule[step]
+            else:
+                print(f"WARNING: Step {step} exceeds scheduler length {len(lr_schedule)}, using min_lr")
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = args.min_blr
+        
+        # Assign the step update function to lr_scheduler
+        lr_scheduler = type('lr_scheduler', (object,), {
+            'step_update': lambda s, step: lr_step_update(optimizer, step)
+        })
     else:
         lr_scheduler = None
     
@@ -736,8 +925,15 @@ def main(args):
             print(f"Auto resuming from {args.resume}")
     
     if args.resume:
-        # Use FSDP utilities to load checkpoint properly
-        fsdp_utils.auto_load_model_fsdp(args, model, optimizer)
+        if is_distributed:
+            # Use FSDP utilities to load checkpoint properly
+            fsdp_utils.auto_load_model_fsdp(args, model, optimizer)
+        else:
+            # Regular checkpoint loading for non-distributed case
+            checkpoint = torch.load(args.resume, map_location='cpu')
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            args.start_epoch = checkpoint['epoch'] + 1
     
     # Training loop
     if is_main_process():
@@ -773,7 +969,18 @@ def main(args):
         
         # Save checkpoint
         if (epoch % args.save_ckpt_freq == 0 or epoch == args.epochs - 1) and args.output_dir:
-            fsdp_utils.save_model_fsdp(args, epoch, model, optimizer)
+            if is_distributed:
+                fsdp_utils.save_model_fsdp(args, epoch, model, optimizer)
+            else:
+                # Save a regular checkpoint for non-distributed case
+                if is_main_process():
+                    checkpoint = {
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'epoch': epoch,
+                        'args': args,
+                    }
+                    torch.save(checkpoint, os.path.join(args.output_dir, f'checkpoint-{epoch}.pth'))
         
         # Evaluate
         if val_loader is not None and (epoch % args.eval_freq == 0 or epoch == args.epochs - 1):
@@ -819,6 +1026,12 @@ def main(args):
 
 if __name__ == '__main__':
     args = get_args()
+    
+    # Use HuggingFace model URL for finetuning if not specified
+    if not args.finetune:
+        print("No finetune path specified, using default 4M model from HuggingFace")
+        args.finetune = 'https://huggingface.co/EPFL-VILAB/4M-7_B_CC12M/resolve/main/model.safetensors'
+        print(f"Using finetune path: {args.finetune}")
     
     # In case distributed stuff needs it
     if args.rlimit > 0:

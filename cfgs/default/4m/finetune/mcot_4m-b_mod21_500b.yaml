@@ -1,0 +1,71 @@
+# 4M-B 21-modality model config
+act_layer: SiLU
+decoder_depth: 12
+dim: 768
+domains_in:
+  - caption
+  - t5_caption
+  - det
+  - metadata
+  - human_poses
+  - color_palette
+  - sam_instance
+  - rgb@224
+  - tok_rgb@224
+  - tok_normal@224
+  - tok_depth@224
+  - tok_semseg@224
+  - tok_clip@224
+  - tok_dinov2@224
+  - tok_dinov2_global
+  - tok_imagebind@224
+  - tok_imagebind_global
+  - tok_sam_edge@224
+  - tok_canny_edge@224
+domains_out:
+  - caption
+  - t5_caption
+  - det
+  - metadata
+  - human_poses
+  - color_palette
+  - sam_instance
+  - tok_rgb@224
+  - tok_normal@224
+  - tok_depth@224
+  - tok_semseg@224
+  - tok_clip@224
+  - tok_dinov2@224
+  - tok_dinov2_global
+  - tok_imagebind@224
+  - tok_imagebind_global
+  - tok_sam_edge@224
+  - tok_canny_edge@224
+  - plan_sequence
+encoder_depth: 12
+gated_mlp: true
+image_size: 224
+mlp_bias: false
+mlp_ratio: 4
+norm_bias: false
+num_heads: 12
+patch_size: 16
+proj_bias: false
+qkv_bias: false
+share_modality_embeddings: false
+
+# MCOT-specific settings
+model: fm_base_12e_12d_swiglu_nobias
+alphas_config:
+  plan_sequence:
+    alpha: 1.0
+  tok_rgb@224:
+    alpha: 1.0
+input_modalities:
+  - tok_rgb@224
+output_modalities:
+  - plan_sequence
+  - tok_rgb@224
+batch_size: 32
+epochs: 20
+text_tokenizer_path: /home/rcharif/MCoT-4m-XL/tokenizer_ckpts/text_tokenizer_4m_mcot.json

@@ -10,6 +10,23 @@ from tokenizers.normalizers import BertNormalizer
 from tokenizers.pre_tokenizers import BertPreTokenizer
 
 
+def get_tokenizer(tokenizer_path):
+    """
+    Load a pretrained tokenizer from a file path.
+    
+    Args:
+        tokenizer_path (str): Path to the tokenizer JSON file
+        
+    Returns:
+        tokenizers.Tokenizer: The loaded tokenizer
+    """
+    if not os.path.exists(tokenizer_path):
+        raise FileNotFoundError(f"Tokenizer file not found at: {tokenizer_path}")
+    
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    return tokenizer
+
+
 def generate_sentinel_tokens(num=100, start_id=0):
     tokens = [
         AddedToken(content=f"[S_{i}]", single_word=True, normalized=False)
