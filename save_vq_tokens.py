@@ -17,6 +17,8 @@ import os
 import random
 import time
 from typing import Optional
+from pathlib import Path
+import logging
 
 import numpy as np
 import torch
@@ -58,33 +60,75 @@ class SaveVQDataset(Dataset):
                  resample_mode: str = 'bilinear',
                  corrupt_samples_log: Optional[str] = None,
                  dryrun: bool = False,
-                 force_load_crop: bool = False):
+                 force_load_crop: bool = False,
+                 year: Optional[str] = None,
+                 verbose: bool = False):
         super().__init__()
         
-        self.data_root = root
-        self.tokens_root = os.path.join(root, tokens_dir)
-        self.crop_settings_root = os.path.join(root, crop_settings_dir)
+        self.root_arg_to_init = Path(root) # Storing for clarity, e.g., /work/com-304/my_mscoco_for_4m/train
+        self.task = task
+
+        # Determine the actual folder where input images are stored
+        # This should be data_root/task/split, e.g., /work/com-304/my_mscoco_for_4m/rgb/train
+        self.actual_input_image_folder = self.root_arg_to_init.parent / self.task / self.root_arg_to_init.name
+
+        # Output directories for tokens and crop settings are relative to `root_arg_to_init` (data_root/split)
+        self.tokens_output_base_dir = self.root_arg_to_init / tokens_dir # e.g. <data_root>/<split>/<task>_<folder_suffix>
+        self.crop_settings_output_base_dir = self.root_arg_to_init / crop_settings_dir # e.g. <data_root>/<split>/crop_settings
+        
         self.n_crops = n_crops
         self.input_size = input_size
-        self.task = task
         self.mask_value = mask_value
         self.task_transforms = task_transforms
         self.resample_mode = resample_mode
-
         self.force_load_crop = force_load_crop
-
         self.dryrun = dryrun
-        self.force_load_crop = force_load_crop
         
         self.loader = lambda path: Image.open(path)
         
-        self.classes, self.class_to_idx = find_classes(os.path.join(root, task))
-        if corrupt_samples_log is not None:
-            task_ext = find_image_extension(os.path.join(root, task))
-            self.samples = self.get_corrupt_samples(corrupt_samples_log, task_ext)
+        if verbose:
+            print(f"SaveVQDataset: Initializing for task '{self.task}'.")
+            print(f"  Expecting input images in: {self.actual_input_image_folder}")
+            print(f"  Base for saving tokens: {self.tokens_output_base_dir}")
+            print(f"  Base for saving crop settings: {self.crop_settings_output_base_dir}")
+
+        try:
+            # Try to find classes in the actual image folder
+            self.classes, self.class_to_idx = find_classes(str(self.actual_input_image_folder))
+            if not self.classes and verbose:
+                 print(f"No class subdirectories found in {self.actual_input_image_folder}. Will treat as a single default class.")
+        except FileNotFoundError:
+            if verbose:
+                print(f"Directory {self.actual_input_image_folder} not found during class finding. This might be an issue.")
+            self.classes = []
+            self.class_to_idx = {}
+
+        # If no classes were found (e.g., flat directory structure like MSCOCO for this task)
+        if not self.classes:
+            if verbose:
+                print(f"Using a dummy class '{self.task}' for flat image structure in {self.actual_input_image_folder}")
+            self.classes = [self.task] # Use task name as a single dummy class name
+            self.class_to_idx = {self.task: 0}
+            # Manually create samples list
+            self.samples = []
+            if self.actual_input_image_folder.exists():
+                for fname in os.listdir(self.actual_input_image_folder):
+                    if fname.lower().endswith(IMG_EXTENSIONS):
+                        self.samples.append((str(self.actual_input_image_folder / fname), 0))
+            if not self.samples and verbose:
+                print(f"Warning: No image files found directly in {self.actual_input_image_folder}")
         else:
-            self.samples = make_dataset(os.path.join(root, task), self.class_to_idx, IMG_EXTENSIONS, None)
+            # If classes were found, use make_dataset
+            self.samples = make_dataset(str(self.actual_input_image_folder), self.class_to_idx, IMG_EXTENSIONS, None)
+            if not self.samples and verbose:
+                print(f"Warning: No image files found using class structure in {self.actual_input_image_folder}")
         
+        self.samples = sorted(self.samples, key=lambda x: x[0]) # Sort for deterministic order
+        if verbose and self.samples:
+            print(f"Found {len(self.samples)} samples for task '{self.task}'. First sample: {self.samples[0]}")
+        elif verbose:
+            print(f"No samples found for task '{self.task}'.")
+
         self.center_crop_augmenter = CenterCropImageAugmenter(
             target_size=self.input_size, hflip=0.0, main_domain=task
         )
@@ -108,7 +152,7 @@ class SaveVQDataset(Dataset):
         
         # Construct path
         corrupt_samples = [
-            (os.path.join(self.data_root, self.task, s[0], s[1].replace('.npy', task_ext)), self.class_to_idx[s[0]])
+            (os.path.join(self.root_arg_to_init.parent, self.task, s[0], s[1].replace('.npy', task_ext)), self.class_to_idx[s[0]])
             for s in corrupt_samples
         ]
         
@@ -118,22 +162,40 @@ class SaveVQDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):        
-        path, _ = self.samples[index]
+        path, target_class_idx = self.samples[index]
         img = self.loader(path)
         img = img.convert("RGB") if self.task in ['rgb', 'normal'] else img
         
-        class_id, file_id = path.split('/')[-2:]
-        file_id = file_id.split('.')[0]
+        # Get class name and file_id (stem)
+        class_name = self.classes[target_class_idx] # This will be our dummy class name if no subfolders
+        file_id = Path(path).stem
 
         if self.mask_value is not None:
-            mask_path = os.path.join(self.data_root, 'mask_valid', class_id, f'{file_id}.png')
-            mask = Image.open(mask_path)
+            # Mask path logic might need adjustment if not using class structure for masks either
+            # Assuming masks might follow a similar structure or are handled differently by the user.
+            # For now, this part is kept as is, but may need review if mask_valid isn't found.
+            mask_path = os.path.join(self.root_arg_to_init.parent, 'mask_valid', self.task, class_name, f'{file_id}.png') 
+            # Or if masks are flat within split/mask_valid: os.path.join(self.root_arg_to_init, 'mask_valid', f'{file_id}.png')
+            # This part is complex if mask structure doesn't align with image class_name logic
+            # Fallback: print a warning if mask needed but not found.
+            try:
+                mask = Image.open(mask_path)
+            except FileNotFoundError:
+                if self.verbose:
+                    print(f"Warning: Mask file not found at {mask_path}. Masking will be skipped or fail.")
+                mask = None # Allow continuation without mask if not found, or handle error as preferred
 
-        tokens_path = os.path.join(self.tokens_root, class_id, f'{file_id}.npy')
+        # tokens_path and crop_settings_path will now use the determined class_name
+        # (which could be the dummy class name like 'rgb')
+        tokens_path = self.tokens_output_base_dir / class_name / f'{file_id}.npy'
         if not self.dryrun:
-            os.makedirs(os.path.dirname(tokens_path), exist_ok=True)
+            os.makedirs(tokens_path.parent, exist_ok=True)
 
-        crop_settings_path = os.path.join(self.crop_settings_root, class_id, f'{file_id}.npy')
+        crop_settings_path = self.crop_settings_output_base_dir / self.task / class_name / f'{file_id}.npy'
+        # Note: save_vq_tokens.py (original from Apple) saves crop settings to <data_root>/<split>/crop_settings/<task>/<class>/<file_id>.npy
+        # My `prepare_mscoco_for_4m.py` moves from <data_root>/<split>/crop_settings to <data_root>/crop_settings/<split>
+        # The `self.crop_settings_output_base_dir` is <data_root>/<split>/crop_settings
+        # So adding self.task and class_name subdirs here is consistent with original save_vq_tokens output structure.
 
         # Create or load crop settings
         if os.path.exists(crop_settings_path) or self.force_load_crop:
@@ -155,7 +217,7 @@ class SaveVQDataset(Dataset):
 
             settings = np.array(settings)
             if not self.dryrun:
-                os.makedirs(os.path.dirname(crop_settings_path), exist_ok=True)
+                os.makedirs(crop_settings_path.parent, exist_ok=True)
                 np.save(crop_settings_path, settings)
 
         # Perform augmentations and optionally mask images
@@ -170,7 +232,7 @@ class SaveVQDataset(Dataset):
             img_mod = self.task_transforms[self.task].postprocess(img_mod)
 
             if self.mask_value is not None:
-                mask_valid = self.task_transforms['mask_valid'].preprocess(mask.copy())
+                mask_valid = self.task_transforms['mask_valid'].preprocess(mask.copy() if mask else Image.new('L', img.size, color=0) ) # Handle if mask is None
                 mask_valid = self.task_transforms['mask_valid'].image_augment(
                     mask_valid, (i,j,h,w), h_flip, None, 
                     (self.input_size, self.input_size), None, None
@@ -183,7 +245,7 @@ class SaveVQDataset(Dataset):
             imgs.append(img_mod)
         imgs = torch.stack(imgs)
 
-        return imgs, tokens_path
+        return imgs, str(tokens_path)
 
 def get_feature_extractor(args):
     if args.task == 'CLIP-B16':
@@ -399,4 +461,23 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     print("Force loading existing crop settings: {}".format(args.force_load_crop))
+
+    # DEBUG BLOCK FOR LOG FILE
+    if args.corrupt_samples_log is not None:
+        print(f"DEBUG: corrupt_samples_log path specified: {args.corrupt_samples_log}")
+        log_path_obj = Path(args.corrupt_samples_log)
+        log_parent_dir = log_path_obj.parent
+        print(f"DEBUG: Attempting to create parent directory: {log_parent_dir}")
+        try:
+            log_parent_dir.mkdir(parents=True, exist_ok=True)
+            print(f"DEBUG: Parent directory mkdir command executed. Exists: {log_parent_dir.exists()}")
+            print(f"DEBUG: Attempting to open/create log file for writing: {log_path_obj}")
+            with open(log_path_obj, "w") as f:
+                f.write("# Corrupt samples log created successfully.\n") # Write something to be sure
+            print(f"DEBUG: Log file should be created/truncated at: {log_path_obj}. Exists: {log_path_obj.exists()}")
+        except Exception as e:
+            print(f"DEBUG: ERROR during log file setup: {e}")
+    else:
+        print("DEBUG: corrupt_samples_log argument was None or not provided.")
+
     main(args)

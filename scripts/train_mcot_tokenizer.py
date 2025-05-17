@@ -2,6 +2,7 @@ import os
 import argparse
 from pathlib import Path
 import glob
+import json
 
 # Assuming the script is in ml-4m/scripts/, so we adjust the path to import from fourm
 # If your ml-4m directory is not in the python path, you might need to add it:
@@ -13,7 +14,6 @@ from fourm.utils.tokenizer import (
     train_unified_wordpiece_tokenizer,
     generate_sentinel_tokens,
     generate_coord_tokens,
-    generate_object_class_tokens,
     AddedToken
 )
 
@@ -22,6 +22,8 @@ from fourm.utils.tokenizer import (
 FOURM_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MSCOCO_PROCESSED_CAPTION_DIR = FOURM_ROOT / "my_mscoco_for_4m" / "caption"
 DEFAULT_SAVE_PATH = FOURM_ROOT / "fourm/utils/tokenizer/trained/text_tokenizer_4m_mcot.json"
+# Path to the local object_classes.json within the MCoT-4m-XL repository
+LOCAL_OBJECT_CLASSES_PATH = FOURM_ROOT / "fourm/utils/tokenizer/object_classes.json"
 
 # Define your MCOT stage marker tokens
 MCOT_STAGE_MARKERS = [
@@ -87,7 +89,23 @@ def train_mcot_tokenizer(args):
     
     object_class_tokens = []
     if args.object_classes == 'coco':
-        object_class_tokens = generate_object_class_tokens(dataset="coco")
+        if not LOCAL_OBJECT_CLASSES_PATH.exists():
+            print(f"Error: Local object_classes.json not found at {LOCAL_OBJECT_CLASSES_PATH}")
+            print("Please ensure this file exists in your repository structure.")
+            exit(1)
+        try:
+            with open(LOCAL_OBJECT_CLASSES_PATH, 'r') as f:
+                all_classes_data = json.load(f)
+            coco_class_names = all_classes_data.get("coco")
+            if coco_class_names and isinstance(coco_class_names, list):
+                for name in coco_class_names:
+                    # Match behavior of original func: single_word=False, normalized=True (default for AddedToken)
+                    object_class_tokens.append(AddedToken(content=name, single_word=False, normalized=True))
+                print(f"Successfully loaded and generated {len(object_class_tokens)} COCO object class tokens locally.")
+            else:
+                print(f"Warning: 'coco' key not found or not a list in {LOCAL_OBJECT_CLASSES_PATH}. No object class tokens will be added.")
+        except Exception as e:
+            print(f"Error reading or processing {LOCAL_OBJECT_CLASSES_PATH}: {e}. No object class tokens will be added.")
     
     # Combine all special tokens: standard 4M ones + your MCOT stage markers
     all_special_tokens = [
@@ -98,20 +116,9 @@ def train_mcot_tokenizer(args):
     ]
     all_special_tokens.extend(sentinel_tokens)
     all_special_tokens.extend(coord_tokens)
-    if object_class_tokens:
+    if object_class_tokens: # Check if list is not empty
         all_special_tokens.extend(object_class_tokens)
     all_special_tokens.extend(MCOT_STAGE_MARKERS)
-
-    # The vocab_size for WordPieceTrainer is the total size *including* special tokens.
-    # The `train_unified_wordpiece_tokenizer` from 4M handles this by passing `special_tokens` to the trainer.
-    # The `args.base_vocab_size` should be the target size for the data-derived tokens.
-    # The final vocab size will be roughly args.base_vocab_size + len(all_special_tokens).
-    # However, the `WordPieceTrainer`'s `vocab_size` parameter is the *target total size*.
-    # So, we should aim for `args.base_vocab_size` to be the target for WordPiece algorithm,
-    # and the special tokens are added on top. The `tokenizers` library ensures special tokens
-    # get IDs, and the WordPiece vocab fills the rest up to `vocab_size`.
-    # Let's set trainer_vocab_size = args.base_vocab_size
-    # The actual final vocab size will be this + the number of unique special tokens.
 
     print(f"Training MCOT-extended tokenizer on {len(caption_files)} files.")
     print(f"Target base vocabulary size: {args.base_vocab_size}")
@@ -129,7 +136,7 @@ def train_mcot_tokenizer(args):
         eos_token="[EOS]",
         sentinel_tokens=sentinel_tokens, # Pass the generated AddedToken objects
         coord_tokens=coord_tokens,       # Pass the generated AddedToken objects
-        object_class_tokens=object_class_tokens if args.object_classes != 'none' else None,
+        object_class_tokens=object_class_tokens if args.object_classes != 'none' and object_class_tokens else None,
         additional_special_tokens=MCOT_STAGE_MARKERS, # Your new MCOT tokens
         min_frequency=args.min_frequency,
         lowercase=args.lowercase,
@@ -144,8 +151,15 @@ def train_mcot_tokenizer(args):
     print(f"MCOT-extended tokenizer saved to: {save_path}")
     print(f"Final vocabulary size: {final_vocab_size}")
     print("Ensure `[PLANNING_START]` and `[ACTING_START]` are present with their IDs:")
-    print(f"Token for [PLANNING_START]: {tokenizer.token_to_id('[PLANNING_START]')}")
-    print(f"Token for [ACTING_START]: {tokenizer.token_to_id('[ACTING_START]')}")
+    # Check if tokens exist before trying to get their ID to prevent errors if they weren't added
+    if tokenizer.token_to_id('[PLANNING_START]') is not None:
+        print(f"Token for [PLANNING_START]: {tokenizer.token_to_id('[PLANNING_START]')}")
+    else:
+        print("Warning: [PLANNING_START] not found in tokenizer vocab.")
+    if tokenizer.token_to_id('[ACTING_START]') is not None:
+        print(f"Token for [ACTING_START]: {tokenizer.token_to_id('[ACTING_START]')}")
+    else:
+        print("Warning: [ACTING_START] not found in tokenizer vocab.")
 
 if __name__ == "__main__":
     args = get_args()

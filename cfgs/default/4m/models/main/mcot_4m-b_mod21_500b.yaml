@@ -1,0 +1,90 @@
+# MCOT Config based on 4M-B_mod21_500b.yaml
+
+# Arch: SwiGLU No Bias
+# Modalities: Adapted for MCOT Planning and Acting on MSCOCO
+# Datasets: MSCOCO (via mscoco_mcot.yaml)
+# Base fine-tuning checkpoint: 4M-7_B_CC12M
+run_name: mcot_coco_train # Or auto
+
+# Input & output (these might be overridden by modality_info or dataset specifics)
+num_input_tokens: 256  # General default, plan_sequence can be 512, acting_input can be longer
+num_target_tokens: 256 # General default
+
+loss_type: mod # Keep, as it allows per-modality loss scaling via alphas_config
+
+# Architecture
+model: fm_base_12e_12d_swiglu_nobias # From base config
+patch_size: 16
+input_size: 224
+dtype: bfloat16
+tokenizer_path: "/home/rcharif/MCoT-4m-XL/fourm/utils/tokenizer/trained/text_tokenizer_4m_mcot.json" # MCOT Tokenizer
+
+# Initialization
+# Finetuning from 4M-7_B_CC12M. Ensure this checkpoint is accessible.
+# Download from: https://huggingface.co/EPFL-VILAB/4M-7_B_CC12M/resolve/main/model.safetensors
+# And place it in a known path, or ensure the script can download it.
+finetune: 'https://huggingface.co/EPFL-VILAB/4M-7_B_CC12M/resolve/main/model.safetensors' # Or local path to downloaded .safetensors
+
+# Train
+epochs: -1 # Driven by total_tokens
+total_tokens: 50 # in billions. ADJUST THIS for MSCOCO fine-tuning. Original 500B is for large pre-training.
+opt: adamw
+blr: 0.0001 # base_lr = 1e-4. Effective lr = base_lr * batch_size / 256.
+min_blr: 0.
+warmup_epochs: -1 # Driven by warmup_tokens
+warmup_tokens: 1 # in billions. ADJUST THIS. Original 10B is for large pre-training.
+# batch_size: 64 # Original was for 64 GPUs (total 4096). ADJUST FOR YOUR SETUP.
+batch_size: 8 # Example for a single GPU, yielding total batch size of 8. Adjust as needed.
+
+# Data
+data_config: "cfgs/default/4m/data/mscoco_mcot.yaml" # Our MCOT data config
+s3_data_endpoint: "/path/to/endpoint" # Change me if using S3, otherwise not needed if data_root in mscoco_mcot.yaml is local
+eval_freq: 1 # Evaluate every N "epochs" (epoch_size)
+fixed_eval: True
+epoch_size: 100000 # Number of samples per "epoch". MSCOCO train has ~118k. This means ~1 real epoch.
+
+# Modalities this model is configured to handle as inputs and produce as outputs.
+# This needs to align with what the MCoTDataset provides and how the model's forward pass is structured.
+# For Planning: input tok_rgb@224, output plan_sequence
+# For Acting: input acting_input_sequence (heterogeneous), output tok_rgb@224
+# MCoTDataset provides: planning_input_image_tokens (maps to tok_rgb@224), planning_target_sequence, 
+#                       acting_input_sequence, acting_target_image_tokens (maps to tok_rgb@224)
+#
+# The model's architecture needs to be aware of these specific input keys from the dataloader
+# or the training script needs to map them.
+# `input_modalities` and `output_modalities` in 4M often refer to the *types* of data the model can process
+# as defined in modality_info.py.
+
+input_modalities: 
+  - 'tok_rgb@224'      # For planning_input_image_tokens
+  - 'plan_sequence'    # For planning_target_sequence (used as input to acting if model separates it) 
+                       # and conceptual type for parts of acting_input_sequence.
+                       # This is a simplification for the heterogeneous acting_input_sequence.
+                       # The model's `forward` will need to correctly route parts of acting_input_sequence
+                       # to appropriate embeddings if it's passed as one tensor.
+
+output_modalities:
+  - 'plan_sequence'    # Target for Planning
+  - 'tok_rgb@224'      # Target for Acting (image reconstruction)
+
+# Alphas config for weighting losses from different output modalities/tasks
+alphas_config:
+  plan_sequence:
+    alpha: 1.0
+    max_tokens: 512 # From modality_info.py
+    loss_type: 'ce' # Cross-entropy
+  tok_rgb@224:
+    # This alpha applies when tok_rgb@224 is a target (i.e., for the Acting task)
+    alpha: 1.0 
+    max_tokens: 196 # (14x14 patches for 224x224 image)
+    loss_type: 'ce' # Cross-entropy for VQ token prediction
+
+# Saving
+save_ckpt_freq: 1 # Save every N "epochs" (epoch_size)
+output_dir: 'output/mcot_coco_train' # CHANGE ME to your desired output directory
+
+# Wandb
+log_wandb: False # Set to True to log to Weights & Biases
+wandb_project: 'mcot-4m'
+wandb_entity: null # Change if needed
+wandb_run_name: auto # Will use the run_name above if auto 

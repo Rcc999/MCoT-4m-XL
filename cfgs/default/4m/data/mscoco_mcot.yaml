@@ -1,0 +1,110 @@
+# Data configuration for MCOT tasks (Planning and Acting) on MSCOCO
+
+# Path to the MCOT text tokenizer.
+# Note: The main model config often also specifies a tokenizer_path. Ensure consistency.
+# This one is more for data-specific aspects if needed by transforms or dataset directly.
+tokenizer_path: "/home/rcharif/MCoT-4m-XL/fourm/utils/tokenizer/trained/text_tokenizer_4m_mcot.json"
+
+# Coordinate bins for detection string formatting
+coord_bins: 1000 
+
+# Base path for data loading, will be passed to MCoTDataset constructor
+# Example: data_root: "/work/com-304/my_mscoco_for_4m/" 
+# This should be set by the user or a higher-level script when running training.
+# data_root: null # To be filled by user/script
+
+# Dataset class specific arguments
+dataset_args:
+  plan_max_seq_length: 512   # From modality_info.py for plan_sequence
+  acting_max_seq_length: 768 # From MCoTDataset for combined acting input sequence
+
+# Define the tasks for MCOT
+# The keys ('planning_task', 'acting_task') are arbitrary descriptive names.
+# How these are used depends on the training script and task sampling logic.
+tasks:
+  planning_task:
+    # Input to planning: image VQ tokens
+    # MCoTDataset provides this as 'planning_input_image_tokens', 
+    # which corresponds to the 'tok_rgb@224' modality definition in modality_info.py
+    in_modalities: ['tok_rgb@224'] 
+    # Output of planning: the plan sequence
+    out_modalities: ['plan_sequence']
+    # Optional: weight for sampling this task, token budget, etc.
+    # weight: 0.5 
+
+  acting_task:
+    # Input to acting: the combined sequence [ACT_START]<img_toks><plan_toks>
+    # MCoTDataset provides this as 'acting_input_sequence'.
+    # This doesn't directly map to a *single* modality in modality_info.py in terms of
+    # data loading path, as it's constructed. However, the model's input embedding
+    # layer for this will expect tokens from the shared MCOT vocabulary.
+    # For configuration purposes, we might need a convention or a dummy modality type
+    # if the training script strictly uses modality_info for all inputs.
+    # For now, let's assume the training script/model can handle an 'acting_input_sequence'
+    # that is a sequence of text tokens. If the model expects separate image and plan tokens,
+    # MCoTDataset would need to return them separately for this stage.
+    # Given the current MCoTDataset, this is a single sequence.
+    in_modalities: ['plan_sequence'] # Placeholder: This needs careful thought. 
+                                     # The 'acting_input_sequence' is a mix of VQ image tokens and text plan tokens.
+                                     # This 'plan_sequence' here is conceptual, representing the combined input.
+                                     # The model architecture will determine how to map this.
+                                     # A better way might be to define 'acting_input_sequence' as a specific modality
+                                     # in modality_info.py if it needs its own embedding type, or the model
+                                     # is designed to take a generic sequence for this.
+                                     # If the model's input is just a sequence of IDs that are then processed by
+                                     # potentially different embeddings based on ranges/segments, then 'plan_sequence'
+                                     # (referring to its vocab characteristics) might be acceptable here.
+                                     # Let's use a more descriptive placeholder for now:
+                                     # in_modalities: ['acting_input_concatenated_sequence'] # This implies a generic seq
+    
+    # Let's refine: The model will likely receive the 'acting_input_sequence' from the dataloader.
+    # The elements within this sequence are: ACT_START_ID (text vocab), image_tokens (image vocab), plan_tokens (text vocab).
+    # This is a heterogeneous sequence. The 4M architecture typically handles distinct modalities.
+    # The most robust way:
+    # 1. MCoTDataset provides: 'acting_input_image_tokens_part' and 'acting_input_plan_tokens_part' (with ACT_START).
+    # 2. Config: in_modalities: ['tok_rgb@224', 'plan_sequence'] (or a specific 'acting_plan_part').
+    #
+    # For now, sticking to what MCoTDataset currently produces (a single 'acting_input_sequence'):
+    # This assumes the model can handle this mixed-token-ID sequence.
+    in_modalities: ['plan_sequence'] # Using 'plan_sequence' to signify its token characteristics from MCOT vocab.
+                                     # This is a simplification. The model input processing will be key.
+
+    # Output of acting: reconstructed image VQ tokens
+    # MCoTDataset provides this as 'acting_target_image_tokens'
+    out_modalities: ['tok_rgb@224']
+    # weight: 0.5
+
+# Modalities to load (might be inferred from tasks by some training scripts)
+modalities:
+  - 'tok_rgb@224'
+  - 'plan_sequence' 
+  # caption and det are implicitly used by plan_sequence construction via MCoTDataset
+
+# Define any specific transformations required, mapping to modality_transforms.py
+# This section might not be strictly needed if MCoTDataset handles all transformations.
+# transforms:
+#   tok_rgb@224:
+#     train: null # Or specific transform object
+#     eval: null
+#   plan_sequence:
+#     train: null 
+#     eval: null
+
+# Dataloader arguments
+dataloader_args:
+  batch_size: 32 # Example
+  num_workers: 4 # Example
+  # collate_fn will be mcot_collate_fn (usually specified in training script)
+  # pin_memory: True
+
+# Split configuration (paths will be data_root / source_path / split_name)
+# MCoTDataset builds these paths internally based on data_root and split.
+# This section is more for generic dataset loaders from the 4M framework.
+# For MCoTDataset, data_root passed to its constructor is the main thing.
+# splits:
+#   train:
+#     dataset_type: 'mcot' # Custom type, if training script uses a factory
+#     source_path: '' # Relative to data_root, MCoTDataset handles internal structure
+#   validation:
+#     dataset_type: 'mcot'
+#     source_path: '' 
