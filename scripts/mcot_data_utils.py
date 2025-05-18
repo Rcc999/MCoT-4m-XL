@@ -29,7 +29,7 @@ def load_mcot_tokenizer(tokenizer_path: str = MCOT_TOKENIZER_PATH) -> Tokenizer:
     print(f"File exists: {os.path.exists(tokenizer_path)}")
     
     try:
-    tokenizer = Tokenizer.from_file(tokenizer_path)
+        tokenizer = Tokenizer.from_file(tokenizer_path)
         print(f"Successfully loaded tokenizer with vocab size: {len(tokenizer.get_vocab())}")
         return tokenizer
     except Exception as e:
@@ -58,7 +58,7 @@ def load_mcot_tokenizer(tokenizer_path: str = MCOT_TOKENIZER_PATH) -> Tokenizer:
                 try:
                     tokenizer = Tokenizer.from_file(loc)
                     print(f"Successfully loaded tokenizer from common location with vocab size: {len(tokenizer.get_vocab())}")
-    return tokenizer
+                    return tokenizer
                 except Exception as e3:
                     print(f"Failed to load from common location: {str(e3)}")
         

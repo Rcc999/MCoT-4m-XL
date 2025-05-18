@@ -2,13 +2,20 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
+import sys
+import os
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tokenizers import Tokenizer
 
-# Assuming mcot_data_utils.py is in the same directory or PYTHONPATH is set up
+# Ensure scripts directory is in the path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.append(script_dir)
+
+# Now try to import mcot_data_utils
 try:
     from mcot_data_utils import (
         load_mcot_tokenizer,
@@ -19,16 +26,23 @@ try:
     )
 except ImportError:
     # Fallback for cases where the script might be run from a different context
-    # This assumes MCoT-4m-XL is the root and scripts/ is in PYTHONPATH
-    # Or that mcot_data_utils is discoverable
     print("Attempting to import MCOT data utils from parent dir if running as script")
-    from .mcot_data_utils import (
-        load_mcot_tokenizer,
-        create_plan_sequence,
-        # create_acting_sequence,
-        MCOT_TOKENIZER_PATH,
-        DEFAULT_COORD_BINS
-    )
+    try:
+        # Try absolute import
+        sys.path.append(os.path.dirname(script_dir))  # Add parent directory to path
+        from scripts.mcot_data_utils import (
+            load_mcot_tokenizer,
+            create_plan_sequence,
+            # create_acting_sequence,
+            MCOT_TOKENIZER_PATH,
+            DEFAULT_COORD_BINS
+        )
+    except ImportError as e:
+        print(f"Error importing mcot_data_utils: {e}")
+        print(f"Current sys.path: {sys.path}")
+        print(f"Looking for file at: {os.path.join(script_dir, 'mcot_data_utils.py')}")
+        print(f"File exists: {os.path.exists(os.path.join(script_dir, 'mcot_data_utils.py'))}")
+        raise
 
 
 logger = logging.getLogger(__name__)
@@ -75,7 +89,7 @@ class MCoTDataset(Dataset):
 
         # Load tokenizer with robust fallbacks
         try:
-        self.tokenizer = load_mcot_tokenizer(self.tokenizer_path)
+            self.tokenizer = load_mcot_tokenizer(self.tokenizer_path)
         except Exception as e:
             logger.warning(f"Failed to load tokenizer from {self.tokenizer_path}: {e}")
             # Try alternate paths if the first one fails

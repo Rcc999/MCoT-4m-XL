@@ -96,11 +96,11 @@ srun --label bash -c '
     --config "${CONFIG_FILE_SRUN}" \
     --data_root "${DATA_ROOT_SRUN}" \
     --output_dir "${OUTPUT_DIR_SRUN}" \
-    --batch_size 2   `# Per-GPU batch size` \
-    --epochs 3       `# Changed to 3 epochs` \
-    --num_workers 6 `# Changed to 6 DataLoader workers: (16 cpus - 2*2 main_procs_cpus) / 2 gpu_procs = 6` \
+    --batch_size 2   # Per-GPU batch size \
+    --epochs 3       # Changed to 3 epochs \
+    --num_workers 6 # Changed to 6 DataLoader workers: (16 cpus - 2*2 main_procs_cpus) / 2 gpu_procs = 6 \
     --log_wandb \
     --wandb_entity "${WANDB_ENTITY_SRUN}" \
-    --dist_url env://  `# Important for PyTorch to use SLURM variables`
+    --dist_url env://  # Important for PyTorch to use SLURM variables
     # Add other arguments for run_training_mcot.py as needed, e.g., --save_ckpt_freq
 ' 

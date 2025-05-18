@@ -1,0 +1,5 @@
+outputs/
+logs/
+*.out
+*.err
+__pycache__/
