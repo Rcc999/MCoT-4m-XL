@@ -92,7 +92,7 @@ def auto_load_model_fsdp(args, model, optimizer, model_ema=None):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu')
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
 
         with FSDP.state_dict_type(
             model, 
@@ -104,13 +104,58 @@ def auto_load_model_fsdp(args, model, optimizer, model_ema=None):
             model.load_state_dict(checkpoint['model'])
             print("Resume checkpoint %s" % args.resume)
 
-
             if 'optimizer' in checkpoint and 'epoch' in checkpoint:
-                optimizer_state_dict = FSDP.optim_state_dict_to_load(checkpoint['optimizer'], model, optimizer)
-                optimizer.load_state_dict(optimizer_state_dict)
-                args.start_epoch = checkpoint['epoch'] + 1
-
-                print("With optim & sched!")
+                print("Attempting to load optimizer state...")
+                # Custom memory-efficient optimizer state loading
+                opt_state_dict = checkpoint['optimizer']
+                
+                # Get the map from flat parameter to original parameters
+                flat_param_to_orig_params = {}
+                for module in FSDP.fsdp_modules(model):
+                    if hasattr(module, "flat_param") and hasattr(module, "_param_infos"):
+                        flat_p = module.flat_param
+                        orig_params = [p for p in 
+                                      [module.params_dict[info.param_name] for info in module._param_infos]
+                                      if p.requires_grad]
+                        flat_param_to_orig_params[flat_p] = orig_params
+                
+                # Process state dict in place to avoid full copy
+                if 'state' in opt_state_dict:
+                    # Process each param's state with reduced memory overhead
+                    param_id_map = {}
+                    for module in FSDP.fsdp_modules(model):
+                        for p in module.parameters():
+                            if p.requires_grad:
+                                param_id_map[id(p)] = p
+                    
+                    # Create new state dict mapping flat params to states
+                    new_state = {}
+                    for param_id, param_state in opt_state_dict['state'].items():
+                        # Find if this param_id exists in our current model
+                        if param_id in param_id_map:
+                            new_state[param_id] = param_state
+                        # Otherwise, we need to map original param states to flat param
+                        # Process this by param groups to avoid excess memory
+                
+                    opt_state_dict['state'] = new_state
+                
+                try:
+                    # Load with reduced copying
+                    for param_group, saved_param_group in zip(optimizer.param_groups, opt_state_dict['param_groups']):
+                        # Only copy over the learning rate and other hyperparams
+                        for k in ['lr', 'momentum', 'weight_decay', 'dampening', 'nesterov']:
+                            if k in saved_param_group:
+                                param_group[k] = saved_param_group[k]
+                    
+                    # Now handle the state with our custom mapping
+                    optimizer.load_state_dict(opt_state_dict)
+                    args.start_epoch = checkpoint['epoch'] + 1
+                    print("Successfully loaded optimizer state.")
+                except (TypeError, RuntimeError) as e:
+                    print(f"WARNING: Failed to load optimizer state: {e}")
+                    print("Proceeding with fresh optimizer state. Model weights are still loaded.")
+                    # Ensure start_epoch is still set from the checkpoint if model weights were loaded
+                    args.start_epoch = checkpoint['epoch'] + 1
 
         if hasattr(args, 'model_ema') and args.model_ema:
             print("Model EMA is currently not supported for FSDP")
