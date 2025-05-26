@@ -848,7 +848,8 @@ class GenerationSampler(nn.Module):
         return uncond_dict, cond_dicts
 
     def autoregressive_step_batched(self, mod_dict, target_mod, temperature, top_k: Union[float, int], top_p: float,
-                                    use_eos=True, eos_token=None, start_tokens=None, text_tokenizer=None, seed=None):
+                                    use_eos=True, eos_token=None, start_tokens=None, text_tokenizer=None, seed=None,
+                                    min_forced_decode_len=0):
 
         # Encoder
         encoder_mod_dict = {mod: self.model.encoder_embeddings[mod](d)
@@ -887,6 +888,22 @@ class GenerationSampler(nn.Module):
         seq_len = y_emb.shape[1]
 
         # Auto-regressive decoding and sampling
+        # Token IDs to suppress during forced generation.
+        # These should correspond to EOS (3) and S2 (6) in your VQA setup.
+        # It's best to get these from text_tokenizer if available and not hardcode.
+        suppress_ids = []
+        if text_tokenizer is not None:
+            try:
+                eos_id_val = text_tokenizer.token_to_id("[EOS]")
+                s2_id_val = text_tokenizer.token_to_id("[S_2]")
+                suppress_ids.extend([eos_id_val, s2_id_val])
+            except Exception as e: # pylint: disable=broad-except
+                # text_tokenizer might not have these, or might be a different tokenizer.
+                # Fallback to default or do nothing if they are not critical for all use cases.
+                # For VQA, they are important.
+                print(f"Warning: Could not get [EOS] or [S_2] from text_tokenizer in autoregressive_step_batched: {e}")
+                # If critical, you might want to raise an error or ensure they are passed if min_forced_decode_len > 0
+
         for i in range(seq_len):
             cur_len = out.shape[1]
             # Convert ids into word embeddings and add corresponding posembs + modemb
@@ -898,7 +915,17 @@ class GenerationSampler(nn.Module):
             y = self.model.forward_decoder(y, context, encoder_mask, causal_mask)
             logits = self.model.forward_logits(y, decoder_mod_dict, decoder_mod_mask[:, :cur_len])[target_mod]
             logits = rearrange(logits, "(b n) d -> b n d", b=B, n=cur_len)
-            last_logits = logits[:, -1]
+            last_logits = logits[:, -1].clone() # Use .clone() to avoid modifying original logits if it's used elsewhere
+
+            # ---- START MODIFICATION for min_forced_decode_len ----
+            # cur_len is the length *before* adding the current token.
+            # The first token generated is at cur_len = 1 (after start_token).
+            # So, if min_forced_decode_len is 1, we suppress for the first predicted token.
+            if (cur_len -1) < min_forced_decode_len and suppress_ids: # -1 because `out` already contains start_token
+                for token_id_to_suppress in suppress_ids:
+                    if 0 <= token_id_to_suppress < last_logits.shape[-1]:
+                        last_logits[:, token_id_to_suppress] = -float('inf')
+            # ---- END MODIFICATION ----
 
             # Sample token for the newly generated logit
             if np.isclose(temperature, 0, atol=1e-10):
@@ -918,7 +945,8 @@ class GenerationSampler(nn.Module):
 
     def guided_autoregressive_step_batched(self, mod_dict, target_mod, temperature, top_k: Union[float, int], top_p: float,
                                            use_eos=True, eos_token=None, start_tokens=None, text_tokenizer=None, 
-                                           conditioning=[], guidance_scale=1.0, seed=None):
+                                           conditioning=[], guidance_scale=1.0, seed=None,
+                                           min_forced_decode_len=0):
 
          ### 1 - Encoder forward pass, with conditioning
         
@@ -985,6 +1013,16 @@ class GenerationSampler(nn.Module):
         seq_len = y_emb.shape[1]
 
         ### 3 -  Auto-regressive decoding and sampling
+        # Token IDs to suppress during forced generation.
+        suppress_ids = []
+        if text_tokenizer is not None:
+            try:
+                eos_id_val = text_tokenizer.token_to_id("[EOS]")
+                s2_id_val = text_tokenizer.token_to_id("[S_2]")
+                suppress_ids.extend([eos_id_val, s2_id_val])
+            except Exception as e: # pylint: disable=broad-except
+                print(f"Warning: Could not get [EOS] or [S_2] from text_tokenizer in guided_autoregressive_step_batched: {e}")
+
         for i in range(seq_len):
             cur_len = out.shape[1]
             # Convert ids into word embeddings and add corresponding posembs + modemb
@@ -1007,6 +1045,14 @@ class GenerationSampler(nn.Module):
 
             ### 3c - Classifier-free guidance
             last_logits = last_logits_uncond + (last_logits_cond - last_logits_uncond) * guidance_scale
+            last_logits = last_logits.clone() # Use .clone() 
+
+            # ---- START MODIFICATION for min_forced_decode_len ----
+            if (cur_len -1) < min_forced_decode_len and suppress_ids: # -1 because `out` already contains start_token
+                for token_id_to_suppress in suppress_ids:
+                    if 0 <= token_id_to_suppress < last_logits.shape[-1]:
+                        last_logits[:, token_id_to_suppress] = -float('inf')
+            # ---- END MODIFICATION ----
 
             # Sample token for the newly generated logit
             if np.isclose(temperature, 0, atol=1e-10):
@@ -1026,7 +1072,7 @@ class GenerationSampler(nn.Module):
 
 
     @torch.no_grad()
-    def generate(self, mod_dict, schedule, top_k=0.0, top_p=0.0, text_tokenizer=None, verbose=False, seed=None):
+    def generate(self, mod_dict, schedule, top_k=0.0, top_p=0.0, text_tokenizer=None, verbose=False, seed=None, min_forced_decode_len=0):
         """ Generates a sequence of tokens from the input modalities.
         :param mod_dict: Dictionary of modalities.
         :param schedule: Schedule of modalities to use. 
@@ -1036,6 +1082,7 @@ class GenerationSampler(nn.Module):
         :param text_tokenizer: Text tokenizer.
         :param verbose: Whether to print progress.
         :param seed: Random seed.
+        :param min_forced_decode_len: Minimum number of tokens to generate before allowing EOS/S2.
         :return: Generated mod dict.
         """
 
@@ -1081,13 +1128,15 @@ class GenerationSampler(nn.Module):
                 if cfg_scale == 1.0 or len(cfg_conditioning) == 0:
                     mod_dict = self.autoregressive_step_batched(
                         mod_dict, target_mod, temperature=temp, top_k=top_k, top_p=top_p,
-                        text_tokenizer=text_tokenizer, seed=seed_i
+                        text_tokenizer=text_tokenizer, seed=seed_i,
+                        min_forced_decode_len=min_forced_decode_len
                     )
                 else:
                     mod_dict = self.guided_autoregressive_step_batched(
                         mod_dict, target_mod, temperature=temp, top_k=top_k, top_p=top_p,
                         text_tokenizer=text_tokenizer, conditioning=cfg_conditioning, 
-                        guidance_scale=cfg_scale, seed=seed_i
+                        guidance_scale=cfg_scale, seed=seed_i,
+                        min_forced_decode_len=min_forced_decode_len
                     )
             else:
                 raise ValueError("Invalid schedule")
@@ -1132,8 +1181,7 @@ class GenerationSampler(nn.Module):
                     else:
                         mod_dict = self.guided_maskgit_step_batched(
                             mod_dict, target_mod, num_select, temperature=temp, top_k=top_k, top_p=top_p,
-                            conditioning=cfg_conditioning, guidance_scale=cfg_scale, seed=seed_i,
-                            write_all_predictions=True
+                            conditioning=cfg_conditioning, guidance_scale=cfg_scale, seed=seed_i
                         )
                 elif scheme.lower() == 'roar':
                     if cfg_scale == 1.0 or len(cfg_conditioning) == 0:
@@ -1152,13 +1200,15 @@ class GenerationSampler(nn.Module):
                 if cfg_scale == 1.0 or len(cfg_conditioning) == 0:
                     mod_dict = self.autoregressive_step_batched(
                         mod_dict, target_mod, temperature=temp, top_k=top_k, top_p=top_p,
-                        text_tokenizer=text_tokenizer, seed=seed_i
+                        text_tokenizer=text_tokenizer, seed=seed_i,
+                        min_forced_decode_len=min_forced_decode_len
                     )
                 else:
                     mod_dict = self.guided_autoregressive_step_batched(
                         mod_dict, target_mod, temperature=temp, top_k=top_k, top_p=top_p,
                         text_tokenizer=text_tokenizer, conditioning=cfg_conditioning, 
-                        guidance_scale=cfg_scale, seed=seed_i
+                        guidance_scale=cfg_scale, seed=seed_i,
+                        min_forced_decode_len=min_forced_decode_len
                     )
             else:
                 raise ValueError("Invalid schedule")
@@ -1243,6 +1293,7 @@ class GenerationSampler(nn.Module):
             expanded_batch, schedule, text_tokenizer=text_tokenizer, 
             verbose=verbose, seed=seed,
             top_p=top_p, top_k=top_k,
+            min_forced_decode_len=0
         )
 
         # Merge the batch generated sequences into one sequence
