@@ -11,3 +11,4 @@ wandb/
 tokenizer_ckpts/
 *pkl
 *.egg-info
+checkpoints/

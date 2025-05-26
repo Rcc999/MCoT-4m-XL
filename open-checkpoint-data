@@ -1,0 +1,84 @@
+from safetensors.torch import load_file as load_safetensors
+import os
+import torch #  Ensure torch is imported if you want to check tensor properties like shape
+
+# Define the path to your checkpoint file
+# Adjust this path if your script/notebook is not in the same directory
+# as the 'checkpoints' folder.
+finetuned_weights_path = './checkpoints/checkpoint-4.safetensors'
+
+if os.path.exists(finetuned_weights_path):
+    print(f"Loading weights from: {finetuned_weights_path}")
+    try:
+        # Load the state dictionary from the .safetensors file
+        state_dict = load_safetensors(finetuned_weights_path, device='cpu')
+
+        print(f"\nSuccessfully loaded the checkpoint.")
+        print(f"Total number of tensors (keys) in the checkpoint: {len(state_dict)}")
+
+        print("\nFirst 10 tensor names (keys) in the checkpoint:")
+        keys = list(state_dict.keys()) # Get keys as a list to slice
+        for i, key in enumerate(keys[:10]): # Print first 10 or fewer
+            print(f"- {key} (Shape: {state_dict[key].shape}, Dtype: {state_dict[key].dtype})")
+
+        # To print all keys (can be very long):
+        # print("\nAll tensor names (keys) in the checkpoint:")
+        # for key in state_dict.keys():
+        #     print(f"- {key} (Shape: {state_dict[key].shape}, Dtype: {state_dict[key].dtype})")
+
+        # Example: Check if a specific key (one of the missing ones) exists
+        specific_key_to_check = "encoder_embeddings.t5_caption.mod_emb"
+        if specific_key_to_check in state_dict:
+            print(f"\nThe key '{specific_key_to_check}' IS PRESENT in the checkpoint.")
+            print(f"  Shape of '{specific_key_to_check}': {state_dict[specific_key_to_check].shape}")
+            print(f"  Data type of '{specific_key_to_check}': {state_dict[specific_key_to_check].dtype}")
+        else:
+            print(f"\nThe key '{specific_key_to_check}' IS MISSING from the checkpoint.")
+
+        # Check for another key that should ideally be there if anything was saved from the transformer
+        another_key_example = "encoder.blocks.0.attn.qkv.weight" # Example, actual key might vary slightly
+        # You might need to list a few keys first to find a valid one from the transformer blocks if you don't know one.
+
+        print("\nLooking for an example transformer block weight...")
+        found_transformer_key = False
+        for key in state_dict.keys():
+            if "encoder.blocks.0" in key: # Check for any key from the first encoder block
+                 print(f"Found example transformer key: '{key}' (Shape: {state_dict[key].shape})")
+                 found_transformer_key = True
+                 break
+        if not found_transformer_key:
+            print("Could not find an example key from 'encoder.blocks.0'. The checkpoint might be very sparse.")
+
+        print("\nChecking for 'encoder.blocks.*' keys...")
+        found_encoder_block = False
+        for key in state_dict.keys():
+            if key.startswith("encoder.blocks."):
+                print(f"- Found: {key}")
+                found_encoder_block = True
+                # break # You can break after finding one, or list a few
+        if not found_encoder_block:
+            print(" - NO 'encoder.blocks.*' keys found.")
+
+        print("\nChecking for 'encoder_embeddings.caption.*' keys...")
+        found_caption_emb = False
+        specific_caption_emb_key = "encoder_embeddings.caption.mod_emb" # Or similar based on SequenceEncoderEmbedding
+        if specific_caption_emb_key in state_dict:
+             print(f"- Found: {specific_caption_emb_key}")
+             found_caption_emb = True
+        else:
+            # List any other encoder_embeddings.caption.* keys if the specific one isn't there
+            for key in state_dict.keys():
+                if key.startswith("encoder_embeddings.caption."):
+                    print(f"- Found alternative: {key}")
+                    found_caption_emb = True
+                    break
+        if not found_caption_emb:
+            print(f" - NO 'encoder_embeddings.caption.*' keys (like '{specific_caption_emb_key}') found.")
+
+    except Exception as e:
+        print(f"Error loading or inspecting the safetensors file: {e}")
+        import traceback
+        traceback.print_exc()
+else:
+    print(f"ERROR: File not found at {finetuned_weights_path}")
+    print(f"Please ensure the path is correct relative to your current working directory: {os.getcwd()}")
