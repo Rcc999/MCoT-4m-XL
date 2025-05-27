@@ -1,0 +1,38 @@
+run_name: mcot_finetune_4m-xl_mod21
+
+num_input_tokens: 512  # Increased for MCoT to handle longer context
+num_target_tokens: 256 # Increased for MCoT to handle all steps outputs
+loss_type: mod
+
+model: fm_xlarge_24e_24d_swiglu_nobias
+patch_size: 16
+input_size: 224
+dtype: bfloat16
+tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
+
+finetune: 'https://huggingface.co/EPFL-VILAB/4M-21_XL/resolve/main/model.safetensors' # Using the Hugging Face URL for the 4m21xl model checkpoint
+
+epochs: 15  # MCoT training may require more epochs
+total_tokens: -1
+opt: adamw
+blr: 0.00002
+min_blr: 0.
+warmup_epochs: 2
+warmup_tokens: -1
+batch_size: 24  # Reduced due to increased complexity of MCoT samples
+clip_grad: 3.0
+use_act_checkpoint: True
+skip_nan_grad: True
+
+data_config: "cfgs/default/4m/data/mcot/mcot.yaml" 
+eval_freq: 1
+fixed_eval: True
+epoch_size: 100_000
+
+save_ckpt_freq: 2
+output_dir: 'output/mcot_finetune_4m-xl_mod21'
+
+# Wandb 
+log_wandb: True
+wandb_project: '4m-mcot-finetune'
+wandb_entity: 'as8148-epfl'

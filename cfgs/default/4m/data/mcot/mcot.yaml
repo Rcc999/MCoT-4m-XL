@@ -1,0 +1,34 @@
+train:
+  datasets:
+    mcot:
+      type: huggingface
+      in_domains: rgb@224-caption
+      out_domains: caption
+      input_alphas: "1.0"
+      target_alphas: "1.0"
+      alphas_config: null
+      data_path: ./mcot_data/mcot_dataset
+      shuffle_buffer_load: 10_000
+  weights: [1.0]
+
+val:
+  datasets:
+    mcot:
+      type: huggingface
+      in_domains: rgb@224-caption
+      out_domains: caption
+      data_path: ./mcot_data/mcot_dataset
+
+transform_keys:
+  - normal
+
+extras:
+  text_to_caption: false
+  insert_sep_between_answers: true
+  insert_image_at_beginning: true
+  # MCoT specific configs
+  mcot_steps: ["planning", "acting", "reflection", "correction"]
+  mcot_planning_weight: 1.0
+  mcot_acting_weight: 1.0
+  mcot_reflection_weight: 1.0
+  mcot_correction_weight: 1.0

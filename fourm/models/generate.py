@@ -328,6 +328,21 @@ class GenerationSampler(nn.Module):
         super().__init__()
         self.model = model
 
+    def _safe_deepcopy_mod_dict(self, mod_dict):
+        """Safely deep copy a modality dictionary, handling tensors that aren't graph leaves"""
+        new_mod_dict = {}
+        for mod_name, mod_data in mod_dict.items():
+            new_mod_data = {}
+            for key, value in mod_data.items():
+                if isinstance(value, torch.Tensor):
+                    # Detach and clone tensors to make them graph leaves
+                    new_mod_data[key] = value.detach().clone()
+                else:
+                    # Use regular deepcopy for non-tensors
+                    new_mod_data[key] = copy.deepcopy(value)
+            new_mod_dict[mod_name] = new_mod_data
+        return new_mod_dict
+
 
     def top_k_top_p_filtering(self, logits, top_k=0.0, top_p=0.0):
         # Compatible with batching
@@ -526,13 +541,21 @@ class GenerationSampler(nn.Module):
         mod_mask_all = torch.full_like(d['ids'], self.model.modality_info[target_mod]['id'], dtype=torch.int16)
         mod_pos_all = torch.arange(d['x'].shape[1], device=d['x'].device).unsqueeze(0)
         mod_pos_all = repeat(mod_pos_all, '1 n -> b n', b=B) 
-        num_decoder_tokens = (~decoder_mask_all[0]).sum() # Adapted for batching, but assumes num_decoder_tokens is the same across the batch
+        
+        # For autoregressive generation, use the full max_tokens capacity instead of just existing unmasked tokens
+        # This allows the model to generate sequences up to the full capacity rather than being limited to existing tokens
+        num_decoder_tokens = self.model.modality_info[target_mod].get('max_tokens', None)
+        if num_decoder_tokens is None:
+            # Fallback to existing logic if max_tokens not defined
+            num_decoder_tokens = (~decoder_mask_all[0]).sum()
  
-        # Add arange multiplied by small constant to mask so they get sorted in a deterministic way
-        mask_arange = torch.arange(decoder_mask_all.shape[1], device=decoder_mask_all.device).unsqueeze(0) * 1e-6
-        ids_shuffle = torch.argsort(decoder_mask_all + mask_arange, dim=1)
-        # ids_restore = torch.argsort(ids_shuffle, dim=1)
-        ids_keep = ids_shuffle[:, :num_decoder_tokens]
+        # For autoregressive generation, we need to keep ALL positions (both input and target)
+        # in their original order, not sort them. This is different from MaskGIT/ROAR.
+        # The target_mask will be used later during generation to determine what to generate.
+        
+        # Use the actual number of tokens in the tensor, not the max_tokens from config
+        actual_num_tokens = decoder_ids_all.shape[1]
+        ids_keep = torch.arange(actual_num_tokens, device=decoder_mask_all.device).unsqueeze(0).repeat(B, 1)
 
         # Same as in forward_mask_decoder
         decoder_ids = torch.gather(decoder_ids_all, dim=1, index=ids_keep)
@@ -541,9 +564,12 @@ class GenerationSampler(nn.Module):
         mod_mask = torch.gather(mod_mask_all, dim=1, index=ids_keep)
         mod_pos = torch.gather(mod_pos_all, dim=1, index=ids_keep)
 
-        decoder_ids[decoder_mask] = 0
+        # Note: We don't zero out the decoder_ids based on decoder_mask here for autoregressive
+        # because we need the input tokens to remain intact for the generation process
         decoder_emb[decoder_mask] = 0.
-        mod_mask[decoder_mask] = -1
+        # FIX: Don't set input token modality IDs to -1 for autoregressive generation
+        # Input tokens need to keep their modality ID for forward_logits to work correctly
+        # mod_mask[decoder_mask] = -1  # REMOVED: This was causing modality ID mismatch
 
         return decoder_ids, decoder_emb, decoder_mask, mod_mask, mod_pos
 
@@ -604,7 +630,7 @@ class GenerationSampler(nn.Module):
             merged_d = self.merge_sequences(input_d, pi, target_mod, text_tokenizer, default_sentinel)[target_mod]
             merged_tensors.append(merged_d['tensor'])
             merged_input_masks.append(merged_d['input_mask'])
-            merged_target_masks.append(merged_d['input_mask'])
+            merged_target_masks.append(merged_d['target_mask'])
             merged_seq_lens.append(merged_d['tensor'].shape[1])
 
 
@@ -866,36 +892,102 @@ class GenerationSampler(nn.Module):
         decoder_mod_dict = {target_mod: self.model.decoder_embeddings[target_mod].forward_embed(mod_dict[target_mod])}
         decoder_ids, decoder_emb, decoder_mask, decoder_mod_mask, mod_pos = self.forward_mask_decoder_autoregressive(decoder_mod_dict, target_mod, seed=seed)
         device = decoder_ids.device
-        seq_len = self.model.modality_info[target_mod]['max_tokens']
+        
+        # Use actual tensor dimensions instead of config max_tokens to prevent index errors
+        actual_seq_len = decoder_ids.shape[1] if decoder_ids is not None else 512
+        seq_len = self.model.modality_info[target_mod].get('max_tokens', actual_seq_len)
+        max_tokens = seq_len
 
         if use_eos and eos_token is None:
             # The eos_token is the final sentinel token provided
-            eos_token = decoder_ids[0][decoder_mask[0] == 0][-1] # Assumes the EOS token is the same for all
+            # Fix: Look for actual EOS token instead of assuming it's the last unmasked token
+            # decoder_mask is target_mask: True = input, False = target
+            input_tokens = decoder_ids[0][decoder_mask[0] == True]  # Get input tokens
+            # Try to find EOS token in the input tokens
+            if text_tokenizer is not None:
+                eos_id = text_tokenizer.token_to_id("[EOS]")
+                if eos_id is not None and eos_id in input_tokens:
+                    eos_token = torch.tensor(eos_id, dtype=input_tokens.dtype)
+                else:
+                    # Fallback: use the last input token (original behavior)
+                    eos_token = input_tokens[-1]
+            else:
+                # Fallback: use the last input token (original behavior)
+                eos_token = input_tokens[-1]
         if use_eos:
             eos_token = eos_token.to(device)
 
-        # If no start_tokens, just use the beginning of the actual target (i.e., a sentinel token)
-        out = decoder_ids[:, :1] if start_tokens is None else start_tokens.to(device)
+        # If no start_tokens, we need to start with all visible input tokens, not just the first one
+        # For VQA, this means starting with the entire question + EOS
+        if start_tokens is None:
+            # FIXED: decoder_mask is target_mask where True means NOT target (i.e., input)
+            input_mask_2d = decoder_mask == True  # Shape: (B, seq_len) - True means input tokens
+            
+            # For autoregressive generation, we need ALL input tokens in sequence order
+            # Find the last input token position for each batch
+            input_lengths = input_mask_2d.sum(dim=1)  # Shape: (B,)
+            max_input_len = input_lengths.max().item()
+            
+            # Extract input tokens maintaining sequence order
+            out = decoder_ids[:, :max_input_len]  # Take the first max_input_len tokens
+        else:
+            out = start_tokens.to(device)
         # Set decoder_tokens to None, we do not use them for decoding
         decoder_ids = None
 
-        # If all samples of the batch have eos, return early
-        if use_eos and (out == eos_token).any(dim=-1).all():
-            return out
+        # Store the initial sequence length to know what we started with
+        initial_seq_len = out.shape[1]
+        
+        # For VQA: Don't return early just because the input contains EOS
+        # We need to generate answer tokens after the question
+        # Only return early if we haven't started generation yet AND we're only dealing with a single EOS
+        # (This preserves the original behavior for non-VQA cases where this might be intended)
 
+        # For generation, we need to expand decoder_emb to the full seq_len capacity
+        # decoder_emb only contains embeddings for existing unmasked tokens, but we need space for generation
+        if decoder_emb.shape[1] < seq_len:
+            # Pad decoder_emb to seq_len with zeros (these will be replaced during generation)
+            pad_size = seq_len - decoder_emb.shape[1]
+            zero_padding = torch.zeros(B, pad_size, decoder_emb.shape[2], device=decoder_emb.device, dtype=decoder_emb.dtype)
+            decoder_emb = torch.cat([decoder_emb, zero_padding], dim=1)
+        
         y_emb = decoder_emb[:, :seq_len]
-        seq_len = y_emb.shape[1]
 
         # Auto-regressive decoding and sampling
-        for i in range(seq_len):
+        target_length = seq_len  # Generate until we reach the full sequence length
+        
+        # Safety check: limit generation to reasonable bounds
+        max_generation_steps = min(target_length, max_tokens if max_tokens else 512)
+        
+        for i in range(max_generation_steps):
             cur_len = out.shape[1]
-            # Convert ids into word embeddings and add corresponding posembs + modemb
-            y = self.model.decoder_embeddings[target_mod].token_emb(out) + y_emb[:, :cur_len]
+            
+            # Stop if we've generated the full sequence
+            if cur_len >= target_length:
+                break
+                
+            # BUG FIX: Use simple token embedding + pre-computed positional/modality embeddings
+            # The y_emb was pre-computed and padded to handle the full sequence length
+            if cur_len <= y_emb.shape[1]:
+                y = self.model.decoder_embeddings[target_mod].token_emb(out) + y_emb[:, :cur_len]
+            else:
+                # If we exceed the pre-computed embeddings, use zero padding for new positions
+                token_emb = self.model.decoder_embeddings[target_mod].token_emb(out)
+                if y_emb.shape[1] > 0:
+                    # Extend with zeros for positions beyond the original sequence
+                    extra_emb = torch.zeros(B, cur_len - y_emb.shape[1], y_emb.shape[2], 
+                                          device=y_emb.device, dtype=y_emb.dtype)
+                    extended_y_emb = torch.cat([y_emb, extra_emb], dim=1)
+                    y = token_emb + extended_y_emb
+                else:
+                    y = token_emb
+            
             # Build causal mask
             causal_mask = torch.ones((cur_len, cur_len), dtype=torch.bool, device=y.device).triu(1)
             causal_mask = repeat(causal_mask, "n1 n2 -> b n1 n2", b=B)
             
             y = self.model.forward_decoder(y, context, encoder_mask, causal_mask)
+            
             logits = self.model.forward_logits(y, decoder_mod_dict, decoder_mod_mask[:, :cur_len])[target_mod]
             logits = rearrange(logits, "(b n) d -> b n d", b=B, n=cur_len)
             last_logits = logits[:, -1]
@@ -908,12 +1000,47 @@ class GenerationSampler(nn.Module):
                 probs = F.softmax(filtered_logits / temperature, dim=-1)
                 sample = torch.multinomial(probs, 1)
             out = torch.cat((out, sample), dim=-1)
+            
+            # CRITICAL FIX: Extend decoder_mod_mask to match the new sequence length
+            # When we add new tokens, we need to add corresponding modality IDs
+            if cur_len + 1 > decoder_mod_mask.shape[1]:
+                # Need to extend the modality mask
+                target_mod_id = self.model.modality_info[target_mod]['id']
+                new_mod_id = torch.full((B, 1), target_mod_id, device=decoder_mod_mask.device, dtype=decoder_mod_mask.dtype)
+                decoder_mod_mask = torch.cat([decoder_mod_mask, new_mod_id], dim=1)
 
-            if use_eos and (out == eos_token).any(dim=-1).all():
+            # Only stop on EOS if we've generated at least one token beyond the initial input
+            # This ensures VQA continues to generate answer tokens after the question EOS
+            if use_eos and (sample == eos_token).any(dim=-1).all() and out.shape[1] > initial_seq_len:
                 break
 
-        mod_dict = self.merge_sequences_batched(mod_dict, out, target_mod, text_tokenizer)
-
+        # FIXED: For autoregressive generation, directly assign the generated sequence
+        # instead of using merge_sequences_batched which is designed for span-filling
+        
+        # Ensure the tensor fits in the original modality dict structure
+        original_tensor_shape = mod_dict[target_mod]['tensor'].shape
+        if out.shape[1] <= original_tensor_shape[1]:
+            # Update the tensor with generated content
+            mod_dict[target_mod]['tensor'][:, :out.shape[1]] = out.to(torch.int32)
+        else:
+            # If generated sequence is longer, replace the entire tensor
+            mod_dict[target_mod]['tensor'] = out.to(torch.int32)
+        
+        # Update the target mask to reflect the generated tokens
+        if 'target_mask' in mod_dict[target_mod]:
+            target_mask = mod_dict[target_mod]['target_mask']
+            # For autoregressive: input tokens remain True (not targets), generated tokens become False (targets)
+            # But since we've generated the sequence, all positions are now "filled"
+            if out.shape[1] <= target_mask.shape[1]:
+                # Keep original target mask structure - don't change input/target designation
+                pass  # Leave target_mask as is
+            else:
+                # If sequence is longer, we need to expand the mask
+                new_target_mask = torch.ones((target_mask.shape[0], out.shape[1]), 
+                                           dtype=target_mask.dtype, device=target_mask.device)
+                new_target_mask[:, :target_mask.shape[1]] = target_mask
+                mod_dict[target_mod]['target_mask'] = new_target_mask
+        
         return mod_dict
 
     def guided_autoregressive_step_batched(self, mod_dict, target_mod, temperature, top_k: Union[float, int], top_p: float,
@@ -938,7 +1065,9 @@ class GenerationSampler(nn.Module):
         decoder_mod_dict_cond = {target_mod: self.model.decoder_embeddings[target_mod].forward_embed(mod_dict[target_mod])}
         decoder_ids, decoder_emb, decoder_mask, decoder_mod_mask_cond, mod_pos = self.forward_mask_decoder_autoregressive(decoder_mod_dict_cond, target_mod, seed=seed)
         device = decoder_ids.device
-        seq_len = self.model.modality_info[target_mod]['max_tokens']
+        # Use actual tensor dimensions instead of config max_tokens to prevent index errors
+        actual_seq_len = decoder_ids.shape[1] if decoder_ids is not None else 512
+        seq_len = self.model.modality_info[target_mod].get('max_tokens', actual_seq_len)
 
 
         ### 2 - Encoder forward pass, without conditioning
@@ -968,27 +1097,83 @@ class GenerationSampler(nn.Module):
 
         if use_eos and eos_token is None:
             # The eos_token is the final sentinel token provided
-            eos_token = decoder_ids[0][decoder_mask[0] == 0][-1] # Assumes the EOS token is the same for all
+            # Fix: Look for actual EOS token instead of assuming it's the last unmasked token
+            # decoder_mask is target_mask: True = input, False = target
+            input_tokens = decoder_ids[0][decoder_mask[0] == True]  # Get input tokens
+            # Try to find EOS token in the input tokens
+            if text_tokenizer is not None:
+                eos_id = text_tokenizer.token_to_id("[EOS]")
+                if eos_id is not None and eos_id in input_tokens:
+                    eos_token = torch.tensor(eos_id, dtype=input_tokens.dtype)
+                else:
+                    # Fallback: use the last input token (original behavior)
+                    eos_token = input_tokens[-1]
+            else:
+                # Fallback: use the last input token (original behavior)
+                eos_token = input_tokens[-1]
         if use_eos:
             eos_token = eos_token.to(device)
 
-        # If no start_tokens, just use the beginning of the actual target (i.e., a sentinel token)
-        out = decoder_ids[:, :1] if start_tokens is None else start_tokens.to(device)
+        # CRITICAL FIX: For VQA, start with all input tokens, not just the first one
+        if start_tokens is None:
+            # Get all input tokens (where target_mask is True, meaning NOT targets = inputs)
+            input_mask_2d = decoder_mask == True  # Shape: (B, seq_len) - True means input tokens
+            
+            # For autoregressive generation, we need ALL input tokens in sequence order
+            # Find the last input token position for each batch
+            input_lengths = input_mask_2d.sum(dim=1)  # Shape: (B,)
+            max_input_len = input_lengths.max().item()
+            
+            # Extract input tokens maintaining sequence order
+            out = decoder_ids[:, :max_input_len]  # Take the first max_input_len tokens
+        else:
+            out = start_tokens.to(device)
         # Set decoder_tokens to None, we do not use them for decoding
         decoder_ids = None
 
-        # If all samples of the batch have eos, return early
-        if use_eos and (out == eos_token).any(dim=-1).all():
-            return out
+        # Store the initial sequence length to know what we started with
+        initial_seq_len = out.shape[1]
 
+        # For VQA: Don't return early just because the input contains EOS
+        # We need to generate answer tokens after the question
+        # The early return condition is removed here to allow continued generation
+
+        # For generation, we need to expand decoder_emb to the full seq_len capacity
+        # decoder_emb only contains embeddings for existing unmasked tokens, but we need space for generation
+        if decoder_emb.shape[1] < seq_len:
+            # Pad decoder_emb to seq_len with zeros (these will be replaced during generation)
+            pad_size = seq_len - decoder_emb.shape[1]
+            zero_padding = torch.zeros(B, pad_size, decoder_emb.shape[2], device=decoder_emb.device, dtype=decoder_emb.dtype)
+            decoder_emb = torch.cat([decoder_emb, zero_padding], dim=1)
+        
         y_emb = decoder_emb[:, :seq_len]
-        seq_len = y_emb.shape[1]
+        # Don't override seq_len here - keep it at max_tokens for full generation capacity
 
         ### 3 -  Auto-regressive decoding and sampling
-        for i in range(seq_len):
+        # Safety check: limit generation to reasonable bounds
+        max_generation_steps = min(seq_len, self.model.modality_info[target_mod].get('max_tokens', 512))
+        
+        for i in range(max_generation_steps):
             cur_len = out.shape[1]
+            
+            # Stop if we've generated the full sequence
+            if cur_len >= seq_len:
+                break
             # Convert ids into word embeddings and add corresponding posembs + modemb
-            y = self.model.decoder_embeddings[target_mod].token_emb(out) + y_emb[:, :cur_len]
+            # BUG FIX: Use safe embedding handling to prevent index out of bounds
+            if cur_len <= y_emb.shape[1]:
+                y = self.model.decoder_embeddings[target_mod].token_emb(out) + y_emb[:, :cur_len]
+            else:
+                # If we exceed the pre-computed embeddings, use zero padding for new positions
+                token_emb = self.model.decoder_embeddings[target_mod].token_emb(out)
+                if y_emb.shape[1] > 0:
+                    # Extend with zeros for positions beyond the original sequence
+                    extra_emb = torch.zeros(B, cur_len - y_emb.shape[1], y_emb.shape[2], 
+                                          device=y_emb.device, dtype=y_emb.dtype)
+                    extended_y_emb = torch.cat([y_emb, extra_emb], dim=1)
+                    y = token_emb + extended_y_emb
+                else:
+                    y = token_emb
             # Build causal mask
             causal_mask = torch.ones((cur_len, cur_len), dtype=torch.bool, device=y.device).triu(1)
             causal_mask = repeat(causal_mask, "n1 n2 -> b n1 n2", b=B)
@@ -1016,17 +1201,50 @@ class GenerationSampler(nn.Module):
                 probs = F.softmax(filtered_logits / temperature, dim=-1)
                 sample = torch.multinomial(probs, 1)
             out = torch.cat((out, sample), dim=-1)
+            
+            # CRITICAL FIX: Extend decoder_mod_mask for both conditional and unconditional branches
+            cur_len = out.shape[1]
+            if cur_len > decoder_mod_mask_cond.shape[1]:
+                target_mod_id = self.model.modality_info[target_mod]['id']
+                new_mod_id = torch.full((B, 1), target_mod_id, device=decoder_mod_mask_cond.device, dtype=decoder_mod_mask_cond.dtype)
+                decoder_mod_mask_cond = torch.cat([decoder_mod_mask_cond, new_mod_id], dim=1)
+                decoder_mod_mask_uncond = torch.cat([decoder_mod_mask_uncond, new_mod_id], dim=1)
 
-            if use_eos and (out == eos_token).any(dim=-1).all():
+            if use_eos and (sample == eos_token).any(dim=-1).all() and out.shape[1] > initial_seq_len:
                 break
 
-        mod_dict = self.merge_sequences_batched(mod_dict, out, target_mod, text_tokenizer)
-
+        # FIXED: For autoregressive generation, directly assign the generated sequence
+        # instead of using merge_sequences_batched which is designed for span-filling
+        
+        # Ensure the tensor fits in the original modality dict structure
+        original_tensor_shape = mod_dict[target_mod]['tensor'].shape
+        if out.shape[1] <= original_tensor_shape[1]:
+            # Update the tensor with generated content
+            mod_dict[target_mod]['tensor'][:, :out.shape[1]] = out.to(torch.int32)
+        else:
+            # If generated sequence is longer, replace the entire tensor
+            mod_dict[target_mod]['tensor'] = out.to(torch.int32)
+        
+        # Update the target mask to reflect the generated tokens
+        if 'target_mask' in mod_dict[target_mod]:
+            target_mask = mod_dict[target_mod]['target_mask']
+            # For autoregressive: input tokens remain True (not targets), generated tokens become False (targets)
+            # But since we've generated the sequence, all positions are now "filled"
+            if out.shape[1] <= target_mask.shape[1]:
+                # Keep original target mask structure - don't change input/target designation
+                pass  # Leave target_mask as is
+            else:
+                # If sequence is longer, we need to expand the mask
+                new_target_mask = torch.ones((target_mask.shape[0], out.shape[1]), 
+                                           dtype=target_mask.dtype, device=target_mask.device)
+                new_target_mask[:, :target_mask.shape[1]] = target_mask
+                mod_dict[target_mod]['target_mask'] = new_target_mask
+        
         return mod_dict
 
 
     @torch.no_grad()
-    def generate(self, mod_dict, schedule, top_k=0.0, top_p=0.0, text_tokenizer=None, verbose=False, seed=None):
+    def generate(self, mod_dict, schedule, top_k=0.0, top_p=0.0, text_tokenizer=None, verbose=False, seed=None, start_tokens=None):
         """ Generates a sequence of tokens from the input modalities.
         :param mod_dict: Dictionary of modalities.
         :param schedule: Schedule of modalities to use. 
@@ -1036,11 +1254,13 @@ class GenerationSampler(nn.Module):
         :param text_tokenizer: Text tokenizer.
         :param verbose: Whether to print progress.
         :param seed: Random seed.
+        :param start_tokens: Optional starting tokens for autoregressive generation.
         :return: Generated mod dict.
         """
 
         # Input embedding -> tokenizes the modalities - Many are placeholder for now
-        mod_dict = copy.deepcopy(mod_dict)
+        # Use custom deepcopy to handle tensors that aren't graph leaves
+        mod_dict = self._safe_deepcopy_mod_dict(mod_dict)
 
         for step, schedule_step_info in tqdm(enumerate(schedule), disable=not verbose):
             target_mod = schedule_step_info['target_domain']
@@ -1110,7 +1330,7 @@ class GenerationSampler(nn.Module):
         """
 
         # Input embedding -> tokenizes the modalities - Many are placeholder for now
-        mod_dict = copy.deepcopy(mod_dict)
+        mod_dict = self._safe_deepcopy_mod_dict(mod_dict)
 
         for step, schedule_step_info in tqdm(enumerate(schedule), disable=not verbose):
             target_mod = schedule_step_info['target_domain']

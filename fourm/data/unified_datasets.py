@@ -478,9 +478,26 @@ def prepare_hf_sample_for_domains(sample, expected_domains):
             processed_sample[full_caption_domain_key] = sample['question']
         elif 'text' in sample:  # For other datasets
             processed_sample[full_caption_domain_key] = sample['text']
+        # Handle MCoT-specific fields
+        elif 'prompt' in sample:  # Base prompt for MCoT
+            processed_sample[full_caption_domain_key] = sample['prompt']
+        elif 'planning' in sample:  # MCoT planning step
+            processed_sample[full_caption_domain_key] = sample['planning']
+        elif 'acting' in sample:  # MCoT acting step
+            processed_sample[full_caption_domain_key] = sample['acting']
+        elif 'reflection' in sample:  # MCoT reflection step
+            processed_sample[full_caption_domain_key] = sample['reflection']
+        elif 'correction' in sample:  # MCoT correction step
+            processed_sample[full_caption_domain_key] = sample['correction']
         else:
-            # If 'caption' is expected but neither 'question' nor 'text' is present
+            # If 'caption' is expected but no suitable text field is present
             return None
+    
+    # Handle MCoT-specific metadata (preserve for step-aware training)
+    mcot_fields = ['mcot_step', 'image_id', 'prompt', 'planning', 'acting', 'reflection', 'correction']
+    for field in mcot_fields:
+        if field in sample:
+            processed_sample[field] = sample[field]
     
     # Final check: ensure all expected domains are now keys in processed_sample
     if all(domain_key in processed_sample for domain_key in expected_domains):
