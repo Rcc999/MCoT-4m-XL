@@ -46,12 +46,12 @@ extras:
 # hf_dataset_data_dir: "/work/com-304/vqav2_data_raw" # For raw files if hf_dataset_script_path is used
 
 # Or, if your framework expects direct paths to processed/raw files:
-train_split:
-  question_file: "/work/com-304/vqav2_subset_25pct/v2_OpenEnded_mscoco_train2014_questions_subset25pct.json"
-  annotation_file: "/work/com-304/vqav2_subset_25pct/v2_mscoco_train2014_annotations_subset25pct.json"
-  image_root: "/work/com-304/vqav2_data_raw/images_train/train2014" # Full image set still used
-  # Optional: if your data loader expects a pre-filtered list of image IDs for the subset
-  # image_list_file: "/work/com-304/vqav2_subset_25pct/train_subset_image_ids.txt" 
+# train_split:
+#   question_file: "/work/com-304/vqav2_subset_25pct/v2_OpenEnded_mscoco_train2014_questions_subset25pct.json"
+#   annotation_file: "/work/com-304/vqav2_subset_25pct/v2_mscoco_train2014_annotations_subset25pct.json"
+#   image_root: "/work/com-304/vqav2_data_raw/images_train/train2014" # Full image set still used
+#   # Optional: if your data loader expects a pre-filtered list of image IDs for the subset
+#   # image_list_file: "/work/com-304/vqav2_subset_25pct/train_subset_image_ids.txt" 
 
 val_split:
   question_file: "/work/com-304/vqav2_data_raw/questions_val/v2_OpenEnded_mscoco_val2014_questions.json"

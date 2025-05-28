@@ -1,7 +1,7 @@
 # Config for FSDP
 # VQA Finetuning based on 4M-7-T2I_XL_CC12M
 
-run_name: vqav2_finetune_4m-7-t2i-xl_subset25pct
+run_name: vqav2_finetune_4m-7-t2i-xl_full
 
 num_input_tokens: 256
 num_target_tokens: 64 # Max VQA answer length
@@ -45,14 +45,17 @@ fixed_eval: True # Use a fixed set of evaluation samples if your eval script sup
 # epoch_size: 100_000 # If using -1 for epochs and defining by total_tokens/epoch_size, this needs to be dataset size.
                      # For 25% subset (110939 samples), set to that or let epochs control.
                      # If epochs is set, epoch_size might be ignored or used for intra-epoch logging/eval. Let's assume epochs is primary.
-epoch_size: 110939 # Number of samples in the 25% training subset
+epoch_size: 443553 # For VQAv2 FULL training set (number of training questions)
 
 # --- Saving ---
 save_ckpt_freq: 1 # Save checkpoint every N epochs
-output_dir: '/work/com-304/vqav2_finetune_4m-7-t2i-xl_subset25pct' # New output directory for this run
+output_dir: '/work/com-304/vqav2_finetune_4m-7-t2i-xl_full' # New output directory for this run
 
 # --- Wandb Logging ---
 log_wandb: True
+wettiko_wandb: False # Set to False if not using Wettiko integration
+wettiko_sync_sweep_wandb: False
+wettiko_entity: ''
 wandb_project: 'MCoT-4M'
-wandb_entity: 'rayane-charifchefchaouni-epfl' # Your entity
-wandb_run_name: 'vqav2_ft_4m7t2ixl_subset25_run1' # Descriptive run name
+wandb_run_name: 'vqav2_ft_4m7t2ixl_full_run1' # Descriptive name for the run
+wandb_tags: ['vqav2', 'finetune', '4m-7-t2i-xl', 'full_dataset']
