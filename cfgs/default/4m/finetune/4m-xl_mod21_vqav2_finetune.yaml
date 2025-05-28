@@ -22,7 +22,7 @@ dtype: bfloat16 # Keep bfloat16 if your hardware supports it well, otherwise flo
 tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
 
 # --- Training Parameters ---
-epochs: 15 # Example: Adjust based on time constraints and subset size (e.g., 10-20 for 25% subset)
+epochs: 5 # Example: Adjust based on time constraints and subset size (e.g., 10-20 for 25% subset)
 total_tokens: -1 # Using epochs instead
 opt: adamw
 blr: 0.00002 # 2e-5, a common finetuning learning rate
