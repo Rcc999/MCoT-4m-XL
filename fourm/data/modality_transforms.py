@@ -94,14 +94,19 @@ class UnifiedDataTransform(object):
 
         crop_coords, flip, orig_size, target_size, rand_aug_idx = self.image_augmenter(mod_dict, crop_settings)
         
-        mod_dict = {
-            k: self.transforms_dict[get_transform_key(k)].image_augment(
-                v, crop_coords=crop_coords, flip=flip, orig_size=orig_size, 
-                target_size=get_transform_resolution(k, target_size), rand_aug_idx=rand_aug_idx,
-                resample_mode=self.resample_mode
-            )
-            for k, v in mod_dict.items()
-        }
+        processed_mod_dict = {}
+        for k, v in mod_dict.items():
+            transform_key = get_transform_key(k)
+            if transform_key in self.transforms_dict and isinstance(self.transforms_dict[transform_key], ImageTransform):
+                processed_mod_dict[k] = self.transforms_dict[transform_key].image_augment(
+                    v, crop_coords=crop_coords, flip=flip, orig_size=orig_size, 
+                    target_size=get_transform_resolution(k, target_size), rand_aug_idx=rand_aug_idx,
+                    resample_mode=self.resample_mode
+                )
+            else: # Pass through non-image modalities or modalities without specific image transforms
+                processed_mod_dict[k] = v
+        
+        mod_dict = processed_mod_dict
 
         if self.add_sizes:
             mod_dict["crop_coords"] = torch.tensor(crop_coords)

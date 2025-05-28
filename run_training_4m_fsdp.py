@@ -35,6 +35,7 @@ from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from huggingface_hub import hf_hub_download
 
 import fourm.utils as utils
 import fourm.utils.fsdp_utils as fsdp_utils
@@ -60,11 +61,9 @@ def get_args():
                              'Effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=100, type=int,
                         help='Number of epochs (default: %(default)s)')
-    parser.add_argument('--total_tokens', default=-1, type=int,
-                        help='Number of total input tokens (in billions), only applicable if epochs is negative. '
-                             'Sets the number of epochs to approximate this amount of tokens.')
-    parser.add_argument('--accum_iter', default=1, type=int,
-                        help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
+    parser.add_argument('--total_tokens', type=int, default=-1, help='Total tokens for training. Set to -1 to use epochs.')
+    parser.add_argument('--accum_iter', type=int, default=1,
+                        help='Accumulate gradient iterations (for increasing the effective batch size).')
     parser.add_argument('--save_ckpt_freq', default=20, type=int,
                         help='Checkpoint saving frequency in epochs (default: %(default)s)')
     parser.add_argument('--use_act_checkpoint', action='store_true')
@@ -461,6 +460,34 @@ def main(args):
     ## Model
     model = get_model(args, modality_info)
     
+    # Store the configuration used to create the model (before FSDP wrapping if possible, or get from model.module.config)
+    # This is crucial for being able to load the model correctly for inference later.
+    # We'll try to get it from model.config which should exist if create_model sets it.
+    # If model.config doesn't exist directly, this might need adjustment based on how FM stores its config.
+    model_config_to_save = getattr(model, 'config', None)
+    if model_config_to_save is None:
+        print("Warning: model.config not found directly. Constructing a basic config from args and modality_info for saving.")
+        # Fallback: Construct a config from args relevant to model architecture and modality_info.
+        # This might not be as complete as model.config if that contains processed/derived values.
+        model_config_to_save = {
+            'model_name': args.model,
+            'patch_size': args.patch_size,
+            'input_size': args.input_size,
+            'num_register_tokens': args.num_register_tokens,
+            'domains_in': args.in_domains,
+            'domains_out': args.out_domains,
+            'modality_info': modality_info, # This can be large, but is important
+            # Add other args that define the model architecture if not covered by model_name and modality_info
+            'dim': getattr(model, 'dim', None), # Try to get actual dim if possible
+            'encoder_depth': getattr(model, 'encoder_depth', None),
+            'decoder_depth': getattr(model, 'decoder_depth', None),
+            'num_heads': getattr(model, 'num_heads', None),
+            # These are from the finetune YAML and should be part of the args for the training script
+            'num_input_tokens': args.num_input_tokens,
+            'num_target_tokens': args.num_target_tokens,
+            'loss_type': args.loss_type,
+        }
+
     ## Logger
     if global_rank == 0 and args.log_wandb:
         log_writer = utils.WandbLogger(args)
@@ -515,50 +542,97 @@ def main(args):
     ## Starting from pre-trained model
     if args.finetune:
         actual_model_state_dict = None
-        if args.finetune.endswith('.safetensors'):
-            print(f"Loading .safetensors file from: {args.finetune}")
-            if args.finetune.startswith('https'):
-                hub_dir = torch.hub.get_dir()
-                os.makedirs(hub_dir, exist_ok=True) # Ensure hub directory exists
+        # Determine if args.finetune is a local path or a Hugging Face Hub ID
+        is_local_path = os.path.exists(args.finetune)
+        # Treat as HF ID if not a local path, contains '/', and is not a full https URL
+        is_hf_id = not is_local_path and '/' in args.finetune and not args.finetune.startswith('https://')
+
+        # Priority for HF Hub ID: try .safetensors files first
+        if is_hf_id:
+            print(f"Attempting to download .safetensors from Hugging Face Hub ID: {args.finetune}")
+            try:
+                try:
+                    file_to_load = hf_hub_download(repo_id=args.finetune, filename="model.safetensors")
+                except Exception as e_model_sf: # Fallback to pytorch_model.safetensors
+                    try:
+                        file_to_load = hf_hub_download(repo_id=args.finetune, filename="pytorch_model.safetensors")
+                    except Exception as e_pytorch_sf:
+                        print(f"Could not find model.safetensors or pytorch_model.safetensors for {args.finetune} via Hub ID. Error for model.sf: {e_model_sf}, Error for pytorch.sf: {e_pytorch_sf}")
+                        # Instead of raising here, we'll let it fall through to the non-safetensors block if these fail
+                        file_to_load = None 
                 
+                if file_to_load: # If safetensors downloaded successfully
+                    print(f"Successfully downloaded .safetensors to: {file_to_load}")
+                    actual_model_state_dict, _ = load_safetensors(file_to_load)
+            except ImportError:
+                print("huggingface_hub library not found. Please install it: pip install huggingface_hub")
+                raise
+            # If actual_model_state_dict is loaded, we are done with this block. 
+            # If not (file_to_load was None), it will proceed to the next 'elif' or 'else'.
+
+        if actual_model_state_dict is None and args.finetune.endswith('.safetensors'): # Existing logic for direct .safetensors paths
+            print(f"Loading .safetensors file from: {args.finetune}")
+            if args.finetune.startswith('https://'): # Direct https URL for .safetensors
+                hub_dir = torch.hub.get_dir()
+                os.makedirs(hub_dir, exist_ok=True)
                 url_path = args.finetune.split('?')[0]
                 filename = os.path.basename(url_path)
                 if not filename: 
-                    filename = "downloaded_model.safetensors" # Fallback filename
-                
+                    filename = "downloaded_model.safetensors"
                 cached_file_path = os.path.join(hub_dir, filename)
-                
                 if not os.path.exists(cached_file_path):
                     print(f"Downloading {args.finetune} to {cached_file_path}...")
                     torch.hub.download_url_to_file(args.finetune, dst=cached_file_path, progress=True)
                     print(f"Downloaded to: {cached_file_path}")
                 else:
                     print(f"Using cached file: {cached_file_path}")
-                
                 file_to_load = cached_file_path
             else: # Local .safetensors file
                 file_to_load = args.finetune
-            # load_safetensors typically returns (state_dict, config_dict)
             actual_model_state_dict, _ = load_safetensors(file_to_load)
-        else: # Original logic for .pth/.pt files or other URL types
+        
+        # If not loaded by previous blocks (e.g. HF ID didn't yield safetensors, or it's not a .safetensors path)
+        if actual_model_state_dict is None:
             print(f"Loading non-safetensors checkpoint from: {args.finetune}")
             loaded_checkpoint_data = None
-            if args.finetune.startswith('https'):
+            if args.finetune.startswith('https://'): # Direct https URL for .bin/.pth
                 loaded_checkpoint_data = torch.hub.load_state_dict_from_url(
                     args.finetune, map_location='cpu', progress=True)
-            else:
+            elif is_hf_id: # HF Hub ID, try .bin then .pth (this is now a fallback if safetensors failed for HF ID)
+                try:
+                    print(f"Attempting to download .bin/.pth from Hugging Face Hub ID (fallback): {args.finetune}")
+                    try:
+                        model_path = hf_hub_download(repo_id=args.finetune, filename="pytorch_model.bin")
+                    except Exception as e_bin: 
+                        try:
+                             model_path = hf_hub_download(repo_id=args.finetune, filename="weights.pth")
+                        except Exception as e_pth:
+                            print(f"Fallback: Could not find pytorch_model.bin or weights.pth for {args.finetune}. Error for .bin: {e_bin}, Error for .pth: {e_pth}")
+                            raise e_pth 
+                    print(f"Successfully downloaded to: {model_path}")
+                    loaded_checkpoint_data = torch.load(model_path, map_location='cpu')
+                except ImportError:
+                    print("huggingface_hub library not found. Please install it: pip install huggingface_hub")
+                    raise
+            elif is_local_path: # Local .bin/.pth file
                 loaded_checkpoint_data = torch.load(args.finetune, map_location='cpu')
+            else: # Neither local, nor valid https, nor working HF ID after all attempts
+                raise FileNotFoundError(f"[Errno 2] No such file or directory (or invalid/unhandled HF ID): '{args.finetune}'")
             
-            # Check if loaded_checkpoint_data is the state_dict or contains it under 'model' key
+            if loaded_checkpoint_data is None: # Should only happen if it's not a local path and not an https/hf_id
+                 raise ValueError(f"Checkpoint data could not be loaded from {args.finetune}")
+
             if 'model' in loaded_checkpoint_data and isinstance(loaded_checkpoint_data['model'], dict):
                 actual_model_state_dict = loaded_checkpoint_data['model']
-            elif isinstance(loaded_checkpoint_data, dict): # Assume it's the state_dict itself
+            elif 'state_dict' in loaded_checkpoint_data and isinstance(loaded_checkpoint_data['state_dict'], dict):
+                actual_model_state_dict = loaded_checkpoint_data['state_dict']
+            elif isinstance(loaded_checkpoint_data, dict):
                 actual_model_state_dict = loaded_checkpoint_data
             else:
                 raise ValueError(f"Cannot determine model state_dict from {args.finetune}. Loaded data type: {type(loaded_checkpoint_data)}")
 
         if actual_model_state_dict is None:
-            raise ValueError(f"Failed to load or resolve model state_dict from {args.finetune}")
+            raise ValueError(f"Failed to load or resolve model state_dict from {args.finetune} after all attempts.")
 
         # Remove pos_emb
         final_state_dict = {k: v for k, v in actual_model_state_dict.items() if ".pos_emb" not in k}
@@ -740,11 +814,43 @@ def main(args):
         if args.output_dir:
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
                 fsdp_utils.save_model_fsdp(args=args, model=model, optimizer=optimizer, epoch=epoch)
+                if utils.is_main_process() and model_config_to_save is not None:
+                    config_save_path = os.path.join(args.output_dir, f'epoch_{epoch:04d}', 'config.json')
+                    # Also save a top-level config.json with the latest epoch's config for convenience
+                    config_latest_save_path = os.path.join(args.output_dir, 'config.json')
+                    try:
+                        os.makedirs(os.path.dirname(config_save_path), exist_ok=True)
+                        with open(config_save_path, 'w') as f:
+                            json.dump(model_config_to_save, f, indent=4, default=lambda o: '__not_serializable__')
+                        print(f"Saved model config to {config_save_path}")
+                        # Save/overwrite the latest config at the root of output_dir
+                        with open(config_latest_save_path, 'w') as f:
+                            json.dump(model_config_to_save, f, indent=4, default=lambda o: '__not_serializable__')
+                        print(f"Saved latest model config to {config_latest_save_path}")
+                    except TypeError as e:
+                        print(f"Warning: Could not serialize part of the model config: {e}. Config not fully saved.")
+
                 if epoch + 1 == args.epochs:
                     use_s3 = len(args.s3_save_dir) > 0
                     fsdp_utils.save_model_fsdp(
                         args=args, model=model, optimizer=optimizer,
                         epoch=epoch, ckpt_name='final', use_s3=use_s3)
+                    if utils.is_main_process() and model_config_to_save is not None:
+                        # For the final checkpoint, ensure the config is also saved in its specific directory and as latest.
+                        final_config_dir = os.path.join(args.output_dir, 'final')
+                        os.makedirs(final_config_dir, exist_ok=True)
+                        final_config_save_path = os.path.join(final_config_dir, 'config.json')
+                        config_latest_save_path = os.path.join(args.output_dir, 'config.json')
+                        try:
+                            with open(final_config_save_path, 'w') as f:
+                                json.dump(model_config_to_save, f, indent=4, default=lambda o: '__not_serializable__')
+                            print(f"Saved final model config to {final_config_save_path}")
+                            # Save/overwrite the latest config at the root of output_dir
+                            with open(config_latest_save_path, 'w') as f:
+                                json.dump(model_config_to_save, f, indent=4, default=lambda o: '__not_serializable__')
+                            print(f"Saved latest model config to {config_latest_save_path}")
+                        except TypeError as e:
+                            print(f"Warning: Could not serialize part of the final model config: {e}. Config not fully saved.")
                     
 
         log_stats = {**{k: v for k, v in train_stats.items()},
@@ -808,6 +914,7 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
     for step, x in enumerate(metric_logger.log_every(data_loader, print_freq, iter_len=loader_len, header=header)):
         # Assign learning rate & weight decay for each step
         it = start_steps + step  # global training iteration
+        grad_norm = None # Initialize grad_norm for the current step
 
         update_grad = (step + 1) % accum_iter == 0
 
@@ -845,6 +952,7 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
 
             if update_grad:
                 nan_gradients = False
+                grad_norm = None # Initialize grad_norm
 
                 if max_norm is not None:
                     grad_norm = model.clip_grad_norm_(max_norm)

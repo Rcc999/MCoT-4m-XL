@@ -24,6 +24,7 @@ from fourm.utils import get_sentinel_to_id_mapping, merge_span_masking
 from fourm.utils.generation import cosine_schedule, linear_schedule, onex_temp_schedule, linear_temp_schedule, continue_schedule
 from tqdm import tqdm
 import copy
+import random
 
 
 
@@ -1045,10 +1046,11 @@ class GenerationSampler(nn.Module):
 
     def guided_autoregressive_step_batched(self, mod_dict, target_mod, temperature, top_k: Union[float, int], top_p: float,
                                            use_eos=True, eos_token=None, start_tokens=None, text_tokenizer=None, 
-                                           conditioning=[], guidance_scale=1.0, seed=None):
+                                           conditioning=[], guidance_scale=1.0, seed=None,
+                                           max_new_tokens: Optional[int] = None):
 
-         ### 1 - Encoder forward pass, with conditioning
         
+         ### 1 - Encoder forward pass, with conditioning
         # Encoder
         encoder_mod_dict = {mod: self.model.encoder_embeddings[mod](d)
                             for mod, d in mod_dict.items()
@@ -1095,37 +1097,53 @@ class GenerationSampler(nn.Module):
         decoder_ids, decoder_emb, decoder_mask, decoder_mod_mask_uncond, mod_pos = self.forward_mask_decoder_autoregressive(decoder_mod_dict_uncond, target_mod, seed=seed)
 
 
+        # Retrieve the stored initial_seq_len
+        initial_seq_len_from_details = 0 # Default if not found
+        if target_mod in mod_dict and '_generation_details' in mod_dict[target_mod] and 'initial_seq_len' in mod_dict[target_mod]['_generation_details']:
+            initial_seq_len_from_details = mod_dict[target_mod]['_generation_details']['initial_seq_len']
+        else:
+            # This case should ideally not happen if generate() sets it correctly
+            print("[DEBUG from guided_autoregressive_step_batched] WARNING: initial_seq_len not found in _generation_details. Falling back to calculating from current decoder_mask.")
+            # Fallback: calculate from current decoder_mask (where True is input)
+            if decoder_mask.ndim >=2 and decoder_mask.shape[0] > 0:
+                 initial_seq_len_from_details = (decoder_mask[0] == True).sum().item()
+            else:
+                 initial_seq_len_from_details = 0
+
         if use_eos and eos_token is None:
             # The eos_token is the final sentinel token provided
             # Fix: Look for actual EOS token instead of assuming it's the last unmasked token
-            # decoder_mask is target_mask: True = input, False = target
-            input_tokens = decoder_ids[0][decoder_mask[0] == True]  # Get input tokens
+            # Use initial_seq_len_from_details to get the prompt tokens
+            prompt_tokens_for_eos = decoder_ids[0, :initial_seq_len_from_details]
             # Try to find EOS token in the input tokens
             if text_tokenizer is not None:
                 eos_id = text_tokenizer.token_to_id("[EOS]")
-                if eos_id is not None and eos_id in input_tokens:
-                    eos_token = torch.tensor(eos_id, dtype=input_tokens.dtype)
+                if eos_id is not None and eos_id in prompt_tokens_for_eos:
+                    eos_token = torch.tensor(eos_id, dtype=prompt_tokens_for_eos.dtype)
                 else:
                     # Fallback: use the last input token (original behavior)
-                    eos_token = input_tokens[-1]
+                    if len(prompt_tokens_for_eos) > 0:
+                        eos_token = prompt_tokens_for_eos[-1]
+                    else:
+                        # This would mean initial_seq_len_from_details is 0, very problematic
+                        print("[DEBUG from guided_autoregressive_step_batched] ERROR: prompt_tokens_for_eos is empty, cannot determine eos_token!")
+                        # Potentially raise an error or set a default EOS if appropriate
+                        # For now, let eos_token remain None if it can't be found.
+                        pass 
             else:
                 # Fallback: use the last input token (original behavior)
-                eos_token = input_tokens[-1]
-        if use_eos:
+                if len(prompt_tokens_for_eos) > 0:
+                    eos_token = prompt_tokens_for_eos[-1]
+                else:
+                    print("[DEBUG from guided_autoregressive_step_batched] ERROR: prompt_tokens_for_eos is empty (no text_tokenizer), cannot determine eos_token!")
+                    pass # eos_token remains None
+        if use_eos and eos_token is not None: # Ensure eos_token was actually found/set before .to(device)
             eos_token = eos_token.to(device)
-
+ 
         # CRITICAL FIX: For VQA, start with all input tokens, not just the first one
         if start_tokens is None:
-            # Get all input tokens (where target_mask is True, meaning NOT targets = inputs)
-            input_mask_2d = decoder_mask == True  # Shape: (B, seq_len) - True means input tokens
-            
-            # For autoregressive generation, we need ALL input tokens in sequence order
-            # Find the last input token position for each batch
-            input_lengths = input_mask_2d.sum(dim=1)  # Shape: (B,)
-            max_input_len = input_lengths.max().item()
-            
-            # Extract input tokens maintaining sequence order
-            out = decoder_ids[:, :max_input_len]  # Take the first max_input_len tokens
+            # Use the initial_seq_len_from_details passed from generate()
+            out = decoder_ids[:, :initial_seq_len_from_details]
         else:
             out = start_tokens.to(device)
         # Set decoder_tokens to None, we do not use them for decoding
@@ -1161,19 +1179,18 @@ class GenerationSampler(nn.Module):
                 break
             # Convert ids into word embeddings and add corresponding posembs + modemb
             # BUG FIX: Use safe embedding handling to prevent index out of bounds
-            if cur_len <= y_emb.shape[1]:
-                y = self.model.decoder_embeddings[target_mod].token_emb(out) + y_emb[:, :cur_len]
-            else:
-                # If we exceed the pre-computed embeddings, use zero padding for new positions
-                token_emb = self.model.decoder_embeddings[target_mod].token_emb(out)
-                if y_emb.shape[1] > 0:
-                    # Extend with zeros for positions beyond the original sequence
-                    extra_emb = torch.zeros(B, cur_len - y_emb.shape[1], y_emb.shape[2], 
-                                          device=y_emb.device, dtype=y_emb.dtype)
-                    extended_y_emb = torch.cat([y_emb, extra_emb], dim=1)
-                    y = token_emb + extended_y_emb
-                else:
-                    y = token_emb
+            # Replace the old y_emb logic with direct embedding construction for 'out'
+            current_decoder_embedding_layer = self.model.decoder_embeddings[target_mod]
+            y = current_decoder_embedding_layer.token_emb(out)
+            
+            if current_decoder_embedding_layer.pos_emb is not None:
+                 # Ensure cur_len does not exceed pos_emb's length
+                 max_pos_len = current_decoder_embedding_layer.pos_emb.shape[1]
+                 y = y + current_decoder_embedding_layer.pos_emb[:, :min(cur_len, max_pos_len), :]
+            
+            if current_decoder_embedding_layer.mod_emb is not None:
+                 y = y + current_decoder_embedding_layer.mod_emb
+            
             # Build causal mask
             causal_mask = torch.ones((cur_len, cur_len), dtype=torch.bool, device=y.device).triu(1)
             causal_mask = repeat(causal_mask, "n1 n2 -> b n1 n2", b=B)
@@ -1202,6 +1219,10 @@ class GenerationSampler(nn.Module):
                 sample = torch.multinomial(probs, 1)
             out = torch.cat((out, sample), dim=-1)
             
+            # <<< DEBUG PRINT >>>
+            if max_new_tokens is not None:
+                print(f"DEBUG: Loop iter {i}, out.shape[1]={out.shape[1]}, initial_seq_len={initial_seq_len}, max_new_tokens={max_new_tokens}, new_tokens_generated={(out.shape[1] - initial_seq_len)}")
+
             # CRITICAL FIX: Extend decoder_mod_mask for both conditional and unconditional branches
             cur_len = out.shape[1]
             if cur_len > decoder_mod_mask_cond.shape[1]:
@@ -1209,6 +1230,11 @@ class GenerationSampler(nn.Module):
                 new_mod_id = torch.full((B, 1), target_mod_id, device=decoder_mod_mask_cond.device, dtype=decoder_mod_mask_cond.dtype)
                 decoder_mod_mask_cond = torch.cat([decoder_mod_mask_cond, new_mod_id], dim=1)
                 decoder_mod_mask_uncond = torch.cat([decoder_mod_mask_uncond, new_mod_id], dim=1)
+
+            # ADD THE MAX_NEW_TOKENS BREAK CONDITION HERE
+            if max_new_tokens is not None and (out.shape[1] - initial_seq_len) >= max_new_tokens:
+                # print(f"DEBUG: Breaking due to max_new_tokens. New tokens generated: {(out.shape[1] - initial_seq_len)}, Total tokens: {out.shape[1]}") # Removed this line
+                break 
 
             if use_eos and (sample == eos_token).any(dim=-1).all() and out.shape[1] > initial_seq_len:
                 break
@@ -1304,10 +1330,25 @@ class GenerationSampler(nn.Module):
                         text_tokenizer=text_tokenizer, seed=seed_i
                     )
                 else:
+                    # Ensure _generation_details exists for storing initial_seq_len
+                    if target_mod not in mod_dict:
+                        mod_dict[target_mod] = {}
+                    if '_generation_details' not in mod_dict[target_mod]:
+                        mod_dict[target_mod]['_generation_details'] = {}
+                    
+                    # Calculate initial_seq_len from the current input_mask for this target_mod
+                    current_initial_seq_len = 0 # Default
+                    if 'input_mask' in mod_dict[target_mod] and mod_dict[target_mod]['input_mask'].ndim >= 2 and mod_dict[target_mod]['input_mask'].shape[0] > 0:
+                        # Count False values (unmasked tokens) in the first batch item's input_mask
+                        current_initial_seq_len = (~mod_dict[target_mod]['input_mask'][0]).sum().item()
+                    
+                    mod_dict[target_mod]['_generation_details']['initial_seq_len'] = current_initial_seq_len
+
                     mod_dict = self.guided_autoregressive_step_batched(
                         mod_dict, target_mod, temperature=temp, top_k=top_k, top_p=top_p,
                         text_tokenizer=text_tokenizer, conditioning=cfg_conditioning, 
-                        guidance_scale=cfg_scale, seed=seed_i
+                        guidance_scale=cfg_scale, seed=seed_i,
+                        max_new_tokens=schedule_step_info['num_tokens']
                     )
             else:
                 raise ValueError("Invalid schedule")
@@ -1375,10 +1416,25 @@ class GenerationSampler(nn.Module):
                         text_tokenizer=text_tokenizer, seed=seed_i
                     )
                 else:
+                    # Ensure _generation_details exists for storing initial_seq_len
+                    if target_mod not in mod_dict:
+                        mod_dict[target_mod] = {}
+                    if '_generation_details' not in mod_dict[target_mod]:
+                        mod_dict[target_mod]['_generation_details'] = {}
+                    
+                    # Calculate initial_seq_len from the current input_mask for this target_mod
+                    current_initial_seq_len = 0 # Default
+                    if 'input_mask' in mod_dict[target_mod] and mod_dict[target_mod]['input_mask'].ndim >= 2 and mod_dict[target_mod]['input_mask'].shape[0] > 0:
+                        # Count False values (unmasked tokens) in the first batch item's input_mask
+                        current_initial_seq_len = (~mod_dict[target_mod]['input_mask'][0]).sum().item()
+                    
+                    mod_dict[target_mod]['_generation_details']['initial_seq_len'] = current_initial_seq_len
+
                     mod_dict = self.guided_autoregressive_step_batched(
                         mod_dict, target_mod, temperature=temp, top_k=top_k, top_p=top_p,
                         text_tokenizer=text_tokenizer, conditioning=cfg_conditioning, 
-                        guidance_scale=cfg_scale, seed=seed_i
+                        guidance_scale=cfg_scale, seed=seed_i,
+                        max_new_tokens=schedule_step_info['num_tokens']
                     )
             else:
                 raise ValueError("Invalid schedule")

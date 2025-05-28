@@ -115,23 +115,31 @@ class VQAv2Dataset(datasets.GeneratorBasedBuilder):
         user_manual_dir = dl_manager.manual_dir
 
         if user_manual_dir is None:
-            # If no manual_dir is specified, default to "vqa_v2_manual_downloads" in the current working directory.
-            # This is based on the user's command `cache_dir='.'` and the original script's implied name.
-            current_working_dir = Path(os.getcwd())
-            data_dir = current_working_dir / "vqa_v2_manual_downloads"
+            # WORKAROUND: If no manual_dir is specified by the calling training script,
+            # default to the expected raw VQAv2 data location.
+            data_dir = Path("/work/com-304/vqav2_data_raw")
             print(
-                f"INFO: 'data_dir' was not specified in load_dataset. "
-                f"Defaulting to '{data_dir}' for downloads and extractions. "
-                f"It is recommended to specify 'data_dir' explicitly for manual downloads."
+                f"INFO: 'data_dir' was not specified in load_dataset by the calling script. "
+                f"Defaulting to WORKAROUND path: '{data_dir}' for VQAv2 raw files. "
+                f"It is recommended that the training script explicitly passes 'data_dir'."
             )
+            if not data_dir.exists():
+                # This is a fallback; the data should ideally already be there from download_vqa.py
+                print(f"ERROR: WORKAROUND path {data_dir} does not exist. VQAv2 data needs to be present.")
+                # Optionally, trigger download here if absolutely necessary, but it's better if data is pre-downloaded.
+                # For now, we assume data must exist if this path is used.
+                raise FileNotFoundError(f"VQAv2 raw data directory {data_dir} not found. Please download the dataset first.")
         else:
             data_dir = Path(user_manual_dir)
 
         # Ensure the target data_dir exists. This directory will store downloaded zips and extracted contents.
-        # The original script created it, so we maintain that behavior.
-        # Using os.makedirs with exist_ok=True is safer.
+        # Using os.makedirs with exist_ok=True is safer if we were to allow downloads here,
+        # but with the workaround, we primarily expect it to exist.
         if not data_dir.exists():
-            os.makedirs(data_dir, exist_ok=True)
+            # This case should ideally not be hit if user_manual_dir is provided and correct,
+            # or if the WORKAROUND path is correct and data is present.
+            print(f"ERROR: Specified or effective data_dir '{data_dir}' does not exist.")
+            os.makedirs(data_dir, exist_ok=True) # Create if it doesn't, though downloads might fail if it was truly missing
 
         split_paths = {}
 

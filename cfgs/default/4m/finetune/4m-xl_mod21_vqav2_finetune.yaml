@@ -1,38 +1,58 @@
-run_name: vqav2_finetune_4m-xl_mod21
+# Config for FSDP
+# VQA Finetuning based on 4M-7-T2I_XL_CC12M
+
+run_name: vqav2_finetune_4m-7-t2i-xl_subset25pct
 
 num_input_tokens: 256
-num_target_tokens: 64 # Adjusted for VQA answer length
+num_target_tokens: 64 # Max VQA answer length
 loss_type: mod
 
+# --- Model Configuration ---
+# The specific model architecture name might need to be confirmed from the T2I model's config.json
+# Assuming fm_xlarge_24e_24d_swiglu_nobias is compatible or training script infers from checkpoint.
 model: fm_xlarge_24e_24d_swiglu_nobias
+# Checkpoint to finetune from - CHANGED to the T2I model
+# Ensure your training script can load from HF ID or download it and use local path.
+# If using local path, it would be something like: '/path/to/your/downloaded/EPFL-VILAB/4M-7-T2I_XL_CC12M_model_files/'
+finetune: 'EPFL-VILAB/4M-7-T2I_XL_CC12M'
+
 patch_size: 16
 input_size: 224
-dtype: bfloat16
+dtype: bfloat16 # Keep bfloat16 if your hardware supports it well, otherwise float32
 tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
 
-finetune: 'https://huggingface.co/EPFL-VILAB/4M-21_XL/resolve/main/model.safetensors' # IMPORTANT: Using the Hugging Face URL for the 4m21xl model checkpoint
-
-epochs: 10 # Adjusted from -1
-total_tokens: -1 # Adjusted from 5
+# --- Training Parameters ---
+epochs: 15 # Example: Adjust based on time constraints and subset size (e.g., 10-20 for 25% subset)
+total_tokens: -1 # Using epochs instead
 opt: adamw
-blr: 0.00002
-min_blr: 0.
-warmup_epochs: 1 # Adjusted from -1
-warmup_tokens: -1 # Adjusted from 0.4
-batch_size: 32 #32
+blr: 0.00002 # 2e-5, a common finetuning learning rate
+min_blr: 0. # Standard practice to decay to 0 or a very small fraction of blr
+warmup_epochs: 2 # Example: 1-2 epochs for warmup on a subset. Adjust based on total epochs.
+warmup_tokens: -1 # Using warmup_epochs
+
+batch_size: 8 # Keep as high as your VRAM allows - REDUCED FROM 16 due to OOM
+accum_iter: 4 # Gradient accumulation - INCREASED FROM 2
 clip_grad: 3.0
-use_act_checkpoint: True
+use_act_checkpoint: True # Saves memory, good for large models
 skip_nan_grad: True
 
-data_config: "cfgs/default/4m/data/vqav2/vqav2.yaml" 
-eval_freq: 1
-fixed_eval: True
-epoch_size: 100_000
+# --- Data Configuration ---
+# This should point to your vqav2.yaml that refers to the 25% subset for training
+# and full validation set for evaluation.
+data_config: "cfgs/default/4m/data/vqav2/vqav2.yaml"
+eval_freq: 1 # Evaluate after every epoch
+fixed_eval: True # Use a fixed set of evaluation samples if your eval script supports it
+# epoch_size: 100_000 # If using -1 for epochs and defining by total_tokens/epoch_size, this needs to be dataset size.
+                     # For 25% subset (110939 samples), set to that or let epochs control.
+                     # If epochs is set, epoch_size might be ignored or used for intra-epoch logging/eval. Let's assume epochs is primary.
+epoch_size: 110939 # Number of samples in the 25% training subset
 
-save_ckpt_freq: 1
-output_dir: 'output/vqav2_finetune_4m-xl_mod21'
+# --- Saving ---
+save_ckpt_freq: 1 # Save checkpoint every N epochs
+output_dir: '/work/com-304/vqav2_finetune_4m-7-t2i-xl_subset25pct' # New output directory for this run
 
-# Wandb 
+# --- Wandb Logging ---
 log_wandb: True
-wandb_project: '4m-vqav2-finetune'
-wandb_entity: 'as8148-epfl'
+wandb_project: 'MCoT-4M'
+wandb_entity: 'rayane-charifchefchaouni-epfl' # Your entity
+wandb_run_name: 'vqav2_ft_4m7t2ixl_subset25_run1' # Descriptive run name

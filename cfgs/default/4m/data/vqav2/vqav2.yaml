@@ -2,27 +2,72 @@ train:
   datasets:
     vqav2:
       type: huggingface
+      # Path to the Hugging Face dataset loading script
+      data_path: ./vqav2_data/vqa_dataset_wget.py 
+      # Directory where raw VQAv2 files (zips, extracted folders) are stored.
+      # The training script's data loader should pass this as 'data_dir' to datasets.load_dataset().
+      hf_data_dir: "/work/com-304/vqav2_data_raw"
       in_domains: rgb@224-caption
       out_domains: caption
       input_alphas: "1.0"
       target_alphas: "1.0"
       alphas_config: null
-      data_path: ./vqav2_data/vqa_dataset_wget
-      shuffle_buffer_load: 1_000
+      shuffle_buffer_load: 1_000 # Buffer for shuffling dataset items if applicable
   weights: [1.0]
 
 val:
   datasets:
     vqav2:
       type: huggingface
+      # Path to the Hugging Face dataset loading script
+      data_path: ./vqav2_data/vqa_dataset_wget.py
+      # Directory for raw VQAv2 files for the validation set
+      hf_data_dir: "/work/com-304/vqav2_data_raw"
       in_domains: rgb@224-caption
       out_domains: caption
-      data_path: ./vqav2_data/vqa_dataset_wget
 
 transform_keys:
-  - normal
+  - normal # Assumes 'normal' corresponds to a standard ImageNet normalization transform
 
 extras:
-  text_to_caption: false
-  insert_sep_between_answers: true
+  # Whether to convert text-only inputs to a "caption" format (likely False for VQA)
+  text_to_caption: false 
+  # Whether the target answer sequence during training should start with [S_2]
+  insert_sep_between_answers: true 
+  # Whether image tokens are placed before text tokens in a sequence (might be relevant for some architectures)
   insert_image_at_beginning: true
+
+# This is an EXAMPLE structure. You need to adapt it to your actual vqav2.yaml format.
+# Ensure the paths below are correct for your system and point to the
+# VQAv2 data (full validation, 25% training subset).
+
+# Path to the Hugging Face dataset loading script for VQAv2 (if your framework uses this)
+# hf_dataset_script_path: "vqav2_data/vqa_dataset_wget.py"
+# hf_dataset_data_dir: "/work/com-304/vqav2_data_raw" # For raw files if hf_dataset_script_path is used
+
+# Or, if your framework expects direct paths to processed/raw files:
+train_split:
+  question_file: "/work/com-304/vqav2_subset_25pct/v2_OpenEnded_mscoco_train2014_questions_subset25pct.json"
+  annotation_file: "/work/com-304/vqav2_subset_25pct/v2_mscoco_train2014_annotations_subset25pct.json"
+  image_root: "/work/com-304/vqav2_data_raw/images_train/train2014" # Full image set still used
+  # Optional: if your data loader expects a pre-filtered list of image IDs for the subset
+  # image_list_file: "/work/com-304/vqav2_subset_25pct/train_subset_image_ids.txt" 
+
+val_split:
+  question_file: "/work/com-304/vqav2_data_raw/questions_val/v2_OpenEnded_mscoco_val2014_questions.json"
+  annotation_file: "/work/com-304/vqav2_data_raw/annotations_val/v2_mscoco_val2014_annotations.json"
+  image_root: "/work/com-304/vqav2_data_raw/images_val/val2014"
+
+# test_split: # If you use a test split during training/eval
+#   question_file: "/work/com-304/vqav2_data_raw/questions_test-dev/v2_OpenEnded_mscoco_test-dev2015_questions.json"
+#   # No annotations for test-dev usually, depends on how your framework handles it
+#   image_root: "/work/com-304/vqav2_data_raw/images_test-dev/test2015"
+
+# --- Other data loader specific settings might go here ---
+# E.g., num_workers, pin_memory, image_transform_configs, text_preprocessing_configs etc.
+
+# Example: How answers are processed for the target sequence
+# This needs to match your model's training expectation (e.g., starting with [S_2])
+answer_processing:
+  insert_s2_token: true # If [S_2] should be prepended to the answer for the decoder target
+  max_ans_tokens: 62 # Max tokens for answer part, allowing for [S_2] and [EOS]

@@ -27,6 +27,8 @@ from huggingface_hub import PyTorchModelHubMixin
 
 from .fm_utils import Block, DecoderBlock, LayerNorm
 from fourm.data.modality_info import MODALITY_INFO
+from .encoder_embeddings import SequenceEncoderEmbedding, ImageEncoderEmbedding
+from .decoder_embeddings import SequenceDecoderEmbedding, ImageTokenDecoderEmbedding
 
 
 # Model definitions
@@ -781,54 +783,139 @@ class FourM(nn.Module):
 # Wrapper for easy loading with Huggingface Hub
 
 class FM(FourM, PyTorchModelHubMixin):
-    """Wrapper around FourM for easy loading with Huggingface Hub.
+    """Wrapper class for FourM that uses MODALITY_INFO to build embeddings"""
 
-    Args:
-        config (dict): Dictionary containing the model and modality configuration, 
-            used for loading from Huggingface Hub.
-    """
     def __init__(self, config: dict):
 
-        config = copy.deepcopy(config)
+        # Determine encoder and decoder domains from config
+        domains_in = config.get('domains_in', [])
+        domains_out = config.get('domains_out', [])
+        if not isinstance(domains_in, list):
+            domains_in = domains_in.split('-')
+        if not isinstance(domains_out, list):
+            domains_out = domains_out.split('-')
+        all_domains = sorted(list(set(domains_in) | set(domains_out)))
 
-        all_domains = sorted(list(set(config['domains_in']) | set(config['domains_out'])))
-        modality_info = {mod: MODALITY_INFO[mod] for mod in all_domains}
-
-        encoder_embeddings = {}
-        for mod in config['domains_in']:
-            info = modality_info[mod]
-            if info.get("encoder_embedding", None) is not None:
-                if info["type"] == "img":
-                    image_size, patch_size = info.get('input_size', config['image_size']), info.get('patch_size', config['patch_size'])
-                    encoder_embeddings[mod] = info["encoder_embedding"](patch_size=patch_size, image_size=image_size)
-                else:
-                    encoder_embeddings[mod] = info["encoder_embedding"]()
-    
-        decoder_embeddings = {}
-        for mod in config['domains_out']:
-            info = modality_info[mod]
-            if info.get("decoder_embedding", None) is not None:
-                if info["type"] == "img":
-                    image_size, patch_size = info.get('input_size', config['image_size']), info.get('patch_size', config['patch_size'])
-                    decoder_embeddings[mod] = info["decoder_embedding"](patch_size=patch_size, image_size=image_size, share_embedding=False)
-                else:
-                    decoder_embeddings[mod] = info["decoder_embedding"](share_embedding=False)
-
-        config['norm_layer'] = partial(LayerNorm, eps=1e-6, bias=config['norm_bias'])
-        config['act_layer'] = getattr(torch.nn, config['act_layer'])
-
-        del config['norm_bias']
-        del config['domains_in']
-        del config['domains_out']
-        del config['image_size']
-        del config['patch_size']
+        # Filter MODALITY_INFO to only include relevant domains and add to config for embedding layers
+        # Make a deepcopy to avoid modifying the global MODALITY_INFO
+        current_modality_info = {mod: copy.deepcopy(MODALITY_INFO[mod]) for mod in all_domains}
         
+        # Override vocab_size in the current_modality_info if provided in config (e.g. for finetuning)
+        # This is a common pattern if a checkpoint was finetuned with a different vocab size
+        # For VQA, the tokenizer vocab_size is 30000, MODALITY_INFO['caption']['vocab_size'] should reflect this.
+        # The inference script already ensures MODALITY_INFO has the correct vocab_size based on tokenizer.
+        # So, current_modality_info['caption']['vocab_size'] will be 30000.
+
+        # Create encoder embeddings based on config and modality_info
+        encoder_embeddings = {}
+        for mod in domains_in:
+            info = current_modality_info[mod]
+            emb_fn = info['encoder_embedding']
+            
+            # Prepare kwargs for the embedding function
+            emb_kwargs = {}
+            if 'patch_size' in info: emb_kwargs['patch_size'] = info['patch_size']
+            if 'input_size' in info: emb_kwargs['image_size'] = info['input_size'] # Encoder ImageEmbeddings use image_size
+            if 'strides' in info: emb_kwargs['strides'] = info['strides'] # For AudioEmbeddings
+            # The .init(dim_tokens=...) method will be called by FourM.__init__ to set the dimension.
+
+            # Filter out None values from emb_kwargs as some embedding init might not like None for optional args
+            emb_kwargs = {k: v for k, v in emb_kwargs.items() if v is not None}
+
+            # For SequenceEncoderEmbedding, it needs vocab_size, max_length, padding_idx from info
+            if emb_fn.func == SequenceEncoderEmbedding: # Check if it's partial of SequenceEncoderEmbedding
+                if 'vocab_size' in info: emb_kwargs['vocab_size'] = info['vocab_size']
+                if 'max_length' in info: emb_kwargs['max_length'] = info['max_length']
+                if 'padding_idx' in info: emb_kwargs['padding_idx'] = info['padding_idx']
+            # For ImageEncoderEmbedding, it needs num_channels from info
+            elif emb_fn.func == ImageEncoderEmbedding:
+                if 'num_channels' in info: emb_kwargs['num_channels'] = info['num_channels']
+
+            encoder_embeddings[mod] = emb_fn(**emb_kwargs)
+
+
+        # Create decoder embeddings
+        decoder_embeddings = {}
+        for mod in domains_out:
+            info = current_modality_info[mod]
+            emb_fn = info['decoder_embedding']
+
+            # Prepare kwargs for the embedding function
+            emb_kwargs = {}
+            # For TextEmbeddings (common for caption decoder)
+            if 'vocab_size' in info: emb_kwargs['vocab_size'] = info['vocab_size']
+            # Add model's main dimension, as embedding layers often need it (e.g. as hidden_dim)
+            emb_kwargs['hidden_dim'] = config.get('dim') # TextEmbeddings use hidden_dim
+            
+            # For ImageEmbeddings if used as decoder (e.g. image generation)
+            if 'patch_size' in info: emb_kwargs['patch_size'] = info['patch_size']
+            if 'output_size' in info: emb_kwargs['image_size'] = info['output_size'] # Decoder ImageEmbeddings might use output_size as image_size
+            elif 'input_size' in info: emb_kwargs['image_size'] = info['input_size']
+
+
+            # Filter out None values
+            emb_kwargs = {k: v for k, v in emb_kwargs.items() if v is not None}
+            
+            # Ensure 'dim' is available for backward compatibility if some embedding uses it directly
+            # and it wasn't added as hidden_dim.
+            if 'dim' not in emb_kwargs and config.get('dim') is not None:
+                 emb_kwargs['dim'] = config.get('dim')
+
+
+            decoder_embeddings[mod] = emb_fn(**emb_kwargs)
+
+
+        # Define base architectural kwargs for FourM superclass
+        # These should be derived from config['model_name_or_type'] or be explicitly in config
+        
+        # Default to XL if not specified, but ideally these come from the config
+        # The inference script now populates these based on the YAML or defaults.
+        base_kwargs = {
+            'modality_info': current_modality_info, # Pass the filtered and potentially updated modality_info
+            'dim': config.get('dim', 2048),
+            'encoder_depth': config.get('encoder_depth', 24),
+            'decoder_depth': config.get('decoder_depth', 24),
+            'num_heads': config.get('num_heads', 32),
+            'mlp_ratio': config.get('mlp_ratio', 4.0),
+            'qkv_bias': config.get('qkv_bias', False), # common for 'nobias' models
+            'proj_bias': config.get('proj_bias', False),# common for 'nobias' models
+            'mlp_bias': config.get('mlp_bias', False),  # common for 'nobias' models
+            'gated_mlp': config.get('gated_mlp', True), # common for 'swiglu' models
+            'act_layer': getattr(nn, config.get('act_layer', 'SiLU')) if isinstance(config.get('act_layer'), str) else config.get('act_layer', nn.SiLU),
+            'norm_layer': partial(LayerNorm, eps=config.get('norm_eps', 1e-6), bias=config.get('norm_bias', True)),
+            'qk_norm': config.get('qk_norm', False),
+            'drop_path_rate_encoder': config.get('drop_path_rate_encoder', 0.0),
+            'drop_path_rate_decoder': config.get('drop_path_rate_decoder', 0.0),
+            'shared_drop_path': config.get('shared_drop_path', False),
+            'decoder_causal_mask': config.get('decoder_causal_mask', False), # VQA likely needs False for question, True for answer
+            'decoder_sep_mask': config.get('decoder_sep_mask', True),
+            'num_register_tokens': config.get('num_register_tokens', 0),
+            'use_act_checkpoint': config.get('use_act_checkpoint', False),
+            'share_modality_embeddings': config.get('share_modality_embeddings', True),
+        }
+
+        # Specific overrides based on model_name_or_type if necessary,
+        # but the inference script already prepares these in the config.
+        # model_name = config.get('model_name_or_type', 'fm_xlarge_24e_24d_swiglu_nobias')
+        # if 'nobias' in model_name:
+        #     base_kwargs.update({'qkv_bias': False, 'proj_bias': False, 'mlp_bias': False})
+        # if 'swiglu' in model_name:
+        #     base_kwargs.update({'gated_mlp': True, 'act_layer': nn.SiLU})
+        # Add more model-specific parsing if needed.
+
+        # Print for debugging what FM is passing to FourM
+        print(f"FM is initializing FourM with base_kwargs: {list(base_kwargs.keys())}")
+        # For more detail:
+        # for k, v in base_kwargs.items():
+        #     if k not in ['encoder_embeddings', 'decoder_embeddings', 'modality_info']:
+        #          print(f"  FM to FourM Kwarg: {k} = {v} (type: {type(v)})")
+
+
         super().__init__(
             encoder_embeddings=encoder_embeddings,
             decoder_embeddings=decoder_embeddings,
-            modality_info=modality_info,
-            **config
-        )   
+            **base_kwargs # Pass the explicitly prepared kwargs
+        )
 
 
 ################################################
