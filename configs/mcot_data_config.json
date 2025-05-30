@@ -1,0 +1,31 @@
+{
+  "name": "mcot_training_data",
+  "description": "MCoT training dataset with step-specific data",
+  "datasets": [
+    {
+      "name": "mcot_base",
+      "type": "multimodal_dataset_folder",
+      "path": "data/mcot_training_dataset.json",
+      "split": "train",
+      "modalities": ["rgb", "caption", "planning", "acting", "reflection", "correction"],
+      "weight": 1.0
+    }
+  ],
+  "sampling_weights": {
+    "rgb": 1.0,
+    "caption": 1.0,
+    "planning": 1.0,
+    "acting": 1.0, 
+    "reflection": 1.0,
+    "correction": 1.0
+  },
+  "preprocessing": {
+    "image_size": 224,
+    "patch_size": 16,
+    "max_text_length": 256
+  },
+  "augmentation": {
+    "enable_image_augmentation": true,
+    "enable_text_augmentation": false
+  }
+}

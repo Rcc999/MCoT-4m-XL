@@ -42,17 +42,29 @@ SeeTRUE-Feedback, and BrushData to create a step-by-step multimodal reasoning pi
 
 _URLS = {
     "visual_genome": {
-        "hf_dataset_name": "ranjaykrishna/visual_genome",
-        "annotations_zip_url": "https://cs.stanford.edu/people/rak248/VG_100K_2/region_descriptions.json.zip"
+        "annotations_zip_url": "https://homes.cs.washington.edu/~ranjay/visualgenome/data/dataset/region_descriptions.json.zip",
+        "images_part1_url": "https://cs.stanford.edu/people/rak248/VG_100K_2/images.zip",
+        "images_part2_url": "https://cs.stanford.edu/people/rak248/VG_100K_2/images2.zip", 
+        "objects_url": "https://homes.cs.washington.edu/~ranjay/visualgenome/data/dataset/objects.json.zip",
+        "attributes_url": "https://homes.cs.washington.edu/~ranjay/visualgenome/data/dataset/attributes.json.zip",
+        "relationships_url": "https://homes.cs.washington.edu/~ranjay/visualgenome/data/dataset/relationships.json.zip"
     },
     "richhf18k": {
-        "github_url": "https://github.com/google-research-datasets/richhf-18k"
+        "tfrecord_urls": {
+            "train": "https://github.com/google-research-datasets/richhf-18k/raw/main/train.tfrecord",
+            "dev": "https://github.com/google-research-datasets/richhf-18k/raw/main/dev.tfrecord", 
+            "test": "https://github.com/google-research-datasets/richhf-18k/raw/main/test.tfrecord"
+        }
     },
     "seetrue_feedback": {
         "hf_dataset_name": "mismatch-quest/SeeTRUE-Feedback"
     },
     "brush_data": {
-        "hf_dataset_name": "random123123/BrushData"
+        "base_tar_url": "https://huggingface.co/datasets/random123123/BrushData/resolve/main/",
+        "tar_files": [
+            "00000.tar", "00001.tar", "00002.tar", "00003.tar", "00004.tar",
+            "00005.tar", "00006.tar"
+        ]
     }
 }
 
@@ -85,10 +97,72 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             citation=_CITATION,
         )
 
+    def _download_all_datasets_first(self, dl_manager, base_data_dir):
+        """Download all datasets first using wget, then process from cache"""
+        import time
+        print("🚀 Step 1: Downloading all datasets first...")
+        
+        # Create cache directories
+        vg_cache_dir = base_data_dir / "visual_genome_raw" / "hf_cache"
+        seetrue_cache_dir = base_data_dir / "seetrue_feedback_raw" / "hf_cache"
+        brush_cache_dir = base_data_dir / "brush_data_raw" / "hf_cache"
+        
+        def download_with_retry(dataset_name, hf_name, config=None, split="train", cache_dir=None, max_retries=3):
+            """Download dataset with exponential backoff retry"""
+            for attempt in range(max_retries):
+                try:
+                    print(f"📦 Downloading {dataset_name} dataset (attempt {attempt + 1}/{max_retries})...")
+                    if config:
+                        dataset = datasets.load_dataset(
+                            hf_name, config, split=split, cache_dir=str(cache_dir),
+                            trust_remote_code=True, download_mode="reuse_cache_if_exists"
+                        )
+                    else:
+                        dataset = datasets.load_dataset(
+                            hf_name, split=split, cache_dir=str(cache_dir),
+                            trust_remote_code=True, download_mode="reuse_cache_if_exists"
+                        )
+                    print(f"✅ {dataset_name} downloaded successfully")
+                    return True
+                except Exception as e:
+                    error_msg = str(e)
+                    if "429" in error_msg or "Too Many Requests" in error_msg:
+                        wait_time = (2 ** attempt) * 60  # Exponential backoff: 60s, 120s, 240s
+                        print(f"⚠️ Rate limited. Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    elif attempt == max_retries - 1:
+                        print(f"❌ {dataset_name} download failed after {max_retries} attempts: {e}")
+                        return False
+                    else:
+                        print(f"⚠️ {dataset_name} download failed (attempt {attempt + 1}): {e}")
+                        time.sleep(30)  # Wait 30s between regular retries
+            return False
+        
+        # Note: Visual Genome will be downloaded directly with wget in _download_and_prepare_visual_genome
+        # This avoids the 9.73GB HuggingFace download that keeps failing
+        print("🎯 Visual Genome will be downloaded directly with wget (skipping HuggingFace)")
+        
+        # Note: BrushData will be downloaded directly with wget in _download_and_prepare_brush_data  
+        # This limits download to 20GB instead of 1.7TB
+        print("🎯 BrushData will be downloaded directly with wget (limiting to 20GB)")
+        
+        # Download SeeTRUE-Feedback with retry
+        download_with_retry(
+            "SeeTRUE-Feedback",
+            _URLS["seetrue_feedback"]["hf_dataset_name"],
+            split="test",
+            cache_dir=seetrue_cache_dir
+        )
+        
+        print("🎉 All dataset downloads attempted! Now processing...")
+
     def _split_generators(self, dl_manager):
         user_manual_dir = dl_manager.manual_dir
         base_data_dir = Path(user_manual_dir) if user_manual_dir else Path(os.getcwd()) / "mcot_downloads"
         base_data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download all datasets first
+        self._download_all_datasets_first(dl_manager, base_data_dir)
 
         processed_data_dir = base_data_dir / "processed_mcot_steps"
         processed_data_dir.mkdir(parents=True, exist_ok=True)
@@ -98,6 +172,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         seetrue_raw_dir = base_data_dir / "seetrue_feedback_raw"
         brush_raw_dir = base_data_dir / "brush_data_raw"
 
+        print("🔄 Step 2: Processing downloaded datasets...")
         self._download_and_prepare_visual_genome(dl_manager, vg_raw_dir, _URLS["visual_genome"])
         self._process_visual_genome(vg_raw_dir, processed_data_dir)
 
@@ -112,42 +187,58 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
 
         self._generate_mcot_examples(processed_data_dir)
         
-        # --- Start Cleanup ---
-        print("MCoT dataset construction complete. Starting cleanup of raw and intermediate files...")
+        # --- Start Conditional Cleanup ---
+        # Check if processing was successful before cleaning up
+        brush_samples_processed = getattr(self, 'brush_correction_samples', [])
+        brush_success = len([s for s in brush_samples_processed if s.get('image_id', '') != 'brush_processing_empty']) > 0
         
-        # 1. Delete Raw Data Directories
-        raw_data_paths_to_clean = [vg_raw_dir, richhf_raw_dir, seetrue_raw_dir, brush_raw_dir]
-        for raw_path in raw_data_paths_to_clean:
-            if raw_path.exists():
-                print(f"Cleaning up raw data directory: {raw_path}")
-                try:
-                    shutil.rmtree(raw_path)
-                    print(f"Successfully removed {raw_path}")
-                except Exception as e:
-                    print(f"Error removing {raw_path}: {e}. Please remove manually if needed.")
-            else:
-                print(f"Raw data directory not found (already cleaned or never created): {raw_path}")
+        # Only disable cleanup if BrushData processing failed (for debugging)
+        cleanup_enabled = brush_success  # Enable cleanup only if BrushData processing succeeded
+        
+        print(f"📊 Processing Summary:")
+        print(f"   BrushData samples processed: {len(brush_samples_processed)}")
+        print(f"   BrushData success: {brush_success}")
+        print(f"   Cleanup enabled: {cleanup_enabled}")
+        
+        if cleanup_enabled:
+            print("MCoT dataset construction complete. Starting cleanup of raw and intermediate files...")
+            
+            # 1. Delete Raw Data Directories
+            raw_data_paths_to_clean = [vg_raw_dir, richhf_raw_dir, seetrue_raw_dir, brush_raw_dir]
+            for raw_path in raw_data_paths_to_clean:
+                if raw_path.exists():
+                    print(f"Cleaning up raw data directory: {raw_path}")
+                    try:
+                        shutil.rmtree(raw_path)
+                        print(f"Successfully removed {raw_path}")
+                    except Exception as e:
+                        print(f"Error removing {raw_path}: {e}. Please remove manually if needed.")
+                else:
+                    print(f"Raw data directory not found (already cleaned or never created): {raw_path}")
 
-        # 2. Delete Intermediate Processed JSON Files
-        intermediate_json_files = [
-            processed_data_dir / "planning_data.json",
-            processed_data_dir / "acting_data.json",
-            processed_data_dir / "reflection_data.json",
-            processed_data_dir / "correction_data.json"
-        ]
-        for json_file in intermediate_json_files:
-            if json_file.exists():
-                print(f"Cleaning up intermediate file: {json_file}")
-                try:
-                    json_file.unlink()
-                    print(f"Successfully removed {json_file}")
-                except Exception as e:
-                    print(f"Error removing {json_file}: {e}. Please remove manually if needed.")
-            else:
-                print(f"Intermediate file not found (already cleaned or never created): {json_file}")
-        
-        print("Cleanup process finished.")
-        # --- End Cleanup ---
+            # 2. Delete Intermediate Processed JSON Files
+            intermediate_json_files = [
+                processed_data_dir / "planning_data.json",
+                processed_data_dir / "acting_data.json",
+                processed_data_dir / "reflection_data.json",
+                processed_data_dir / "correction_data.json"
+            ]
+            for json_file in intermediate_json_files:
+                if json_file.exists():
+                    print(f"Cleaning up intermediate file: {json_file}")
+                    try:
+                        json_file.unlink()
+                        print(f"Successfully removed {json_file}")
+                    except Exception as e:
+                        print(f"Error removing {json_file}: {e}. Please remove manually if needed.")
+                else:
+                    print(f"Intermediate file not found (already cleaned or never created): {json_file}")
+            
+            print("Cleanup process finished.")
+        else:
+            print("⚠️ Cleanup SKIPPED due to BrushData processing failures. Raw files preserved for debugging.")
+            print("MCoT dataset construction complete. Raw files preserved for debugging.")
+        # --- End Conditional Cleanup ---
 
         return [
             datasets.SplitGenerator(
@@ -161,46 +252,125 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         ]
 
     def _download_and_prepare_visual_genome(self, dl_manager, vg_raw_dir, urls):
+        """Download Visual Genome using direct wget - much more reliable than HuggingFace"""
         vg_raw_dir.mkdir(parents=True, exist_ok=True)
+        images_dir = vg_raw_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        
+        print("🎯 Downloading Visual Genome using direct wget (bypassing HuggingFace)...")
+        
+        # Download region descriptions (small file, usually works)
         try:
             annotations_zip_path = dl_manager.download_and_extract(urls["annotations_zip_url"])
             region_descriptions_json = Path(annotations_zip_path) / "region_descriptions.json"
             if region_descriptions_json.exists():
                 shutil.copy(region_descriptions_json, vg_raw_dir / "region_descriptions.json")
+                print("✅ Visual Genome region descriptions downloaded successfully")
             else:
                 (vg_raw_dir / "region_descriptions.json").write_text("[]")
                 print(f"Warning: region_descriptions.json not found in {annotations_zip_path}")
         except Exception as e_zip:
-            print(f"Error downloading/extracting Visual Genome annotations: {e_zip}")
+            print(f"Error downloading Visual Genome region descriptions: {e_zip}")
             (vg_raw_dir / "region_descriptions.json").write_text("[]")
 
+        # Download additional JSON files directly with wget
+        json_downloads = [
+            ("objects.json.zip", urls.get("objects_url")),
+            ("attributes.json.zip", urls.get("attributes_url")), 
+            ("relationships.json.zip", urls.get("relationships_url"))
+        ]
+        
+        for filename, url in json_downloads:
+            if url:
+                try:
+                    print(f"📦 Downloading {filename}...")
+                    downloaded_path = dl_manager.download_and_extract(url)
+                    json_filename = filename.replace('.zip', '')
+                    json_path = Path(downloaded_path) / json_filename
+                    if json_path.exists():
+                        shutil.copy(json_path, vg_raw_dir / json_filename)
+                        print(f"✅ {json_filename} downloaded successfully")
+                    else:
+                        print(f"⚠️ {json_filename} not found in download")
+                except Exception as e:
+                    print(f"⚠️ Failed to download {filename}: {e}")
 
-        try:
-            (vg_raw_dir / "hf_cache").mkdir(exist_ok=True, parents=True)
-            print(f"Visual Genome Hugging Face dataset will be loaded/cached into {vg_raw_dir / 'hf_cache'}")
-            dl_manager.download_config(urls["hf_dataset_name"], datasets.DownloadConfig(cache_dir=vg_raw_dir / "hf_cache"))
+        # Download images (these are large but more reliable with direct wget)
+        image_downloads = [
+            ("images.zip", urls.get("images_part1_url")),
+            ("images2.zip", urls.get("images_part2_url"))
+        ]
+        
+        for img_filename, img_url in image_downloads:
+            if img_url:
+                try:
+                    print(f"🖼️ Downloading Visual Genome {img_filename} (this may take a while)...")
+                    downloaded_img_path = dl_manager.download_and_extract(img_url)
+                    
+                    # Extract images to our images directory
+                    if Path(downloaded_img_path).is_dir():
+                        for img_file in Path(downloaded_img_path).glob("**/*.jpg"):
+                            shutil.copy(img_file, images_dir / img_file.name)
+                        print(f"✅ {img_filename} images extracted successfully")
+                    else:
+                        print(f"⚠️ {img_filename} extraction failed")
+                        
+                except Exception as e:
+                    print(f"⚠️ Failed to download {img_filename}: {e}")
+                    print("🔄 Continuing without images (will use metadata only)")
 
-        except Exception as e:
-            print(f"Could not prepare Visual Genome HF dataset cache via dl_manager: {e}")
-            (vg_raw_dir / "hf_dataset_load_failed.flag").touch()
+        # Create a simple success marker
+        (vg_raw_dir / "vg_direct_download_completed.flag").touch()
+        print("✅ Visual Genome direct download completed!")
 
 
     def _download_and_prepare_richhf18k(self, dl_manager, richhf_raw_dir, urls):
+        """Download RichHF-18K TFRecord files using direct wget"""
         richhf_raw_dir.mkdir(parents=True, exist_ok=True)
-        repo_target_path = richhf_raw_dir / "repo"
-        if not (repo_target_path / ".git").exists(): 
+        
+        print("🎯 Downloading RichHF-18K TFRecord files using direct wget...")
+        
+        tfrecord_urls = urls.get("tfrecord_urls", {})
+        
+        for split, url in tfrecord_urls.items():
+            filename = f"{split}.tfrecord"
+            target_path = richhf_raw_dir / filename
+            
+            if target_path.exists():
+                file_size = target_path.stat().st_size
+                if file_size > 1024:  # File is larger than 1KB
+                    print(f"✅ {filename} already exists ({file_size:,} bytes)")
+                    continue
+                else:
+                    print(f"⚠️ {filename} exists but is too small ({file_size} bytes). Re-downloading...")
+            
             try:
-                print(f"Cloning RichHF-18K repository to {repo_target_path}...")
-                subprocess.run(
-                    ["git", "clone", "--depth", "1", urls["github_url"], str(repo_target_path)],
-                    check=True, capture_output=True, text=True
+                print(f"📥 Downloading {filename} from {url}...")
+                result = subprocess.run(
+                    ["wget", "-O", str(target_path), url],
+                    check=True
                 )
-                print("RichHF-18K cloned successfully.")
+                
+                # Verify the downloaded file
+                if target_path.exists():
+                    file_size = target_path.stat().st_size
+                    if file_size > 1024:  # Verify it's not a placeholder
+                        print(f"✅ Successfully downloaded {filename} ({file_size:,} bytes)")
+                    else:
+                        print(f"⚠️ Downloaded {filename} but file seems too small ({file_size} bytes)")
+                else:
+                    print(f"❌ Failed to download {filename} - file not found after wget")
+                    
+            except subprocess.CalledProcessError as e:
+                print(f"❌ Failed to download {filename}: {e}")
+                print(f"   stderr: {e.stderr}")
+                # Create empty placeholder to prevent re-download attempts
+                target_path.touch()
             except Exception as e:
-                print(f"Failed to clone RichHF-18K: {e}")
-                repo_target_path.mkdir(exist_ok=True) 
-        else:
-            print(f"RichHF-18K repository already exists at {repo_target_path}.")
+                print(f"❌ Unexpected error downloading {filename}: {e}")
+                target_path.touch()
+        
+        print("✅ RichHF-18K TFRecord download process completed.")
 
 
     def _download_and_prepare_seetrue_feedback(self, dl_manager, seetrue_raw_dir, urls):
@@ -215,25 +385,77 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
 
 
     def _download_and_prepare_brush_data(self, dl_manager, brush_raw_dir, urls):
+        """Download BrushData using direct wget - limited to 20GB instead of 1.7TB"""
         brush_raw_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            (brush_raw_dir / "hf_cache").mkdir(exist_ok=True, parents=True)
-            print(f"BrushData Hugging Face dataset will be loaded/cached into {brush_raw_dir / 'hf_cache'}")
-            dl_manager.download_config(urls["hf_dataset_name"], datasets.DownloadConfig(cache_dir=brush_raw_dir / "hf_cache"))
-            print(f"BrushData cache directory prepared at {brush_raw_dir / 'hf_cache'}")
-        except Exception as e:
-            print(f"Could not prepare BrushData HF dataset cache via dl_manager: {e}")
-            (brush_raw_dir / "hf_dataset_load_failed.flag").touch()
+        tars_dir = brush_raw_dir / "tars"
+        tars_dir.mkdir(exist_ok=True)
+        
+        print("🎯 Downloading BrushData using direct wget (limited to 20GB)...")
+        
+        base_url = urls.get("base_tar_url", "")
+        tar_files = urls.get("tar_files", [])
+        
+        if not base_url or not tar_files:
+            print("⚠️ No direct URLs configured for BrushData, skipping direct download")
+            (brush_raw_dir / "brush_direct_download_failed.flag").touch()
+            return
+        
+        downloaded_files = []
+        total_size_gb = 0
+        MAX_SIZE_GB = 20
+        
+        for i, tar_filename in enumerate(tar_files):
+            if total_size_gb >= MAX_SIZE_GB:
+                print(f"🛑 Reached 20GB limit, stopping BrushData download")
+                break
+                
+            tar_url = base_url + tar_filename
+            tar_local_path = tars_dir / tar_filename
+            
+            if tar_local_path.exists():
+                file_size_gb = tar_local_path.stat().st_size / (1024**3)
+                print(f"📁 {tar_filename} already exists ({file_size_gb:.1f}GB)")
+                downloaded_files.append(tar_local_path)
+                total_size_gb += file_size_gb
+                continue
+            
+            try:
+                print(f"📦 Downloading BrushData {tar_filename} ({i+1}/{len(tar_files)})...")
+                downloaded_path = dl_manager.download_and_extract(tar_url)
+                
+                # Copy to our tars directory
+                if Path(downloaded_path).is_file():
+                    shutil.copy(downloaded_path, tar_local_path)
+                    file_size_gb = tar_local_path.stat().st_size / (1024**3)
+                    downloaded_files.append(tar_local_path)
+                    total_size_gb += file_size_gb
+                    print(f"✅ {tar_filename} downloaded ({file_size_gb:.1f}GB, total: {total_size_gb:.1f}GB)")
+                else:
+                    print(f"⚠️ {tar_filename} download failed")
+                    
+            except Exception as e:
+                print(f"⚠️ Failed to download {tar_filename}: {e}")
+                continue
+        
+        print(f"✅ BrushData direct download completed! Downloaded {len(downloaded_files)} TAR files ({total_size_gb:.1f}GB)")
+        (brush_raw_dir / "brush_direct_download_completed.flag").touch()
+        
+        # Save list of downloaded files for processing
+        with open(brush_raw_dir / "downloaded_tars.json", 'w') as f:
+            json.dump([str(p) for p in downloaded_files], f)
 
     def _process_visual_genome(self, vg_raw_dir, processed_data_dir):
+        """Process Visual Genome from direct downloads (no HuggingFace dependency)"""
         planning_samples = []
-        regions_json_path = vg_raw_dir / "region_descriptions.json"
         
+        # Load region descriptions
+        regions_json_path = vg_raw_dir / "region_descriptions.json"
         regions_data_by_image_id = defaultdict(list)
         if regions_json_path.exists() and regions_json_path.stat().st_size > 2: 
             try:
                 with open(regions_json_path, 'r') as f:
                     all_regions_data = json.load(f)
+                print(f"📊 Loaded {len(all_regions_data)} region descriptions from direct download")
                 for entry in all_regions_data: 
                     image_id_from_json = entry.get("id", entry.get("image_id"))
                     if image_id_from_json is not None:
@@ -242,74 +464,123 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             except json.JSONDecodeError as e:
                 print(f"Warning: Could not decode {regions_json_path}: {e}")
         
-        try:
-            print(f"Loading Visual Genome HF dataset from cache: {str(vg_raw_dir / 'hf_cache')}")
-            vg_hf_dataset = datasets.load_dataset(
-                _URLS["visual_genome"]["hf_dataset_name"],
-                split="train", 
-                cache_dir=str(vg_raw_dir / "hf_cache"),
-                trust_remote_code=True 
-            )
-            print(f"Successfully loaded Visual Genome HF dataset. Number of samples: {len(vg_hf_dataset)}")
-            for i, sample in enumerate(vg_hf_dataset):
-                image_id_hf = sample.get("image_id") 
-                if image_id_hf is None: 
-                    image_id_hf = sample.get("id") 
+        # Load objects data if available
+        objects_data_by_image_id = defaultdict(list)
+        objects_json_path = vg_raw_dir / "objects.json"
+        if objects_json_path.exists():
+            try:
+                with open(objects_json_path, 'r') as f:
+                    all_objects_data = json.load(f)
+                print(f"📊 Loaded {len(all_objects_data)} object descriptions from direct download")
+                for entry in all_objects_data:
+                    image_id = entry.get("image_id", entry.get("id"))
+                    if image_id is not None:
+                        objects_data_by_image_id[image_id] = entry.get("objects", [])
+            except Exception as e:
+                print(f"Warning: Could not load objects.json: {e}")
+        
+        # Load attributes data if available
+        attributes_data_by_image_id = defaultdict(list)
+        attributes_json_path = vg_raw_dir / "attributes.json"
+        if attributes_json_path.exists():
+            try:
+                with open(attributes_json_path, 'r') as f:
+                    all_attributes_data = json.load(f)
+                print(f"📊 Loaded {len(all_attributes_data)} attribute descriptions from direct download")
+                for entry in all_attributes_data:
+                    image_id = entry.get("image_id", entry.get("id"))
+                    if image_id is not None:
+                        attributes_data_by_image_id[image_id] = entry.get("attributes", [])
+            except Exception as e:
+                print(f"Warning: Could not load attributes.json: {e}")
+        
+        # Find available images
+        images_dir = vg_raw_dir / "images"
+        available_images = {}
+        if images_dir.exists():
+            for img_file in images_dir.glob("*.jpg"):
+                # Extract image ID from filename (Visual Genome uses format like "2407890.jpg")
+                img_id = img_file.stem
+                try:
+                    img_id_int = int(img_id)
+                    available_images[img_id_int] = img_file
+                except ValueError:
+                    continue
+            print(f"🖼️ Found {len(available_images)} images from direct download")
+        
+        # Process available data to create planning samples
+        print("🔄 Processing Visual Genome data for MINT planning step...")
+        
+        # Get all unique image IDs from all data sources
+        all_image_ids = set()
+        all_image_ids.update(regions_data_by_image_id.keys())
+        all_image_ids.update(objects_data_by_image_id.keys())
+        all_image_ids.update(attributes_data_by_image_id.keys())
+        all_image_ids.update(available_images.keys())
+        
+        # Limit processing to reasonable number for performance
+        MAX_SAMPLES = 5000  
+        processed_count = 0
+        
+        for image_id in list(all_image_ids)[:MAX_SAMPLES]:
+            if processed_count >= MAX_SAMPLES:
+                break
                 
-                if image_id_hf is None:
-                    image_id_str = f"vg_hf_no_id_{i}"
-                else:
-                    image_id_str = str(image_id_hf)
-
-                image = sample.get("image") 
-                
-                planning_text = "Planning: Comprehensive scene analysis with structured tables. "
-                
-                final_regions_to_process = regions_data_by_image_id.get(image_id_hf, sample.get("regions", []))
-
-                if final_regions_to_process:
-                    region_descriptions = []
-                    for region in final_regions_to_process[:5]:
-                        phrase = region.get("phrase", "")
-                        x = region.get("x", 0); y = region.get("y", 0)
-                        width = region.get("width", 0); height = region.get("height", 0)
-                        if phrase:
-                            region_descriptions.append(f"{phrase} (x:{x}, y:{y}, w:{width}, h:{height})")
-                    if region_descriptions:
-                        planning_text += f"Structured regions: {'; '.join(region_descriptions)}. "
-
-                hf_objects = sample.get("objects", [])
-                if hf_objects:
-                    object_info = []
-                    for obj_entry in hf_objects[:5]: 
-                        obj_name = obj_entry.get("names", ["unknown"])[0] if obj_entry.get("names") else "object"
-                        obj_attrs = obj_entry.get("attributes", [])
-                        object_info.append(f"{obj_name} ({', '.join(obj_attrs[:2])})" if obj_attrs else obj_name)
+            image_id_str = str(image_id)
+            planning_text = "Planning: Comprehensive scene analysis with structured tables. "
+            
+            # Add region information
+            regions = regions_data_by_image_id.get(image_id, [])
+            if regions:
+                region_descriptions = []
+                for region in regions[:5]:  # Limit to first 5 regions
+                    phrase = region.get("phrase", "")
+                    x = region.get("x", 0); y = region.get("y", 0)
+                    width = region.get("width", 0); height = region.get("height", 0)
+                    if phrase:
+                        region_descriptions.append(f"{phrase} (x:{x}, y:{y}, w:{width}, h:{height})")
+                if region_descriptions:
+                    planning_text += f"Structured regions: {'; '.join(region_descriptions)}. "
+            
+            # Add object information
+            objects = objects_data_by_image_id.get(image_id, [])
+            if objects:
+                object_info = []
+                for obj_entry in objects[:5]:  # Limit to first 5 objects
+                    obj_name = obj_entry.get("names", ["unknown"])[0] if obj_entry.get("names") else "object"
+                    obj_attrs = attributes_data_by_image_id.get(image_id, [])
+                    if obj_attrs:
+                        # Find attributes for this object
+                        relevant_attrs = [attr.get("attribute", "") for attr in obj_attrs[:2]]
+                        object_info.append(f"{obj_name} ({', '.join(relevant_attrs)})" if relevant_attrs else obj_name)
+                    else:
+                        object_info.append(obj_name)
+                if object_info:
                     planning_text += f"Structured objects: {', '.join(object_info)}. "
-                
-                planning_text += "Visual Genome structured table processing complete."
-                planning_samples.append({
-                    "image_id": image_id_str,
-                    "planning": planning_text,
-                    "image": image 
-                })
-        except Exception as e:
-            print(f"Error processing Visual Genome HF dataset: {e}. Using only JSON-based regions if available.")
-            if not planning_samples: 
-                for img_id_json, regions_list_json in regions_data_by_image_id.items():
-                    planning_text_json = "Planning: Scene analysis from region descriptions. "
-                    region_descs_json = []
-                    for region in regions_list_json[:5]:
-                        phrase = region.get("phrase", ""); x = region.get("x",0); y = region.get("y",0); width = region.get("width",0); height = region.get("height",0)
-                        if phrase: region_descs_json.append(f"{phrase} (x:{x}, y:{y}, w:{width}, h:{height})")
-                    if region_descs_json: planning_text_json += f"Structured regions: {'; '.join(region_descs_json)}. "
-                    planning_samples.append({"image_id": str(img_id_json), "planning": planning_text_json, "image": None})
-
-            if not planning_samples: 
-                 planning_samples.append({
-                    "image_id": "vg_fallback_empty", "planning": "Planning data unavailable.", "image": None
-                })
-
+            
+            planning_text += "Visual Genome structured table processing complete."
+            
+            # Load image if available
+            image_pil = None
+            if image_id in available_images:
+                try:
+                    image_pil = Image.open(available_images[image_id]).convert("RGB")
+                except Exception as e:
+                    print(f"Warning: Could not load image {image_id}: {e}")
+            
+            planning_samples.append({
+                "image_id": image_id_str,
+                "planning": planning_text,
+                "image": image_pil
+            })
+            
+            processed_count += 1
+            if processed_count % 500 == 0:
+                print(f"📈 Processed {processed_count} Visual Genome samples...")
+        
+        print(f"✅ Processed {len(planning_samples)} Visual Genome planning samples")
+        
+        # Save processed data
         with open(processed_data_dir / "planning_data.json", 'w') as f:
             serializable_samples = []
             for ps in planning_samples:
@@ -317,7 +588,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 if isinstance(s_ps.get("image"), Image.Image):
                     s_ps["image_mode"] = s_ps["image"].mode
                     s_ps["image_size"] = s_ps["image"].size
-                    s_ps.pop("image") 
+                    s_ps.pop("image")  # Remove PIL image for JSON serialization
                 serializable_samples.append(s_ps)
             json.dump(serializable_samples, f)
         
@@ -326,67 +597,196 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
 
     def _process_richhf18k(self, richhf_raw_dir, processed_data_dir):
         acting_samples = []
-        repo_dir = richhf_raw_dir / "repo"
-        tfrecord_files = list(repo_dir.glob("**/*.tfrecord")) + list(repo_dir.glob("**/*.tfr"))
-
-        if tf is not None and tfrecord_files:
-            for tfrecord_file in tfrecord_files:
-                try:
-                    dataset = tf.data.TFRecordDataset(str(tfrecord_file))
-                    for i, raw_record in enumerate(dataset):
-                        example = tf.train.Example()
-                        example.ParseFromString(raw_record.numpy())
-                        features = example.features.feature
-                        prompt = self._get_string_feature(features, 'prompt')
-                        feedback_score = self._get_float_feature(features, 'feedback_score')
-                        feedback_text = self._get_string_feature(features, 'feedback_text')
-                        quality_score = self._get_float_feature(features, 'quality_score')
-                        aspect_scores = self._get_float_list_feature(features, 'aspect_scores')
+        
+        # MINT paper: "Acting: Generate the image based on the planning outputs"
+        # RichHF-18K provides human feedback on image generation quality
+        
+        # Look for TFRecord files downloaded directly via wget
+        try:
+            # Process directly downloaded TFRecord files
+            MAX_SAMPLES_PER_FILE = 1000  # Increased from 100 for more complete dataset
+            
+            # Look for TFRecord files in the direct download location
+            tfrecord_files = list(richhf_raw_dir.glob("*.tfrecord"))
+            
+            print(f"Found {len(tfrecord_files)} TFRecord files in RichHF-18K directory")
+            
+            # Process TFRecord files (preferred format)
+            if tf is not None and tfrecord_files:
+                print(f"🔄 Processing {len(tfrecord_files)} TFRecord files...")
+                for tfrecord_file in tfrecord_files:
+                    print(f"📂 Processing TFRecord: {tfrecord_file}")
+                    
+                    # Check if file is a valid TFRecord
+                    file_size = tfrecord_file.stat().st_size
+                    if file_size < 1000:  # Likely too small to be valid
+                        print(f"⚠️ {tfrecord_file.name} appears to be too small (size: {file_size} bytes)")
+                        print("   This may indicate a download failure.")
+                        continue
                         
-                        acting_text = "Acting: TensorFlow Example format processing from RichHF-18K. "
-                        acting_text += f"Prompt: {prompt} "
-                        if feedback_text: acting_text += f"Human feedback: {feedback_text} "
-                        if feedback_score > 0: acting_text += f"Feedback score: {feedback_score:.3f} "
-                        if quality_score > 0: acting_text += f"Quality rating: {quality_score:.3f} "
-                        if aspect_scores:
-                            aspects = ['composition', 'color', 'lighting', 'detail', 'coherence']
-                            aspect_info = [f"{aspects[j]}:{score:.2f}" for j, score in enumerate(aspect_scores[:5]) if j < len(aspects)]
-                            if aspect_info: acting_text += f"Aspect scores: {', '.join(aspect_info)} "
-                        acting_text += "TFRecord native format processing complete."
-                        acting_samples.append({
-                            "image_id": f"richhf_{tfrecord_file.stem}_{i}", "acting": acting_text,
-                            "prompt": prompt, "feedback_score": feedback_score, "quality_score": quality_score
-                        })
-                except Exception as e:
-                    print(f"Error processing TFRecord file {tfrecord_file}: {e}")
+                    try:
+                        dataset = tf.data.TFRecordDataset(str(tfrecord_file))
+                        processed_count = 0
+                        
+                        for i, raw_record in enumerate(dataset.take(MAX_SAMPLES_PER_FILE)):
+                            try:
+                                example = tf.train.Example()
+                                example.ParseFromString(raw_record.numpy())
+                                features = example.features.feature
+                                
+                                # Extract TFRecord data
+                                prompt = self._get_string_feature(features, 'prompt')
+                                feedback_text = self._get_string_feature(features, 'feedback_text')
+                                feedback_score = self._get_float_feature(features, 'feedback_score')
+                                quality_score = self._get_float_feature(features, 'quality_score')
+                                aspect_scores = self._get_float_list_feature(features, 'aspect_scores')
+                                
+                                if prompt:
+                                    acting_sample = self._process_richhf_sample({
+                                        "prompt": prompt,
+                                        "feedback": feedback_text,
+                                        "feedback_score": feedback_score,
+                                        "quality_score": quality_score,
+                                        "aspect_scores": aspect_scores
+                                    }, f"richhf_{tfrecord_file.stem}_{i}")
+                                    if acting_sample:
+                                        acting_samples.append(acting_sample)
+                                        processed_count += 1
+                                        
+                            except Exception as parse_error:
+                                if i < 5:  # Only show first few parse errors to avoid spam
+                                    print(f"⚠️ Parse error in record {i}: {parse_error}")
+                                continue
+                                
+                        print(f"✅ Processed {processed_count} samples from {tfrecord_file.name}")
+                        
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "corrupted record" in error_msg.lower() or "invalid argument" in error_msg.lower():
+                            print(f"❌ {tfrecord_file.name} is corrupted or invalid (likely download failure)")
+                            print("   The file was successfully downloaded but may be incomplete.")
+                        else:
+                            print(f"❌ Error processing TFRecord file {tfrecord_file}: {e}")
+                        continue
+            
+            # Also check for legacy repo directory structure (from previous approach)
+            repo_dir = richhf_raw_dir / "repo"
+            if repo_dir.exists() and not tfrecord_files:
+                print("📁 Found legacy Git repository structure, checking for data files...")
+                MAX_TOTAL_FILES = 50  # Limit total files processed to keep dataset manageable
+                
+                jsonl_files = list(repo_dir.glob("**/*.jsonl"))[:MAX_TOTAL_FILES]
+                json_files = list(repo_dir.glob("**/*.json"))[:MAX_TOTAL_FILES]
+                legacy_tfrecord_files = list(repo_dir.glob("**/*.tfrecord"))[:MAX_TOTAL_FILES] + list(repo_dir.glob("**/*.tfr"))[:MAX_TOTAL_FILES]
+                
+                # Process legacy TFRecord files if they exist and are valid
+                for tfrecord_file in legacy_tfrecord_files:
+                    file_size = tfrecord_file.stat().st_size
+                    if file_size < 1000:  # Skip small files
+                        continue
+                    tfrecord_files.append(tfrecord_file)
+                
+                # Process JSONL files as fallback
+                for jsonl_file in jsonl_files:
+                    try:
+                        with open(jsonl_file, 'r', encoding='utf-8') as f:
+                            for line_idx, line in enumerate(f):
+                                if line_idx >= MAX_SAMPLES_PER_FILE:  # Use configurable limit
+                                    break
+                                try:
+                                    data = json.loads(line.strip())
+                                    acting_sample = self._process_richhf_sample(data, f"richhf_{jsonl_file.stem}_{line_idx}")
+                                    if acting_sample:
+                                        acting_samples.append(acting_sample)
+                                except json.JSONDecodeError:
+                                    continue
+                    except Exception as e:
+                        print(f"Error processing JSONL file {jsonl_file}: {e}")
+                        continue
+                
+                # Process JSON files as additional fallback
+                for json_file in json_files:
+                    try:
+                        with open(json_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            if isinstance(data, list):
+                                for idx, item in enumerate(data[:MAX_SAMPLES_PER_FILE]):  # Use configurable limit
+                                    acting_sample = self._process_richhf_sample(item, f"richhf_{json_file.stem}_{idx}")
+                                    if acting_sample:
+                                        acting_samples.append(acting_sample)
+                            else:
+                                acting_sample = self._process_richhf_sample(data, f"richhf_{json_file.stem}")
+                                if acting_sample:
+                                    acting_samples.append(acting_sample)
+                    except Exception as e:
+                        print(f"Error processing JSON file {json_file}: {e}")
+                        continue
+                        
+        except Exception as e:
+            print(f"Error processing RichHF-18K data: {e}")
         
-        if not acting_samples and repo_dir.exists(): 
-            json_files = list(repo_dir.glob("**/*.json")) 
-            for data_file in json_files:
-                try:
-                    with open(data_file, 'r') as f: data = json.load(f)
-                    if isinstance(data, list):
-                        for i, item in enumerate(data[:20]): 
-                            if "prompt" in item and ("feedback" in item or "score" in item):
-                                acting_text = "Acting: GitHub JSON format processing from RichHF-18K. "
-                                acting_text += f"Prompt: {item.get('prompt', '')} "
-                                feedback = item.get("feedback", ""); score = item.get("score", 0.0)
-                                if feedback: acting_text += f"Feedback: {feedback} "
-                                if score > 0: acting_text += f"Quality score: {score} "
-                                acting_text += "GitHub repository format processing complete."
-                                acting_samples.append({
-                                    "image_id": f"richhf_github_{data_file.stem}_{i}",
-                                    "acting": acting_text, "prompt": item.get("prompt", "")
-                                })
-                except Exception as e:
-                    print(f"Error processing RichHF GitHub JSON file {data_file}: {e}")
-        
-        if not acting_samples:
-            acting_samples.append({"image_id": "richhf_fallback_empty", "acting": "Acting data unavailable.", "prompt": ""})
+        print(f"✅ Successfully processed {len(acting_samples)} RichHF-18K acting samples")
 
         with open(processed_data_dir / "acting_data.json", 'w') as f:
             json.dump(acting_samples, f)
         self.richhf_acting_samples = acting_samples
+
+    def _process_richhf_sample(self, data, image_id):
+        """Process individual RichHF-18K sample following MINT acting methodology"""
+        prompt = data.get("prompt", data.get("text", data.get("caption", "")))
+        
+        # Extract feedback information for acting step
+        feedback = data.get("feedback", data.get("human_feedback", ""))
+        quality_score = data.get("quality_score", data.get("quality", data.get("score", data.get("rating", 0.5))))
+        feedback_score = data.get("feedback_score", 0.0)
+        aspect_scores = data.get("aspect_scores", [])
+        
+        if not prompt:
+            return None
+            
+        # Generate acting text following MINT paper specifications
+        acting_text = "Acting: Generate the image based on the planning outputs. "
+        acting_text += f"Prompt execution: '{prompt}' "
+        
+        if feedback:
+            feedback_clean = feedback[:200] if len(feedback) > 200 else feedback
+            acting_text += f"Human feedback integration: {feedback_clean} "
+            
+        if quality_score and quality_score > 0:
+            quality_assessment = "excellent" if quality_score > 0.8 else "good" if quality_score > 0.6 else "moderate"
+            acting_text += f"Quality target: {quality_assessment} generation (score: {quality_score:.2f}). "
+        
+        if feedback_score > 0:
+            acting_text += f"Feedback confidence: {feedback_score:.3f}. "
+            
+        if aspect_scores:
+            aspects = ['composition', 'color', 'lighting', 'detail', 'coherence']
+            aspect_info = [f"{aspects[j]}:{score:.2f}" for j, score in enumerate(aspect_scores[:5]) if j < len(aspects)]
+            if aspect_info:
+                acting_text += f"Aspect evaluation: {', '.join(aspect_info)}. "
+        
+        acting_text += "Following spatial relationships and object placements from planning step. "
+        acting_text += "Coherent visual representation with attention to interwoven conditions."
+        
+        return {
+            "image_id": str(image_id),
+            "prompt": prompt,
+            "acting": acting_text,
+            "quality_score": quality_score,
+            "feedback": feedback,
+            "feedback_score": feedback_score,
+            "aspect_scores": aspect_scores
+        }
+    
+    def _generate_mint_acting_text(self, prompt):
+        """Generate acting text following MINT paper methodology"""
+        acting_text = "Acting: Generate the image based on the planning outputs. "
+        acting_text += f"Use the caption and layout information to create a coherent visual representation. "
+        acting_text += f"Prompt guidance: '{prompt}' "
+        acting_text += "Follow the spatial relationships and object placements from the planning step. "
+        acting_text += "Execute with attention to fine-grained alignment and interwoven conditions. "
+        acting_text += "Maintain consistency with dense caption and bounding box specifications."
+        return acting_text
 
     def _get_string_feature(self, features, key):
         return features[key].bytes_list.value[0].decode('utf-8') if key in features and features[key].bytes_list.value else ""
@@ -400,9 +800,10 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
     def _process_seetrue_feedback(self, seetrue_raw_dir, processed_data_dir):
         reflection_samples = []
         try:
+            print(f"Loading SeeTRUE-Feedback HF dataset")
             seetrue_hf_dataset = datasets.load_dataset(
                 _URLS["seetrue_feedback"]["hf_dataset_name"],
-                split="train", 
+                split="test",  # Use 'test' split instead of 'train'
                 cache_dir=str(seetrue_raw_dir / "hf_cache"),
                 trust_remote_code=True
             )
@@ -431,58 +832,154 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 })
         except Exception as e:
             print(f"Error processing SeeTRUE-Feedback HF dataset: {e}")
-            reflection_samples.append({"image_id": "seetrue_fallback_empty", "reflection": "Reflection data unavailable."})
         
         with open(processed_data_dir / "reflection_data.json", 'w') as f:
             json.dump(reflection_samples, f)
         self.seetrue_reflection_samples = reflection_samples
 
     def _process_brush_data(self, brush_raw_dir, processed_data_dir):
+        """Process BrushData from direct wget downloads (limited to 20GB)"""
         global wds 
         correction_samples = []
         
-        TARGET_BRUSH_DATA_SIZE_GB = 100.0 
-        APPROX_TAR_SIZE_GB = 3.0 
-        NUM_TARS_TO_PROCESS = math.ceil(TARGET_BRUSH_DATA_SIZE_GB / APPROX_TAR_SIZE_GB)
-
-        brush_cache_dir = brush_raw_dir / "hf_cache"
-        print(f"Ensuring BrushData is downloaded/cached at: {brush_cache_dir}")
-
-        try:
-            datasets.load_dataset(
-                _URLS["brush_data"]["hf_dataset_name"],
-                split="train", 
-                cache_dir=str(brush_cache_dir),
-                trust_remote_code=True,
-                streaming=True 
-            ).prepare_split("train") 
-            print("BrushData download/caching check complete via load_dataset.")
-        except Exception as e_load:
-            print(f"Error during initial load_dataset for BrushData (used for download trigger): {e_load}")
-            print("This might also indicate the dataset is not streamable or some other issue.")
+        print("🔄 Processing BrushData from direct wget downloads...")
         
-        all_tar_files = sorted(list(brush_cache_dir.glob("**/*.tar"))) 
+        # Check if we have direct downloads
+        downloaded_tars_file = brush_raw_dir / "downloaded_tars.json"
+        tars_dir = brush_raw_dir / "tars"
         
-        if not all_tar_files:
-            print(f"No .tar files found for BrushData in {brush_cache_dir} after attempting load_dataset.")
-            correction_samples.append({"image_id": "brush_tars_not_found", "correction": "Correction data unavailable, TAR files not located in cache."})
-        elif wds is None:
-            print("Webdataset library (wds) not available. Cannot process BrushData TAR files. Skipping.")
-            correction_samples.append({"image_id": "brush_wds_missing", "correction": "Correction data unavailable, webdataset library missing."})
+        if downloaded_tars_file.exists():
+            try:
+                with open(downloaded_tars_file, 'r') as f:
+                    tar_file_paths = [Path(p) for p in json.load(f)]
+                print(f"📂 Found {len(tar_file_paths)} downloaded TAR files for BrushData")
+            except Exception as e:
+                print(f"⚠️ Could not read downloaded TAR files list: {e}")
+                tar_file_paths = []
         else:
-            print(f"Found {len(all_tar_files)} .tar files for BrushData. Processing up to the first {NUM_TARS_TO_PROCESS} files.")
-            
+            # Fallback: look for TAR files in directory
+            tar_file_paths = list(tars_dir.glob("*.tar")) if tars_dir.exists() else []
+            print(f"📂 Found {len(tar_file_paths)} TAR files in {tars_dir}")
+        
+        if not tar_file_paths:
+            print("⚠️ No BrushData TAR files found")
+            correction_samples.append({
+                "image_id": "brush_no_tars", 
+                "correction": "No BrushData TAR files available."
+            })
+        elif wds is None:
+            print("❌ Webdataset library not available. Cannot process BrushData TAR files.")
+            correction_samples.append({
+                "image_id": "brush_wds_missing", 
+                "correction": "Correction data unavailable, webdataset library missing."
+            })
+        else:
             processed_sample_count = 0
-            tar_files_to_process = all_tar_files[:NUM_TARS_TO_PROCESS]
-
-            for i, tar_file_path in enumerate(tar_files_to_process):
-                print(f"Processing BrushData TAR file ({i+1}/{len(tar_files_to_process)}): {tar_file_path}")
+            MAX_SAMPLES = 2000  # Process more samples since we limited download size
+            
+            for i, tar_file_path in enumerate(tar_file_paths):
+                if processed_sample_count >= MAX_SAMPLES:
+                    print(f"🛑 Reached {MAX_SAMPLES} sample limit, stopping processing")
+                    break
+                    
+                print(f"🔄 Processing BrushData TAR file ({i+1}/{len(tar_file_paths)}): {tar_file_path.name}")
                 try:
-                    dataset_shard = wds.WebDataset(str(tar_file_path)).decode("pil").rename(image="jpg;png;jpeg", mask="mask.png;mask.jpg;mask.jpeg", caption="txt;json")
+                    # BrushData TAR files already contain processed data with 'image', 'caption', etc. keys
+                    # Don't use .decode() or .rename() as the data is already structured
+                    dataset_shard = wds.WebDataset(str(tar_file_path))
                     
                     for sample_idx, sample in enumerate(dataset_shard):
-                        image_pil = sample.get("image")
-                        mask_pil = sample.get("mask")
+                        if processed_sample_count >= MAX_SAMPLES:
+                            break
+                        
+                        # Debug: Print comprehensive sample structure for first few samples
+                        if sample_idx < 3:  # Debug first 3 samples from first TAR file
+                            print(f"🔍 DEBUG Sample {sample_idx} structure:")
+                            print(f"   Available keys: {list(sample.keys())}")
+                            for key, value in sample.items():
+                                if isinstance(value, bytes):
+                                    # Try to decode bytes to understand content
+                                    try:
+                                        decoded_str = value.decode('utf-8')
+                                        print(f"   {key}: bytes→string ('{decoded_str[:100]}...' if len > 100)")
+                                    except:
+                                        print(f"   {key}: bytes (length: {len(value)}, non-text)")
+                                elif isinstance(value, str):
+                                    print(f"   {key}: string ('{value[:100]}...' if len > 100)")
+                                elif hasattr(value, 'shape'):  # numpy array or tensor
+                                    print(f"   {key}: array/tensor (shape: {value.shape}, dtype: {getattr(value, 'dtype', 'unknown')})")
+                                elif hasattr(value, 'mode'):  # PIL Image
+                                    print(f"   {key}: PIL Image (mode: {value.mode}, size: {value.size})")
+                                else:
+                                    print(f"   {key}: {type(value)} - {str(value)[:100]}...")
+                        
+                        # Handle image data - it might be raw bytes that need to be converted to PIL
+                        image_pil = None
+                        mask_pil = None
+                        
+                        if "image" in sample:
+                            image_data = sample["image"]
+                            if isinstance(image_data, bytes):
+                                try:
+                                    from io import BytesIO
+                                    image_pil = Image.open(BytesIO(image_data))
+                                except Exception as e:
+                                    print(f"⚠️ Could not decode image data: {e}")
+                                    continue
+                            elif hasattr(image_data, 'mode'):  # Already a PIL image
+                                image_pil = image_data
+                        
+                        # Handle mask/segmentation data - BrushData uses RLE JSON format
+                        mask_pil = None
+                        segmentation_data = None
+                        if "segmentation" in sample:
+                            mask_data = sample["segmentation"]
+                            if isinstance(mask_data, bytes):
+                                try:
+                                    # First try: decode as JSON (RLE format)
+                                    seg_text = mask_data.decode('utf-8')
+                                    segmentation_data = json.loads(seg_text)
+                                    
+                                    if sample_idx < 3:  # Debug output
+                                        print(f"   segmentation: RLE JSON with {len(segmentation_data.get('mask', []))} masks")
+                                    
+                                    # Successfully parsed RLE data - we'll use this for mask generation
+                                    # For now, mark as having segmentation data (we could convert RLE to PIL later if needed)
+                                    has_segmentation_data = True
+                                    
+                                except json.JSONDecodeError:
+                                    try:
+                                        # Second try: direct image decoding (fallback)
+                                        from io import BytesIO
+                                        mask_pil = Image.open(BytesIO(mask_data))
+                                        has_segmentation_data = True
+                                        if sample_idx < 3:
+                                            print(f"   segmentation: decoded as PIL image")
+                                    except Exception as e:
+                                        if sample_idx < 3:
+                                            print(f"   segmentation: failed to decode - {e}")
+                                        has_segmentation_data = False
+                                except Exception as e:
+                                    if sample_idx < 3:
+                                        print(f"   segmentation: failed to parse as JSON - {e}")
+                                    has_segmentation_data = False
+                            elif hasattr(mask_data, 'mode'):  # Already a PIL image
+                                mask_pil = mask_data
+                                has_segmentation_data = True
+                            elif isinstance(mask_data, dict):  # Already parsed JSON
+                                segmentation_data = mask_data
+                                has_segmentation_data = True
+                                if sample_idx < 3:
+                                    print(f"   segmentation: pre-parsed RLE JSON with {len(mask_data.get('mask', []))} masks")
+                            else:
+                                has_segmentation_data = False
+                        
+                        if image_pil is None:
+                            continue  # Skip samples without valid images
+                        
+                        # Use either PIL mask or RLE segmentation data to determine if we have mask info
+                        has_actual_mask = mask_pil is not None or segmentation_data is not None
+                        
                         caption_text = ""
                         task_type_content = "inpainting" 
 
@@ -494,7 +991,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                                 caption_text = cap_data.get("caption", cap_data.get("text",""))
                                 task_type_content = cap_data.get("task_type", task_type_content)
                         
-                        has_actual_mask = mask_pil is not None
+                        has_actual_mask = mask_pil is not None or segmentation_data is not None
                         image_id_str = f"brush_{tar_file_path.stem}_{sample.get('__key__', sample_idx)}"
 
                         correction_text_gen = self._generate_mint_correction_text(
@@ -507,21 +1004,30 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                             "correction": correction_text_gen,
                             "has_mask": has_actual_mask,
                             "task_type": task_type_content,
-                            "caption": caption_text
+                            "caption": caption_text,
+                            "segmentation_rle": segmentation_data,  # Store RLE data for potential future use
+                            "mask_pil": mask_pil  # Store PIL mask if available
                         })
                         processed_sample_count += 1
+                        
+                        if processed_sample_count % 100 == 0:
+                            print(f"📈 Processed {processed_sample_count} BrushData samples...")
+                            
                 except Exception as e_tar:
-                    print(f"Error processing TAR file {tar_file_path}: {e_tar}")
+                    print(f"⚠️ Error processing TAR file {tar_file_path}: {e_tar}")
                     continue 
-            print(f"Processed {processed_sample_count} samples from {len(tar_files_to_process)} BrushData TAR files.")
+                    
+            print(f"✅ Processed {processed_sample_count} samples from {len(tar_file_paths)} BrushData TAR files")
 
         if not correction_samples:
-            correction_samples.append({"image_id": "brush_processing_empty", "correction": "No correction data processed."})
+            correction_samples.append({
+                "image_id": "brush_processing_empty", 
+                "correction": "No correction data processed."
+            })
 
         with open(processed_data_dir / "correction_data.json", 'w') as f:
             json.dump(correction_samples, f)
         self.brush_correction_samples = correction_samples
-
 
     def _generate_mint_correction_text(self, has_mask=True, task_type="inpainting", caption="", mask_coverage=0.0):
         if not has_mask and mask_coverage == 0.0 and Image is not None and ImageDraw is not None :
@@ -644,22 +1150,30 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 for ps_json in planning_samples_json:
                     ps_json["image"] = None 
                     planning_samples.append(ps_json)
-            except FileNotFoundError: planning_samples = [{"image_id": "dummy_planning", "planning": "No planning data.", "image": None, "image_mode": "RGB", "image_size": [512,512]}]
+            except FileNotFoundError: 
+                print("Warning: planning_data.json not found")
+                planning_samples = []
         
         if not acting_samples:
             try:
                 with open(processed_data_dir / "acting_data.json", 'r') as f: acting_samples = json.load(f)
-            except FileNotFoundError: acting_samples = [{"image_id": "dummy_acting", "acting": "No acting data."}]
+            except FileNotFoundError: 
+                print("Warning: acting_data.json not found")
+                acting_samples = []
         
         if not reflection_samples:
             try:
                 with open(processed_data_dir / "reflection_data.json", 'r') as f: reflection_samples = json.load(f)
-            except FileNotFoundError: reflection_samples = [{"image_id": "dummy_reflection", "reflection": "No reflection data."}]
+            except FileNotFoundError: 
+                print("Warning: reflection_data.json not found")
+                reflection_samples = []
 
         if not correction_samples:
             try:
                 with open(processed_data_dir / "correction_data.json", 'r') as f: correction_samples = json.load(f)
-            except FileNotFoundError: correction_samples = [{"image_id": "dummy_correction", "correction": "No correction data."}]
+            except FileNotFoundError: 
+                print("Warning: correction_data.json not found")
+                correction_samples = []
 
         mcot_examples = []
         num_planning = len(planning_samples)
@@ -789,17 +1303,113 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # Create dataset instance and download/process data
-    dataset_builder = MCoTWgetDataset()
-    
     print("Starting MCoT dataset download and processing...")
     print(f"Output directory: {args.output_dir}")
     print(f"Cache directory: {args.cache_dir}")
     
-    # Build the dataset
-    dataset_builder.download_and_prepare(
-        download_dir=args.cache_dir,
-        output_dir=args.output_dir
-    )
+    # Process data directly without using HuggingFace datasets builder framework
+    try:
+        # Create directory structure
+        output_path = Path(args.output_dir)
+        cache_path = Path(args.cache_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create a simple download manager-like object
+        class SimpleDownloadManager:
+            def __init__(self, cache_dir):
+                self.cache_dir = cache_dir
+                self.manual_dir = cache_dir
+                
+            def download_and_extract(self, url):
+                """Robust download and extract implementation using wget"""
+                import subprocess
+                import zipfile
+                filename = url.split('/')[-1]
+                local_path = Path(self.cache_dir) / filename
+                
+                if not local_path.exists():
+                    print(f"Downloading {url} using wget...")
+                    try:
+                        # Use wget with robust options:
+                        # -c: continue partial downloads
+                        # --timeout=0: no connection timeout (wait indefinitely)
+                        # --tries=3: retry up to 3 times
+                        # --progress=bar: show progress bar
+                        wget_cmd = [
+                            'wget',
+                            '-c',                    # Continue partial downloads
+                            '--timeout=0',           # No connection timeout (wait indefinitely)
+                            '--tries=3',             # Reasonable number of retries
+                            '--wait=5',              # Wait 5 seconds between retries
+                            '--progress=bar:force',  # Force progress bar display
+                            '--show-progress',       # Show download progress
+                            '--user-agent=Mozilla/5.0 (compatible; Research Bot)', # Add user agent
+                            '-O', str(local_path),   # Output to specific file
+                            url
+                        ]
+                        
+                        print(f"Running: {' '.join(wget_cmd)}")
+                        result = subprocess.run(
+                            wget_cmd, 
+                            check=True, 
+                            capture_output=False,  # Show wget output directly
+                            text=True,
+                            timeout=None  # No subprocess timeout - allow downloads to complete
+                        )
+                        print(f"✅ Download completed: {local_path}")
+                        
+                    except subprocess.CalledProcessError as e:
+                        print(f"❌ wget failed with exit code {e.returncode}: {url}")
+                        if local_path.exists():
+                            local_path.unlink()  # Remove partial/corrupted file
+                        raise
+                    except FileNotFoundError:
+                        print("❌ wget not found. Please install wget or use alternative download method.")
+                        raise
+                else:
+                    print(f"📁 File already exists: {local_path}")
+                
+                # Extract if it's a zip file
+                if filename.endswith('.zip'):
+                    extract_dir = local_path.parent / filename.replace('.zip', '')
+                    if not extract_dir.exists():
+                        print(f"📦 Extracting {local_path}...")
+                        try:
+                            with zipfile.ZipFile(local_path, 'r') as zip_ref:
+                                zip_ref.extractall(extract_dir)
+                            print(f"✅ Extraction completed: {extract_dir}")
+                        except zipfile.BadZipFile:
+                            print(f"❌ Corrupted zip file: {local_path}")
+                            local_path.unlink()  # Remove corrupted file
+                            raise
+                    else:
+                        print(f"📁 Already extracted: {extract_dir}")
+                    return str(extract_dir)
+                    
+                return str(local_path)
+                
+            def download_config(self, *args, **kwargs):
+                """Placeholder for download_config - not needed for our direct processing"""
+                pass
+        
+        # Create dataset builder and process data
+        dataset_builder = MCoTWgetDataset()
+        dl_manager = SimpleDownloadManager(str(cache_path))
+        
+        # Call the split generators directly to process the data
+        print("Processing MCoT dataset components...")
+        split_generators = dataset_builder._split_generators(dl_manager)
+        
+        print("Dataset processing completed successfully!")
+        print(f"Processed data saved to: {cache_path}")
+        print("You can now use the MCoT PyTorch dataset classes to load this data for training.")
+        
+    except Exception as e:
+        print(f"Error during dataset processing: {e}")
+        import traceback
+        print("Full error traceback:")
+        traceback.print_exc()
+        print("Please check the error messages above for specific issues.")
     
-    print("MCoT dataset processing completed successfully!")
+    print("MCoT dataset processing completed!")
