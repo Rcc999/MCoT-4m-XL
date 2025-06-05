@@ -1,15 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=4m_fsdp_finetune
-#SBATCH --time=9:00:00
+#SBATCH --job-name=4m_mcot_fsdp_train
+#SBATCH --time=5:00:00
 #SBATCH --account=com-304
 #SBATCH --qos=com-304
 #SBATCH --gres=gpu:2
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=128G             # Monitor this, might need more CPU RAM for loading large ckpts
-#SBATCH --output=4m_fsdp_finetune_%j.out # Added job ID to output
-#SBATCH --error=4m_fsdp_finetune_%j.err # Added job ID to error
+#SBATCH --mem=64G             # Monitor this, might need more CPU RAM for loading large ckpts
+#SBATCH --output=4m_mcot_fsdp_train_%j.out # Added job ID to output
+#SBATCH --error=4m_mcot_fsdp_train_%j.err # Added job ID to error
 
 # === Accept arguments ===
 # Argument 1: Path to the main YAML config file
@@ -55,9 +55,9 @@ srun --label bash -c "
   conda activate fourm
 
   # Change to the project directory
-  cd \"/home/siminszk/ml-4m-main 2\" # Use quotes due to the space
+  cd \"/work/com-304/MCoT-4m-XL-1\"
 
-  torchrun \${TORCHRUN_ARGS} run_training_4m_fsdp.py \
+  torchrun \${TORCHRUN_ARGS} run_training_4m_mcot_fsdp.py \
     --config \${CONFIG_FILE} \
     --log_wandb \
     --wandb_entity \${WANDB_ENTITY} \

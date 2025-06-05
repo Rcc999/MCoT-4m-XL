@@ -6,3 +6,6 @@ Pillow>=9.5.0
 pandas>=2.0.0
 requests>=2.31.0
 webdataset>=0.2.0
+scipy>=1.10.0
+scikit-image>=0.20.0
+opencv-python>=4.8.0

@@ -40,48 +40,6 @@ except ImportError:
     from fourm.models.fm_utils import Block, LayerNorm
 
 
-def create_artifact_heatmap_generator(model_config: Dict[str, Any]) -> Optional[nn.Module]:
-    """Factory function to create artifact heatmap generator."""
-    try:
-        import sys
-        import os
-        mcot_data_path = os.path.join(os.path.dirname(__file__), '..', '..', 'mcot_data')
-        if mcot_data_path not in sys.path:
-            sys.path.insert(0, mcot_data_path)
-        
-        from artifact_heatmap import ArtifactHeatmapGenerator
-        return ArtifactHeatmapGenerator(
-            image_size=model_config.get("image_size", 512),
-            patch_size=model_config.get("patch_size", 16),
-            feature_dim=model_config.get("feature_dim", 768),
-            num_heads=model_config.get("num_heads", 8)
-        )
-    except ImportError as e:
-        print(f"Warning: Could not import ArtifactHeatmapGenerator: {e}")
-        return None
-
-
-def create_reflection_guided_mask_generator(model_config: Dict[str, Any]) -> Optional[nn.Module]:
-    """Factory function to create reflection-guided mask generator."""
-    try:
-        import sys
-        import os
-        mcot_data_path = os.path.join(os.path.dirname(__file__), '..', '..', 'mcot_data')
-        if mcot_data_path not in sys.path:
-            sys.path.insert(0, mcot_data_path)
-        
-        from reflection_guided_masks import ReflectionGuidedMaskGenerator
-        return ReflectionGuidedMaskGenerator(
-            image_size=model_config.get("image_size", 512),
-            min_mask_size=model_config.get("min_mask_size", 16),
-            max_mask_size=model_config.get("max_mask_size", 128),
-            mask_expansion_ratio=model_config.get("mask_expansion_ratio", 1.2)
-        )
-    except ImportError as e:
-        print(f"Warning: Could not import ReflectionGuidedMaskGenerator: {e}")
-        return None
-
-
 class MCoTStepProcessor(nn.Module):
     """
     Enhanced MCoT step processor with MINT paper features:
@@ -89,13 +47,23 @@ class MCoTStepProcessor(nn.Module):
     - Reflection-guided mask generation for targeted correction
     """
     
-    def __init__(self, dim: int, device: str = 'cuda'):
+    def __init__(self, dim: int = 768, device: str = 'cuda', enable_mint: bool = False,
+                 mcot_steps: Optional[List[str]] = None, step_weights: Optional[Dict[str, float]] = None):
         super().__init__()
         
         self.dim = dim
         self.device = device
+        self.enable_mint = enable_mint
         
-        # Original step configurations
+        # Configure MCoT steps
+        default_steps = ["planning", "acting", "reflection", "correction"]
+        self.mcot_steps = mcot_steps if mcot_steps is not None else default_steps
+        
+        # Configure step weights
+        default_weights = {"planning": 1.0, "acting": 1.2, "reflection": 1.5, "correction": 1.3}
+        self.step_weights = step_weights if step_weights is not None else default_weights
+        
+        # Step configurations
         self.step_instructions = {
             "planning": "Create a detailed dense caption and layout plan with bounding boxes for objects. Focus on spatial relationships and compositional elements.",
             "acting": "Generate the image based on the planning output. Use the dense caption and layout information to create a high-quality image.",
@@ -108,23 +76,12 @@ class MCoTStepProcessor(nn.Module):
         # Step embeddings for conditioning
         self.step_embeddings = nn.Embedding(len(self.step_instructions), dim)
         
-        # Enhanced MINT paper features
-        model_config = {
-            "image_size": 512,
-            "patch_size": 16,
-            "feature_dim": dim,
-            "num_heads": 8,
-            "min_mask_size": 16,
-            "max_mask_size": 128,
-            "mask_expansion_ratio": 1.2
-        }
-        
-        # Initialize MINT paper components (optional, will be None if import fails)
-        self.artifact_heatmap_generator = create_artifact_heatmap_generator(model_config)
-        self.reflection_guided_mask_generator = create_reflection_guided_mask_generator(model_config)
-        
         # Enhanced reflection processing
         self.reflection_confidence_threshold = 0.5
+        
+        print(f"MCoTStepProcessor initialized with dim={dim}, enable_mint={enable_mint}")
+        print(f"Steps: {self.mcot_steps}")
+        print(f"Step weights: {self.step_weights}")
         
     def get_step_embedding(self, step: str, batch_size: int, device: torch.device) -> torch.Tensor:
         """
@@ -169,88 +126,9 @@ class MCoTStepProcessor(nn.Module):
             
         return formatted_prompt
 
-    def process_reflection_with_mint(self, image: torch.Tensor, reflection_text: str) -> Dict[str, Any]:
-        """
-        Enhanced reflection processing using MINT paper features.
-        
-        Args:
-            image: Input image tensor [B, C, H, W]
-            reflection_text: Base reflection text
-            
-        Returns:
-            Enhanced reflection results with artifact analysis
-        """
-        results = {
-            "base_reflection": reflection_text,
-            "mint_features_available": False
-        }
-        
-        if self.artifact_heatmap_generator is not None:
-            try:
-                # Generate artifact heatmaps
-                heatmap_results = self.artifact_heatmap_generator(image)
-                
-                # Generate enhanced reflection text
-                enhanced_reflections = self.artifact_heatmap_generator.generate_reflection_text(
-                    heatmap_results, threshold=self.reflection_confidence_threshold
-                )
-                
-                results.update({
-                    "mint_features_available": True,
-                    "artifact_heatmaps": heatmap_results["artifact_heatmaps"],
-                    "confidence_map": heatmap_results["confidence_map"],
-                    "enhanced_reflections": enhanced_reflections,
-                    "attention_weights": heatmap_results["attention_weights"]
-                })
-                
-            except Exception as e:
-                print(f"Warning: MINT artifact detection failed: {e}")
-                
-        return results
-
-    def generate_correction_masks(self, artifact_analysis: Dict[str, Any], 
-                                image: Optional[torch.Tensor] = None,
-                                strategy: str = 'adaptive') -> Dict[str, Any]:
-        """
-        Generate targeted correction masks using reflection-guided approach.
-        
-        Args:
-            artifact_analysis: Results from reflection processing
-            image: Optional input image for context
-            strategy: Masking strategy
-            
-        Returns:
-            Generated masks and metadata
-        """
-        results = {
-            "masks_generated": False,
-            "strategy": strategy
-        }
-        
-        if (self.reflection_guided_mask_generator is not None and 
-            artifact_analysis.get("mint_features_available", False)):
-            try:
-                mask_results = self.reflection_guided_mask_generator(
-                    artifact_heatmaps=artifact_analysis["artifact_heatmaps"],
-                    confidence_map=artifact_analysis["confidence_map"],
-                    image=image,
-                    strategy=strategy
-                )
-                
-                results.update({
-                    "masks_generated": True,
-                    "correction_masks": mask_results["final_masks"],
-                    "brushstroke_masks": mask_results["brushstroke_masks"],
-                    "mask_metadata": {
-                        "initial_masks": mask_results["initial_masks"],
-                        "refined_masks": mask_results["refined_masks"]
-                    }
-                })
-                
-            except Exception as e:
-                print(f"Warning: MINT mask generation failed: {e}")
-                
-        return results
+    def get_step_weight(self, step: str) -> float:
+        """Get the loss weight for a specific MCoT step."""
+        return self.step_weights.get(step, 1.0)
 
 
 class MCoTWrapper(nn.Module):
@@ -259,14 +137,17 @@ class MCoTWrapper(nn.Module):
     This enables step-specific processing without changing the base architecture.
     """
     
-    def __init__(self, base_model: nn.Module):
+    def __init__(self, base_model: nn.Module, mcot_processor: Optional[MCoTStepProcessor] = None):
         super().__init__()
         
         self.base_model = base_model
         self.dim = getattr(base_model, 'dim', 768)
         
-        # MCoT step processor with MINT features
-        self.step_processor = MCoTStepProcessor(self.dim)
+        # MCoT step processor
+        if mcot_processor is not None:
+            self.step_processor = mcot_processor
+        else:
+            self.step_processor = MCoTStepProcessor(self.dim)
         
         # Copy important attributes from base model
         self.modality_info = getattr(base_model, 'modality_info', {})
@@ -330,17 +211,20 @@ class MCoTWrapper(nn.Module):
             return getattr(self.base_model, name)
 
 
-def add_mcot_to_model(model: nn.Module) -> MCoTWrapper:
+def add_mcot_to_model(model: nn.Module, mcot_processor: Optional[MCoTStepProcessor] = None) -> MCoTWrapper:
     """
     Add MCoT capabilities to an existing 4M model.
     
     Args:
         model: Existing 4M model
+        mcot_processor: Optional MCoT processor (will create default if None)
         
     Returns:
         Model with MCoT capabilities
     """
-    return MCoTWrapper(base_model=model)
+    return MCoTWrapper(base_model=model, mcot_processor=mcot_processor)
+
+
 
 
 

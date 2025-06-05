@@ -13,93 +13,80 @@
 # limitations under the License.
 
 """
-Enhanced 4M MCoT Training Script with MINT Paper Features
+4M MCoT Training Script with MINT Paper Features
 Based on the proven run_training_4m_fsdp.py but adapted for MCoT training.
 
-This script adds MCoT capabilities to 4M finetuning, incorporating:
+This script adds MCoT capabilities to 4M training, incorporating:
 - Step-specific loss computation for Planning, Acting, Reflection, Correction
 - Artifact heatmap generation during reflection
 - Reflection-guided mask generation for correction
 - MINT paper methodology integration
+- SeeTRUE-Feedback dataset integration for enhanced reflection training
 """
 
 import argparse
 import datetime
+import functools
 import json
+import math
 import os
+import resource
 import sys
 import time
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Iterable, List, Optional, Dict
+from typing import Iterable, List, Optional
 
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
-import torch.distributed as dist
+import yaml
 from tokenizers import Tokenizer
-
-# PyTorch FSDP imports
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointImpl, apply_activation_checkpointing, checkpoint_wrapper
-)
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (CheckpointImpl, apply_activation_checkpointing, checkpoint_wrapper)
 from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-# 4M imports
-from fourm.data import (
-    build_mixture_dataloader, get_train_dataloader, get_val_dataloader, setup_sampling_mod_info
-)
+import fourm.utils as utils
+import fourm.utils.fsdp_utils as fsdp_utils
+from fourm.data import (build_mixture_dataloader, get_train_dataloader, get_val_dataloader, setup_sampling_mod_info)
 from fourm.models import fm
 from fourm.models.fm_utils import Block, DecoderBlock
-from fourm.models.mcot_fixed import MCoTWrapper, add_mcot_to_model
+from fourm.models.mcot_fixed import MCoTStepProcessor, add_mcot_to_model
 from fourm.data.modality_info import MODALITY_INFO
 from fourm.utils import create_model, load_safetensors
 from fourm.utils.optim_factory import create_optimizer
-from fourm.utils.dist import init_distributed_mode, is_main_process, get_rank, get_world_size
-from fourm.utils.misc import NativeScalerWithGradNormCount
-from fourm.utils.scheduler import cosine_scheduler
-from fourm.utils.logger import MetricLogger
 
-# MCoT data utilities
-try:
-    from mcot_data import mcot_utils
-    MCOT_UTILS_AVAILABLE = True
-except ImportError:
-    print("Warning: mcot_utils not available. Some MCoT features may be limited.")
-    MCOT_UTILS_AVAILABLE = False
-
-# Optional wandb logging
+# Optional Wandb logging
 try:
     import wandb
     HAS_WANDB = True
 except ImportError:
+    print("Wandb not available - logging will be limited")
     HAS_WANDB = False
 
 
 def get_args():
-    """Parse command line arguments for MCoT training."""
     config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
     parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
                         help='YAML config file specifying default arguments')
 
     parser = argparse.ArgumentParser('4M MCoT training script (using FSDP)', add_help=False)
-    parser.add_argument('--run_name', type=str, default='mcot_training')
+    parser.add_argument('--run_name', type=str, default='auto')
 
-    # Basic training parameters
-    parser.add_argument('--batch_size', default=32, type=int,
+    parser.add_argument('--batch_size', default=256, type=int,
                         help='Batch size per GPU (default: %(default)s). '
                              'Effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=50, type=int,
+    parser.add_argument('--epochs', default=100, type=int,
                         help='Number of epochs (default: %(default)s)')
     parser.add_argument('--total_tokens', default=-1, type=int,
-                        help='Number of total input tokens (in billions), only applicable if epochs is negative.')
+                        help='Number of total input tokens (in billions), only applicable if epochs is negative. '
+                             'Sets the number of epochs to approximate this amount of tokens.')
     parser.add_argument('--accum_iter', default=1, type=int,
-                        help='Accumulate gradient iterations')
-    parser.add_argument('--save_ckpt_freq', default=10, type=int,
+                        help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
+    parser.add_argument('--save_ckpt_freq', default=20, type=int,
                         help='Checkpoint saving frequency in epochs (default: %(default)s)')
     parser.add_argument('--use_act_checkpoint', action='store_true')
     parser.add_argument('--no_use_act_checkpoint', action='store_false', dest='use_act_checkpoint')
@@ -118,17 +105,145 @@ def get_args():
                         choices=['float16', 'bfloat16', 'float32', 'bf16', 'fp16', 'fp32'],
                         help='Data type (default: %(default)s')
 
-    # Token budget parameters
-    parser.add_argument('--num_input_tokens', type=int, default=256, help="Token budget for the input")
-    parser.add_argument('--num_target_tokens', type=int, default=256, help="Token budget for the target")
+    parser.add_argument('--num_input_tokens', type=int, default=128, help="Token budget for the input")
+    parser.add_argument('--num_target_tokens', type=int, default=128, help="Token budget for the target")
     parser.add_argument('--min_input_tokens', type=int, default=None,
-                        help="Minimum token budget for the input")
+                        help="Minimum token budget for the input (None to set it to num_input_tokens)")
     parser.add_argument('--min_target_tokens', type=int, default=None,
-                        help="Minimum token budget for the target")
+                        help="Minimum token budget for the target (None to set it to num_target_tokens)")
+    
+    parser.add_argument('--loss_type', type=str, choices=['mod', 'token'], default='mod',
+                        help="If mod, loss is the mean of the per-modality loss. If token, loss is the mean of the per-token loss (default: %(default)s)")
 
-    # MCoT specific parameters
-    parser.add_argument('--mcot_steps', type=str, default="planning,acting,reflection,correction", 
-                        help="MCoT steps to include in training, comma-separated")
+    # Weight init / fine-tune parameters
+    parser.add_argument('--finetune', default='', help='finetune from checkpoint (for two-stage training)')
+
+    # Optimizer parameters
+    parser.add_argument('--opt', default='adamw', type=str,
+                        help='Optimizer (default: %(default)s)')
+    parser.add_argument('--opt_eps', default=1e-8, type=float,
+                        help='Optimizer epsilon (default: %(default)s)')
+    parser.add_argument('--opt_betas', default=[0.9, 0.95], type=float, nargs='+',
+                        help='Optimizer betas (default: %(default)s)')
+    parser.add_argument('--clip_grad', type=float, default=None,
+                        help='Clip gradient norm (default: %(default)s)')
+    parser.add_argument('--momentum', type=float, default=0.9,
+                        help='SGD momentum (default: %(default)s)')
+    parser.add_argument('--weight_decay', type=float, default=0.05,
+                        help='Weight decay (default: %(default)s)')
+    parser.add_argument('--weight_decay_end', type=float, default=None, 
+                        help="Final value of the weight decay. (Set the same value as args.weight_decay to keep weight decay value constant)")
+    parser.add_argument('--skip_nan_grad', action='store_true', 
+                        help="Skips the batch if the grad norm is NaN, requires having grad clipping activated")
+
+    parser.add_argument('--blr', type=float, default=1e-4,
+                        help='Base learning rate: absolute_lr = base_lr * total_batch_size / 256 (default: %(default)s)')
+    parser.add_argument('--min_blr', type=float, default=0.,
+                        help='Lower base lr bound for cyclic schedulers that hit 0 (default: %(default)s)')
+    parser.add_argument('--frozen_model_blr', type=float, default=-1,
+                        help='base lr bound for frozen model (default: %(default)s)')
+    parser.add_argument('--scheduler', type=str, default='cosine',
+                        choices=['cosine', 'inverse_sqrt-10000'],
+                        help='Learning rate scheduler type (default: %(default)s')
+    parser.add_argument('--warmup_epochs', type=int, default=10,
+                        help='Epochs to warmup LR, if scheduler supports (default: %(default)s)')
+    parser.add_argument('--warmup_steps', type=int, default=-1,
+                        help='Steps to warmup LR, if scheduler supports (default: %(default)s)')
+    parser.add_argument('--warmup_tokens', type=int, default=-1,
+                        help='Total tokens to warmup LR, if scheduler supports (default: %(default)s)')
+    parser.add_argument('--cooldown_epochs', type=int, default=10,
+                        help='Epochs to cool down LR, if scheduler supports (default: %(default)s)')
+    parser.add_argument('--cooldown_steps', type=int, default=-1, 
+                        help='Steps to cool down LR, if scheduler supports (default: %(default)s)')
+    parser.add_argument('--cooldown_tokens', type=int, default=-1, 
+                        help='Total tokens to cool down LR, if scheduler supports (default: %(default)s)')
+    parser.add_argument('--frozen_model_epochs', default=0, type=int,
+                        help='Number of epochs where only input/output embeddings are trained (default: %(default)s)')
+    parser.add_argument('--frozen_model_tokens', default=0, type=int,
+                        help='Number of tokens where only input/output embeddings are trained (default: %(default)s)')
+    parser.add_argument('--frozen_embedding_domain', default=None, type=str,
+                        help='Embeddings of domains that are frozen during training (default: %(default)s)')
+    
+    # Dataset parameters
+    parser.add_argument('--data_config', type=str, default="",
+                        help="Path to data config to specify dataset and modality mixture parameters.")
+    parser.add_argument('--epoch_size', type=int, help="Number of samples per epoch")
+    parser.add_argument('--s3_endpoint', default='', type=str, help='S3 endpoint URL')
+    parser.add_argument('--s3_data_endpoint', default=None, type=str, 
+                        help='S3 endpoint URL for the data (if different). If set to None, will be set to s3_endpoint')
+    parser.add_argument('--s3_multipart_chunksize_mb', default=512, type=int)
+    parser.add_argument('--s3_multipart_threshold_mb', default=512, type=int)
+    parser.add_argument('--s3_max_io_queue', default=100, type=int)
+
+    # Text tokenizer
+    parser.add_argument('--text_tokenizer_path', default='fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json',
+                        help="Path to trained text tokenizer")
+
+    # Eval
+    parser.add_argument('--eval_freq', default=10, type=int, help="frequency of evaluation")
+    parser.add_argument('--dist_eval', action='store_true', default=False,
+                        help='Enabling distributed evaluation')
+    parser.add_argument('--no_dist_eval', action='store_false', dest='dist_eval',
+                    help='Disabling distributed evaluation')
+    parser.set_defaults(dist_eval=True)
+
+    parser.add_argument('--fixed_eval', action='store_true')
+    parser.add_argument('--no_fixed_eval', action='store_false', dest='fixed_eval')
+    parser.set_defaults(fixed_eval=True)
+    parser.add_argument('--fixed_eval_input_tokens', default=128, type=int,
+                        help="Number of input tokens for the fixed evaluation")
+    parser.add_argument('--fixed_eval_target_tokens', default=128, type=int,
+                        help="Number of target tokens for the fixed evaluation")
+    parser.add_argument('--fixed_eval_batch_size', default=32, type=int,
+                        help="Batch size for the fixed evaluation")
+
+    parser.add_argument('--eval', action='store_true',
+                        help='Perform evaluation only')
+
+    # Misc.
+    parser.add_argument('--output_dir', default='',
+                        help='Path where to save, empty for no saving')
+    parser.add_argument('--device', default='cuda',
+                        help='Device to use for training / testing')
+
+    parser.add_argument('--seed', default=0, type=int, help='Random seed ')
+    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--auto_resume', action='store_true')
+    parser.add_argument('--no_auto_resume', action='store_false', dest='auto_resume')
+    parser.set_defaults(auto_resume=True)
+
+    parser.add_argument('--start_epoch', default=0, type=int, help='start epoch')
+    parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--pin_mem', action='store_true',
+                        help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+    parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem',
+                        help='')
+    parser.set_defaults(pin_mem=True)
+
+    parser.add_argument('--rlimit', default=4096, type=int, 
+                        help='Increase rlimit to avoid "RuntimeError: received 0 items of ancdata".')
+    parser.add_argument('--print_all', action='store_true', default=False)
+    parser.add_argument('--s3_save_dir', type=str, default="")
+    parser.add_argument('--show_user_warnings', default=False, action='store_true')
+
+    # Distributed training parameters
+    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+
+    # Wandb logging
+    parser.add_argument('--log_wandb', default=False, action='store_true',
+                        help='Log training and validation metrics to wandb')
+    parser.add_argument('--no_log_wandb', action='store_false', dest='log_wandb')
+    parser.set_defaults(log_wandb=False)
+    parser.add_argument('--wandb_project', default=None, type=str,
+                        help='Project name on wandb')
+    parser.add_argument('--wandb_entity', default=None, type=str,
+                        help='User or team name on wandb')
+    parser.add_argument('--wandb_run_name', default='auto', type=str,
+                        help='Run name on wandb')
+
+    # MCoT-specific parameters
+    parser.add_argument('--mcot_steps', type=str, default='planning,acting,reflection,correction',
+                        help='Comma-separated list of MCoT steps to train')
     parser.add_argument('--mcot_planning_weight', type=float, default=1.0, 
                         help="Weight for planning step loss")
     parser.add_argument('--mcot_acting_weight', type=float, default=1.0, 
@@ -140,237 +255,505 @@ def get_args():
     parser.add_argument('--enable_mint_features', action='store_true',
                         help="Enable MINT paper features (artifact heatmaps, reflection-guided masks)")
 
-    # Dataset parameters
-    parser.add_argument('--data_config', type=str, required=True,
-                        help='Path to data config file for MCoT dataset')
-    parser.add_argument('--dataset_dirs', type=str, nargs='+', required=True,
-                        help='Directories containing MCoT training data')
-    parser.add_argument('--data_path', type=str, default=None,
-                        help='Path to MCoT data (JSON file or directory from wget script)')
-    parser.add_argument('--tokenizer_path', type=str, default='fourm/utils/tokenizer/trained/text_tokenizer_4m.json',
-                        help='Path to text tokenizer')
+    # Parse config file if there is one
+    args_config, remaining = config_parser.parse_known_args()
 
-    # Optimization parameters
-    parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
-                        help='Optimizer (default: %(default)s)')
-    parser.add_argument('--opt_eps', default=1e-8, type=float, metavar='EPSILON',
-                        help='Optimizer epsilon (default: %(default)s)')
-    parser.add_argument('--opt_betas', default=None, type=float, nargs='+', metavar='BETA',
-                        help='Optimizer betas (default: None, use opt default)')
-    parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
-                        help='Clip gradient norm (default: None, no clipping)')
-    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
-                        help='SGD momentum (default: %(default)s)')
-    parser.add_argument('--weight_decay', type=float, default=0.05,
-                        help='Weight decay (default: %(default)s)')
-    parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
-                        help='Learning rate (default: %(default)s)')
-    parser.add_argument('--layer_decay', type=float, default=None,
-                        help='Layer-wise lr decay (default: %(default)s)')
-    parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
-                        help='Lower lr bound for cyclic schedulers that hit 0 (default: %(default)s)')
-    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',
-                        help='Epochs to warmup LR, if scheduler supports')
-    parser.add_argument('--warmup_steps', type=int, default=-1, metavar='N',
-                        help='Steps to warmup LR, if scheduler supports')
+    if args_config.config:
+        with open(args_config.config, 'r') as f:
+            cfg = yaml.safe_load(f)
+            parser.set_defaults(**cfg)            
 
-    # Checkpointing and logging
-    parser.add_argument('--finetune', default='',
-                        help='Path to finetune from checkpoint')
-    parser.add_argument('--resume', default='',
-                        help='Resume from checkpoint')
-    parser.add_argument('--auto_resume', action='store_true')
-    parser.set_defaults(auto_resume=True)
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
-                        help='Start epoch')
-    parser.add_argument('--output_dir', default='./output/mcot_training',
-                        help='Path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='./logs/mcot_training',
-                        help='Path to save logs')
-    parser.add_argument('--device', default='cuda',
-                        help='Device to use')
-    parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--num_workers', default=8, type=int)
-    parser.add_argument('--pin_mem', action='store_true',
-                        help='Pin CPU memory in DataLoader for more efficient transfer to GPU.')
-    parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
-    parser.set_defaults(pin_mem=True)
+    # The main arg parser parses the rest of the args, the usual
+    # defaults will have been overridden if config file is specified.
+    args = parser.parse_args(remaining)
 
-    # Distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='Number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
-    parser.add_argument('--dist_on_itp', action='store_true')
-    parser.add_argument('--dist_url', default='env://',
-                        help='URL used to set up distributed training')
+    # Add the config path as a final args if given
+    args.config_path = args_config.config
 
-    # Logging
-    parser.add_argument('--wandb_project', type=str, default='4m-mcot',
-                        help='Wandb project name')
-    parser.add_argument('--wandb_run_name', type=str, default=None,
-                        help='Wandb run name')
-    parser.add_argument('--disable_wandb', action='store_true',
-                        help='Disable wandb logging')
-
-    return parser
+    return args
 
 
 def setup_modality_info(args):
-    """Setup modality information for MCoT training."""
-    # Use standard 4M modality info but add MCoT-specific modalities if needed
-    modality_info = MODALITY_INFO.copy()
+    """Setup modality information based on args - matches base script structure."""
+    # Global modality info
+    modality_info = {mod: MODALITY_INFO[mod] for mod in MODALITY_INFO.keys()}
     
-    # Add step-specific modalities if needed
-    mcot_steps = args.mcot_steps.split(',')
-    for step in mcot_steps:
-        step = step.strip()
-        if f'{step}_text' not in modality_info:
-            # Add step-specific text modality
-            modality_info[f'{step}_text'] = modality_info['caption'].copy()
-            modality_info[f'{step}_text']['name'] = f'{step}_text'
-    
+    # Max tokens
+    for mod in modality_info:
+        image_size, patch_size = modality_info[mod].get('input_size', args.input_size), modality_info[mod].get('patch_size', args.patch_size)
+        num_patches = (image_size // patch_size) ** 2
+        if modality_info[mod]['type'] == 'img':
+            modality_info[mod]['max_tokens'] = num_patches
+
     return modality_info
 
 
-def setup_mcot_data(args):
-    """Setup MCoT-specific data loaders for the wget dataset format."""
-    print("Setting up MCoT data loaders...")
+def setup_data(args):
+    """Setup data loaders following base 4M script structure with MCoT data integration."""
+    text_tokenizer = Tokenizer.from_file(args.text_tokenizer_path)
     
-    # Determine data path - can be JSON file or directory from wget script
-    data_path = args.data_path
-    if not data_path:
-        # Try common locations
-        json_path = os.path.join(args.dataset_dirs[0], "mcot_training_dataset.json")
-        dir_path = args.dataset_dirs[0]
-        
-        if os.path.exists(json_path):
-            data_path = json_path
-        elif os.path.exists(dir_path):
-            data_path = dir_path
-        else:
-            raise FileNotFoundError(f"No MCoT data found at {args.dataset_dirs[0]}")
+    # Load data config
+    with open(args.data_config, 'r') as f:
+        data_config = yaml.safe_load(f)
     
-    print(f"Using MCoT data from: {data_path}")
+    # Parse config and set domains
+    train_config = data_config['train']['datasets']
+    args.in_domains = sorted(set.union(*[set(cfg['in_domains'].split('-')) for cfg in train_config.values()]))
+    args.out_domains = sorted(set.union(*[set(cfg['out_domains'].split('-')) for cfg in train_config.values()]))
+    args.all_domains = sorted(list(set(args.in_domains) | set(args.out_domains)))
     
-    # Setup modality info
+    # Set up shared modality info
     modality_info = setup_modality_info(args)
     
-    # Create MCoT dataset based on data format
-    if data_path.endswith('.json'):
-        # JSON format
-        import json
-        with open(data_path, 'r') as f:
-            data = json.load(f)
+    # Initialize train loaders
+    if any([cfg['data_path'].startswith('s3') for cfg in train_config.values()]):
+        utils.s3_utils.override_wds_s3_tar_loading(args.s3_data_endpoint, args.s3_multipart_threshold_mb, args.s3_multipart_chunksize_mb, args.s3_max_io_queue)
+    
+    num_trainsets = len(train_config)
+    num_workers = args.num_workers
+    
+    if num_trainsets == 1:
+        # Single dataset - directly configure the loader
+        dataset_name, dataset_cfg = list(train_config.items())[0]
+        print(f'Setting up single dataset {dataset_name} / train')
+        dataset_mod_info, sampling_weights = setup_sampling_mod_info(dataset_cfg, modality_info)
         
-        from mcot_data.mcot_torch_dataset import MCoTDataset
-        mcot_dataset = MCoTDataset(
-            data=data,
-            modality_info=modality_info,
-            input_size=args.input_size,
-            num_input_tokens=args.num_input_tokens,
-            num_target_tokens=args.num_target_tokens
+        # Check for MCoT data path override
+        if hasattr(args, 'mcot_data_path') and args.mcot_data_path:
+            # Override data path for MCoT training
+            dataset_cfg = dict(dataset_cfg)
+            dataset_cfg['data_path'] = args.mcot_data_path
+            print(f"Using MCoT data path: {args.mcot_data_path}")
+        
+        data_loader_train = get_train_dataloader(
+            dataset_config=dataset_cfg, modality_info=dataset_mod_info,
+            sampling_weights=sampling_weights, text_tokenizer=text_tokenizer, input_size=args.input_size,
+            num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens,
+            min_input_tokens=args.min_input_tokens, min_target_tokens=args.min_target_tokens,
+            num_tasks=args.num_tasks, num_workers=num_workers,
+            dataset_batch_size=args.batch_size,
+            epoch_size=args.epoch_size,
+            use_text_to_caption_transform=True
         )
+        
+        if hasattr(data_loader_train, 'n_shards') and data_loader_train.n_shards > 0:
+            num_workers = min(data_loader_train.n_shards, args.num_workers)
     else:
-        # Directory format from wget script
-        from mcot_data.mcot_torch_dataset import MCoTDatasetFromWgetOutput
-        mcot_dataset = MCoTDatasetFromWgetOutput(
-            dataset_dir=data_path,
-            modality_info=modality_info,
-            input_size=args.input_size,
-            num_input_tokens=args.num_input_tokens,
-            num_target_tokens=args.num_target_tokens,
-            split='train'
-        )
+        # Multiple datasets - use mixture approach
+        train_iters = []
+        shards_per_dataset = []
+        for dataset_name, dataset_cfg in train_config.items():
+            print(f'Setting up dataset {dataset_name} / train for mixture')
+            dataset_mod_info, sampling_weights = setup_sampling_mod_info(dataset_cfg, modality_info)
+            
+            # Check for MCoT data path override
+            if hasattr(args, 'mcot_data_path') and args.mcot_data_path:
+                dataset_cfg = dict(dataset_cfg)
+                dataset_cfg['data_path'] = args.mcot_data_path
+                print(f"Using MCoT data path for {dataset_name}: {args.mcot_data_path}")
+            
+            dataiter = get_train_dataloader(
+                dataset_config=dataset_cfg, modality_info=dataset_mod_info,
+                sampling_weights=sampling_weights, text_tokenizer=text_tokenizer, input_size=args.input_size,
+                num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens,
+                min_input_tokens=args.min_input_tokens, min_target_tokens=args.min_target_tokens,
+                num_tasks=args.num_tasks, num_workers=num_workers,
+                dataset_batch_size=None,  # For mixture, individual loaders yield single samples
+                epoch_size=None,  # MixtureDataset handles epoch_size
+                use_text_to_caption_transform=True
+            )
+            train_iters.append(dataiter)
+            if hasattr(dataiter, 'n_shards') and dataiter.n_shards > 0:
+                shards_per_dataset.append(dataiter.n_shards)
         
-        # Create validation dataset
-        val_dataset = MCoTDatasetFromWgetOutput(
-            dataset_dir=data_path,
-            modality_info=modality_info,
-            input_size=args.input_size,
-            num_input_tokens=args.num_input_tokens,
-            num_target_tokens=args.num_target_tokens,
-            split='val'
+        # Adjust num_workers for the MixtureLoader
+        if shards_per_dataset:
+            num_workers = min(min(shards_per_dataset), args.num_workers)
+        
+        weights = data_config['train'].get('weights', [1.0] * num_trainsets)
+        data_loader_train = build_mixture_dataloader(
+            data_iters=train_iters, weights=weights, modality_info=modality_info,
+            batch_size=args.batch_size, num_workers=num_workers,
+            epoch_size=args.epoch_size, num_gpus=args.num_tasks
         )
     
-    # Split dataset if using JSON format
-    if data_path.endswith('.json'):
-        train_size = int(0.9 * len(mcot_dataset))
-        val_size = len(mcot_dataset) - train_size
+    # Calculate training steps
+    num_training_steps_per_epoch = args.epoch_size // (args.batch_size * args.num_tasks)
+    
+    # Setup validation loaders
+    data_loaders_val, data_loaders_fixed_eval = None, None
+    if 'val' in data_config:
+        val_config = data_config['val']['datasets']
+        data_loaders_val, data_loaders_fixed_eval = {}, {}
         
-        from torch.utils.data import random_split
-        train_dataset, val_dataset = random_split(mcot_dataset, [train_size, val_size])
-    else:
-        train_dataset = mcot_dataset
+        for dataset_name, dataset_cfg in val_config.items():
+            dataset_mod_info, sampling_weights = setup_sampling_mod_info(train_config[dataset_name], modality_info)
+            
+            # MCoT validation can use same data path override
+            if hasattr(args, 'mcot_data_path') and args.mcot_data_path:
+                dataset_cfg = dict(dataset_cfg)
+                # For validation, might want to use a different split or path
+                val_path = args.mcot_data_path.replace('train', 'val') if 'train' in args.mcot_data_path else args.mcot_data_path
+                dataset_cfg['data_path'] = val_path
+            
+            data_loaders_val[dataset_name] = get_val_dataloader(
+                dataset_config=dataset_cfg, dataset_name=dataset_name, train_configs=train_config,
+                modality_info=dataset_mod_info, sampling_weights=sampling_weights, text_tokenizer=text_tokenizer,
+                input_size=args.input_size, num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens,
+                min_input_tokens=args.min_input_tokens, min_target_tokens=args.min_target_tokens, fixed_eval=False,
+                fixed_eval_input_tokens=args.fixed_eval_input_tokens, fixed_eval_target_tokens=args.fixed_eval_target_tokens,
+                dist_eval=args.dist_eval, num_tasks=args.num_tasks, num_workers=args.num_workers,
+                batch_size=int(1.5*args.batch_size), pin_mem=args.pin_mem,
+                use_text_to_caption_transform=True
+            )
+            
+            if args.fixed_eval:
+                data_loaders_fixed_eval[dataset_name] = get_val_dataloader(
+                    dataset_config=dataset_cfg, dataset_name=dataset_name, train_configs=train_config,
+                    modality_info=dataset_mod_info, sampling_weights=sampling_weights, text_tokenizer=text_tokenizer,
+                    input_size=args.input_size, num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens,
+                    min_input_tokens=args.min_input_tokens, min_target_tokens=args.min_target_tokens, fixed_eval=True,
+                    fixed_eval_input_tokens=args.fixed_eval_input_tokens, fixed_eval_target_tokens=args.fixed_eval_target_tokens,
+                    dist_eval=args.dist_eval, num_tasks=args.num_tasks, num_workers=args.num_workers,
+                    batch_size=int(1.5*args.batch_size), pin_mem=args.pin_mem,
+                    use_text_to_caption_transform=True
+                )
+        
+        data_loaders_val = data_loaders_val if data_loaders_val else None
+        data_loaders_fixed_eval = data_loaders_fixed_eval if data_loaders_fixed_eval else None
     
-    # Create data loaders
-    from torch.utils.data import DataLoader
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-        collate_fn=train_dataset.collate_fn if hasattr(train_dataset, 'collate_fn') else train_dataset.dataset.collate_fn
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=False,
-        collate_fn=val_dataset.collate_fn if hasattr(val_dataset, 'collate_fn') else val_dataset.dataset.collate_fn
-    )
-    
-    return train_loader, val_loader, modality_info
+    return modality_info, data_loader_train, num_training_steps_per_epoch, data_loaders_val, data_loaders_fixed_eval
 
 
-def get_mcot_model(args, modality_info):
-    """Create 4M model with MCoT capabilities."""
+def get_model(args, modality_info):
+    """Create and enhance 4M model with MCoT capabilities - simplified version."""
     print(f"Creating model: {args.model}")
     
-    # Create base 4M model
-    base_model = create_model(
+    # Create base 4M model using standard factory
+    model = create_model(
         args.model,
-        modality_info=modality_info,
         input_size=args.input_size,
         patch_size=args.patch_size,
-        num_register_tokens=args.num_register_tokens
+        drop_path_rate=getattr(args, 'drop_path', 0.0),
+        drop_rate=getattr(args, 'drop', 0.0),
+        attn_drop_rate=getattr(args, 'attn_drop_rate', 0.0),
+        head_drop_rate=getattr(args, 'head_drop_rate', 0.0),
+        modality_info=modality_info,
+        num_input_tokens=args.num_input_tokens,
+        num_target_tokens=args.num_target_tokens,
+        num_register_tokens=args.num_register_tokens,
     )
     
-    # Add MCoT wrapper
-    model = add_mcot_to_model(base_model)
+    # Enhance with MCoT capabilities if specified
+    if hasattr(args, 'mcot_steps') and args.mcot_steps:
+        print("Adding MCoT capabilities to base model...")
+        mcot_processor = MCoTStepProcessor(
+            dim=getattr(model, 'dim', 768),
+            device=args.device,
+            enable_mint=getattr(args, 'enable_mint_features', False),
+            mcot_steps=args.mcot_steps.split(','),
+            step_weights={
+                'planning': args.mcot_planning_weight,
+                'acting': args.mcot_acting_weight,
+                'reflection': args.mcot_reflection_weight,
+                'correction': args.mcot_correction_weight
+            }
+        )
+        
+        # Wrap model with MCoT capabilities
+        model = add_mcot_to_model(model, mcot_processor)
     
-    # Load from checkpoint if specified
+    # Load pretrained weights if specified
     if args.finetune:
-        print(f"Loading checkpoint from {args.finetune}")
-        checkpoint = torch.load(args.finetune, map_location='cpu')
-        
-        # Handle different checkpoint formats
-        if 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        elif 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
+        print(f"Loading pretrained model from: {args.finetune}")
+        if args.finetune.endswith('.safetensors'):
+            state_dict = load_safetensors(args.finetune)
         else:
-            state_dict = checkpoint
-        
-        # Remove 'base_model.' prefix if present for loading into MCoT wrapper
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('base_model.'):
-                new_key = key[11:]  # Remove 'base_model.' prefix
-                new_state_dict[f'base_model.{new_key}'] = value
+            checkpoint = torch.load(args.finetune, map_location='cpu')
+            if 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            elif 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
             else:
-                new_state_dict[f'base_model.{key}'] = value
+                state_dict = checkpoint
         
-        # Load state dict with strict=False to allow for new MCoT parameters
-        msg = model.load_state_dict(new_state_dict, strict=False)
+        # Load with strict=False to allow for new MCoT parameters
+        msg = model.load_state_dict(state_dict, strict=False)
         print(f"Loaded checkpoint with message: {msg}")
     
     return model
+
+
+def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: torch.optim.Optimizer,
+                    device: torch.device, epoch: int, loss_scaler, max_norm: float = None,
+                    log_writer=None, lr_scheduler=None, start_steps=None, lr_schedule_values=None,
+                    wd_schedule_values=None, num_training_steps_per_epoch=None, update_freq=None,
+                    use_amp=False, args=None):
+    """Train one epoch following base script structure with MCoT enhancements."""
+    
+    model.train(True)
+    
+    # Handle frozen model epochs if specified
+    frozen_model_epochs = getattr(args, 'frozen_model_epochs', 0)
+    if frozen_model_epochs > 0 and epoch < frozen_model_epochs:
+        frozen_embedding_domain = getattr(args, 'frozen_embedding_domain', None)
+        if frozen_embedding_domain is None:
+            model.freeze_shared_params()
+        else:
+            model.freeze_params_except_specific_embeddings(frozen_embedding_domain)
+    else:
+        model.unfreeze_all()
+    
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    
+    # Add MCoT-specific metrics if applicable
+    if hasattr(args, 'mcot_steps') and args.mcot_steps:
+        for step in args.mcot_steps.split(','):
+            step = step.strip()
+            metric_logger.add_meter(f'{step}_loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    
+    header = f'Epoch: [{epoch}]'
+    print_freq = 10
+    
+    optimizer.zero_grad()
+    
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        step = data_iter_step // update_freq
+        if step >= num_training_steps_per_epoch:
+            continue
+        
+        it = start_steps + step  # global training iteration
+        
+        # Update learning rate and weight decay
+        if data_iter_step % update_freq == 0:
+            if lr_schedule_values is not None:
+                for param_group in optimizer.param_groups:
+                    if lr_schedule_values[it] is not None:
+                        param_group['lr'] = lr_schedule_values[it] * param_group.get('lr_scale', 1.0)
+            if wd_schedule_values is not None and len(wd_schedule_values) > it:
+                for param_group in optimizer.param_groups:
+                    if param_group['weight_decay'] > 0:
+                        param_group['weight_decay'] = wd_schedule_values[it]
+        
+        # Prepare batch data - handle both standard 4M format and MCoT format
+        if isinstance(batch, dict) and 'mod_dict' in batch:
+            # MCoT format batch
+            mod_dict = batch['mod_dict']
+            mcot_step = batch.get('mcot_step', 'planning')
+            mcot_context = batch.get('mcot_context', {})
+        else:
+            # Standard 4M format batch
+            mod_dict = {
+                modality: {k: v.to(device, non_blocking=True) for k, v in d.items()}
+                for modality, d in batch.items()
+                if modality in args.all_domains
+            }
+            mcot_step = None
+            mcot_context = {}
+        
+        # Move data to device
+        if not isinstance(batch, dict) or 'mod_dict' not in batch:
+            mod_dict = {
+                modality: {k: v.to(device, non_blocking=True) for k, v in d.items()}
+                for modality, d in mod_dict.items()
+                if modality in args.all_domains
+            }
+        
+        update_grad = (data_iter_step + 1) % update_freq == 0
+        
+        # Use gradient sync context for FSDP
+        with nullcontext() if update_grad else model.no_sync():
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                # Forward pass with MCoT support
+                if hasattr(model, 'mcot_processor') and mcot_step:
+                    # MCoT-enhanced forward pass
+                    outputs = model(
+                        mod_dict, 
+                        num_encoder_tokens=args.num_input_tokens,
+                        num_decoder_tokens=args.num_target_tokens,
+                        mcot_step=mcot_step,
+                        mcot_context=mcot_context,
+                        loss_type=args.loss_type
+                    )
+                else:
+                    # Standard 4M forward pass
+                    outputs = model(
+                        mod_dict,
+                        num_encoder_tokens=args.num_input_tokens,
+                        num_decoder_tokens=args.num_target_tokens,
+                        loss_type=args.loss_type
+                    )
+                
+                # Extract loss and individual losses
+                if isinstance(outputs, tuple) and len(outputs) >= 2:
+                    loss, mod_loss = outputs[0], outputs[1]
+                elif hasattr(outputs, 'loss'):
+                    loss = outputs.loss
+                    mod_loss = getattr(outputs, 'mod_loss', {})
+                else:
+                    loss = outputs
+                    mod_loss = {}
+                
+                loss_value = loss.item()
+                mod_loss_values = {f'{mod}_loss': l.item() for mod, l in mod_loss.items()} if isinstance(mod_loss, dict) else {}
+            
+            if not math.isfinite(loss_value):
+                print(f"Loss is {loss_value}, stopping training")
+                if args.output_dir:
+                    torch.save(mod_dict, os.path.join(args.output_dir, "debug_mod_dict.pt"))
+                sys.exit(1)
+            
+            loss = loss / update_freq
+            loss.backward()
+            
+            if update_grad:
+                nan_gradients = False
+                
+                if max_norm is not None:
+                    if hasattr(model, 'clip_grad_norm_'):
+                        grad_norm = model.clip_grad_norm_(max_norm)
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                    
+                    # Check for NaN gradients if specified
+                    if getattr(args, 'skip_nan_grad', False):
+                        if hasattr(grad_norm, 'isnan') and grad_norm.isnan():
+                            nan_gradients = True
+                    
+                    grad_norm = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
+                else:
+                    grad_norm = None
+                
+                if not (getattr(args, 'skip_nan_grad', False) and nan_gradients):
+                    optimizer.step()
+                elif nan_gradients:
+                    print(f"Skipping step {data_iter_step} in epoch {epoch} due to NaN gradients")
+                
+                optimizer.zero_grad()
+        
+        torch.cuda.synchronize()
+        
+        # Update metrics
+        metric_logger.update(loss=loss_value)
+        metric_logger.update(**mod_loss_values)
+        
+        min_lr = 10.
+        max_lr = 0.
+        for group in optimizer.param_groups:
+            min_lr = min(min_lr, group["lr"])
+            max_lr = max(max_lr, group["lr"])
+        
+        metric_logger.update(lr=max_lr)
+        metric_logger.update(min_lr=min_lr)
+        
+        weight_decay_value = None
+        for group in optimizer.param_groups:
+            if group["weight_decay"] > 0:
+                weight_decay_value = group["weight_decay"]
+        if weight_decay_value is not None:
+            metric_logger.update(weight_decay=weight_decay_value)
+        
+        if grad_norm is not None:
+            metric_logger.update(grad_norm=grad_norm)
+        
+        # Log to wandb
+        if log_writer is not None and update_grad:
+            log_writer.update({
+                'loss': loss_value,
+                'lr': max_lr,
+                'min_lr': min_lr,
+                'weight_decay': weight_decay_value or 0.0,
+            })
+            log_writer.update(mod_loss_values)
+            if grad_norm is not None:
+                log_writer.update({'grad_norm': grad_norm})
+            
+            # Add token tracking
+            total_batch_size = args.batch_size * args.accum_iter * utils.get_world_size()
+            log_writer.update({
+                'input_tokens_seen_b': it * (total_batch_size / args.accum_iter) * args.num_input_tokens / 1e9,
+                'target_tokens_seen_b': it * (total_batch_size / args.accum_iter) * args.num_target_tokens / 1e9,
+                'total_tokens_seen_b': it * (total_batch_size / args.accum_iter) * (args.num_input_tokens + args.num_target_tokens) / 1e9,
+            })
+            log_writer.set_step()
+        
+        if lr_scheduler is not None:
+            lr_scheduler.step_update(start_steps + data_iter_step)
+    
+    # Gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+    torch.cuda.empty_cache()
+    
+    return {'[Epoch] ' + k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+@torch.no_grad()
+def evaluate(model, data_loader, device, args):
+    """Evaluate model following base script structure."""
+    model.eval()
+    
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
+    
+    for batch in metric_logger.log_every(data_loader, 10, header):
+        # Prepare batch data - handle both formats
+        if isinstance(batch, dict) and 'mod_dict' in batch:
+            # MCoT format batch
+            mod_dict = batch['mod_dict']
+            mcot_step = batch.get('mcot_step', 'planning')
+            mcot_context = batch.get('mcot_context', {})
+        else:
+            # Standard 4M format batch
+            mod_dict = {
+                modality: {k: v.to(device, non_blocking=True) for k, v in d.items()}
+                for modality, d in batch.items()
+                if modality in args.all_domains
+            }
+            mcot_step = None
+            mcot_context = {}
+        
+        with torch.no_grad():
+            # Forward pass with MCoT support
+            if hasattr(model, 'mcot_processor') and mcot_step:
+                outputs = model(
+                    mod_dict,
+                    num_encoder_tokens=args.num_input_tokens,
+                    num_decoder_tokens=args.num_target_tokens,
+                    mcot_step=mcot_step,
+                    mcot_context=mcot_context,
+                    loss_type=args.loss_type
+                )
+            else:
+                outputs = model(
+                    mod_dict,
+                    num_encoder_tokens=args.num_input_tokens,
+                    num_decoder_tokens=args.num_target_tokens,
+                    loss_type=args.loss_type
+                )
+            
+            # Extract loss
+            if isinstance(outputs, tuple) and len(outputs) >= 2:
+                loss, mod_loss = outputs[0], outputs[1]
+            elif hasattr(outputs, 'loss'):
+                loss = outputs.loss
+                mod_loss = getattr(outputs, 'mod_loss', {})
+            else:
+                loss = outputs
+                mod_loss = {}
+            
+            metric_logger.update(loss=loss.item())
+            if isinstance(mod_loss, dict):
+                mod_loss_values = {f'{mod}_loss': l.item() for mod, l in mod_loss.items()}
+                metric_logger.update(**mod_loss_values)
+    
+    # Gather stats
+    metric_logger.synchronize_between_processes()
+    print('* Loss {losses.global_avg:.3f}'.format(losses=metric_logger.loss))
+    
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 def compute_mcot_step_loss(outputs, targets, step, criterion):
@@ -423,9 +806,12 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
     """Train one epoch with MCoT-specific processing."""
     
     model.train(True)
-    metric_logger = MetricLogger(delimiter="  ")
+    metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', "{:.8f}")
     metric_logger.add_meter('min_lr', "{:.8f}")
+    # Add MCoT-specific metrics
+    metric_logger.add_meter('seetrue_usage', "{:.3f}")
+    metric_logger.add_meter('reflection_enhanced', "{:.3f}")
     header = f'Epoch: [{epoch}]'
     print_freq = 10
     
@@ -445,6 +831,11 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
     
     mcot_steps = args.mcot_steps.split(',')
     mcot_steps = [step.strip() for step in mcot_steps]
+    
+    # Track SeeTRUE-Feedback usage for monitoring
+    seetrue_usage_count = 0
+    reflection_enhanced_count = 0
+    total_reflection_samples = 0
     
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         
@@ -506,11 +897,33 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
             # Use the current step as specified in batch or default to planning
             current_step = sample_mcot_step if sample_mcot_step in mcot_steps else 'planning'
             
-            # Setup context (empty for first step)
+            # Setup context for MCoT processing
             mcot_context = {}
             
+            # Extract SeeTRUE-Feedback data if available for reflection step
+            seetrue_data = None
+            if current_step == 'reflection' and step_data:
+                total_reflection_samples += 1
+                
+                # step_data is a dict with step names as keys
+                reflection_step_data = step_data.get('reflection', {})
+                if reflection_step_data and 'seetrue_data' in reflection_step_data:
+                    seetrue_batch = reflection_step_data['seetrue_data']
+                    if isinstance(seetrue_batch, list) and i < len(seetrue_batch):
+                        seetrue_data = seetrue_batch[i]
+                    elif not isinstance(seetrue_batch, list):
+                        seetrue_data = seetrue_batch
+                        
+                    if seetrue_data:
+                        mcot_context['seetrue_data'] = seetrue_data
+                        seetrue_usage_count += 1
+                        reflection_enhanced_count += 1
+                        # Log SeeTRUE usage for monitoring
+                        if args.enable_mint_features:
+                            print(f"✅ Using SeeTRUE-Feedback data for reflection training on sample {i}")
+            
             with torch.cuda.amp.autocast(enabled=use_amp):
-                # Forward pass for this step
+                # Forward pass for this step with enhanced context
                 outputs = model(
                     mod_dict=sample_mod_dict,
                     num_encoder_tokens=args.num_input_tokens,
@@ -575,6 +988,13 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
         for step_name, step_loss in step_losses.items():
             metric_logger.update(**{f'loss_{step_name}': step_loss.item()})
         
+        # Update SeeTRUE usage metrics
+        if total_reflection_samples > 0:
+            seetrue_usage_rate = seetrue_usage_count / total_reflection_samples
+            reflection_enhanced_rate = reflection_enhanced_count / total_reflection_samples
+            metric_logger.update(seetrue_usage=seetrue_usage_rate)
+            metric_logger.update(reflection_enhanced=reflection_enhanced_rate)
+        
         min_lr = 10.
         max_lr = 0.
         for group in optimizer.param_groups:
@@ -604,7 +1024,7 @@ def evaluate(model, data_loader, device, args):
     """Evaluate model on validation set."""
     criterion = torch.nn.CrossEntropyLoss()
 
-    metric_logger = MetricLogger(delimiter="  ")
+    metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
 
     model.eval()
@@ -649,6 +1069,15 @@ def evaluate(model, data_loader, device, args):
             current_step = sample_mcot_step if sample_mcot_step in mcot_steps else 'planning'
             mcot_context = {}
             
+            # Extract SeeTRUE-Feedback data if available for reflection step
+            step_data = batch.get('step_data', {})
+            if current_step == 'reflection' and i < len(step_data) if isinstance(step_data, list) else step_data:
+                sample_step_data = step_data[i] if isinstance(step_data, list) else step_data
+                if isinstance(sample_step_data, dict):
+                    seetrue_data = sample_step_data.get('seetrue_data')
+                    if seetrue_data:
+                        mcot_context['seetrue_data'] = seetrue_data
+            
             with torch.no_grad():
                 outputs = model(
                     mod_dict=sample_mod_dict,
@@ -682,22 +1111,27 @@ def evaluate(model, data_loader, device, args):
 
 def main(args):
     """Main training function."""
-    init_distributed_mode(args)
+    utils.init_distributed_mode(args)
 
     print(f"Job dir: {os.path.dirname(os.path.realpath(__file__))}")
     print("{}".format(args).replace(', ', ',\n'))
 
     device = torch.device(args.device)
-    seed = args.seed + get_rank()
+    
+    # Set num_tasks for distributed training - essential for data loading
+    num_tasks = utils.get_world_size()
+    args.num_tasks = num_tasks
+    
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     cudnn.benchmark = True
 
     # Setup data
-    train_loader, val_loader, modality_info = setup_mcot_data(args)
+    modality_info, data_loader_train, num_training_steps_per_epoch, data_loaders_val, data_loaders_fixed_eval = setup_data(args)
     
     # Setup model
-    model = get_mcot_model(args, modality_info)
+    model = get_model(args, modality_info)
     model.to(device)
 
     # Setup FSDP
@@ -722,7 +1156,7 @@ def main(args):
         )
 
     # Wrap with FSDP
-    if get_world_size() > 1:
+    if utils.get_world_size() > 1:
         model = FSDP(
             model,
             auto_wrap_policy=transformer_auto_wrap_policy,
@@ -740,21 +1174,20 @@ def main(args):
     )
 
     # Setup learning rate scheduler
-    num_training_steps_per_epoch = len(train_loader) // args.accum_iter
-    lr_schedule_values = cosine_scheduler(
-        args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
+    lr_schedule_values = utils.cosine_scheduler(
+        args.blr, args.min_blr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
     )
-    wd_schedule_values = cosine_scheduler(
+    wd_schedule_values = utils.cosine_scheduler(
         args.weight_decay, args.weight_decay, args.epochs, num_training_steps_per_epoch
     )
 
     # Setup loss scaler for mixed precision
-    loss_scaler = NativeScalerWithGradNormCount() if args.dtype in ['fp16', 'bf16'] else None
+    loss_scaler = utils.NativeScalerWithGradNormCount() if args.dtype in ['fp16', 'bf16'] else None
 
     # Setup logging
     log_writer = None
-    if HAS_WANDB and not args.disable_wandb and is_main_process():
+    if HAS_WANDB and args.log_wandb and utils.is_main_process():
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name or args.run_name,
@@ -773,7 +1206,7 @@ def main(args):
         
         # Train one epoch
         train_stats = train_one_epoch(
-            model, train_loader, optimizer, device, epoch, loss_scaler,
+            model, data_loader_train, optimizer, device, epoch, loss_scaler,
             max_norm=args.clip_grad, log_writer=log_writer,
             start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values,
@@ -785,8 +1218,8 @@ def main(args):
         )
         
         # Evaluate
-        if val_loader is not None:
-            val_stats = evaluate(model, val_loader, device, args)
+        if data_loaders_val is not None:
+            val_stats = evaluate(model, data_loaders_val, device, args)
             print(f"Validation loss: {val_stats['loss']:.4f}")
             
             if log_writer:
@@ -815,7 +1248,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    args = get_args().parse_args()
+    args = get_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

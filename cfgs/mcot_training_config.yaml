@@ -1,0 +1,59 @@
+# MCoT Training Configuration for SLURM/SCITAS
+# Based on 4M FSDP training with MCoT enhancements
+
+# Data configuration
+data_config: "cfgs/default/4m/data/mcot/mcot.yaml"
+text_tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
+
+# Model configuration
+model: "fm_base_12e_12d_swiglu_nobias"
+finetune: "https://huggingface.co/EPFL-VILAB/4M-7_B_CC12M/resolve/main/model.safetensors"
+input_size: 224
+patch_size: 16
+
+# Training configuration
+batch_size: 32
+epochs: 50
+accum_iter: 1
+blr: 5e-5  # Base learning rate
+weight_decay: 0.05
+min_lr: 1e-6
+
+# Token configuration
+num_input_tokens: 512
+num_target_tokens: 512
+min_input_tokens: 64
+min_target_tokens: 64
+
+# Scheduler configuration
+warmup_epochs: 5
+cooldown_epochs: 5
+
+# MCoT specific configuration
+mcot_steps: ["planning", "acting", "reflection", "correction"]
+mcot_planning_weight: 1.0
+mcot_acting_weight: 1.2
+mcot_reflection_weight: 1.5
+mcot_correction_weight: 1.3
+enable_mint_features: true
+
+# FSDP configuration
+use_act_checkpoint: true
+dtype: "bfloat16"
+clip_grad: 1.0
+
+# Evaluation configuration
+eval_freq: 5
+fixed_eval: true
+fixed_eval_input_tokens: 256
+fixed_eval_target_tokens: 256
+fixed_eval_batch_size: 16
+
+# Logging configuration
+save_ckpt_freq: 10
+log_wandb: true
+wandb_project: "4m-mcot-scitas"
+
+# System configuration
+num_workers: 5
+pin_mem: true

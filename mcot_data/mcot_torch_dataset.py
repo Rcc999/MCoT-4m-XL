@@ -90,9 +90,24 @@ class MCoTDataset(Dataset):
         
         # Prepare text for each MCoT step
         step_texts = {}
+        seetrue_data = None
+        
         for step in self.mcot_steps:
             step_text = sample.get(step, f"No {step} data available.")
             step_texts[step] = step_text
+            
+            # Extract SeeTRUE-Feedback data for reflection step
+            if step == 'reflection' and sample.get('dataset_source') == 'seetrue_feedback_as_mint_reflection':
+                seetrue_data = {
+                    'bbox_artifacts': sample.get('bbox_artifacts', []),
+                    'misalignment_detected': sample.get('misalignment_detected', False),
+                    'incorrect_objects': sample.get('incorrect_objects', []),
+                    'requires_correction': sample.get('requires_correction', False),
+                    'artifact_confidence': sample.get('artifact_confidence', 0.0),
+                    'caption_misalignment': sample.get('caption_misalignment', ''),
+                    'visual_misalignment': sample.get('visual_misalignment', ''),
+                    'human_feedback': sample.get('human_feedback', [])
+                }
         
         # Create modality dictionary for 4M model
         mod_dict = {
@@ -115,6 +130,7 @@ class MCoTDataset(Dataset):
             'mcot_step': sample.get('mcot_step', 'planning'),
             'step_texts': step_texts,
             'target_text': target_text,
+            'seetrue_data': seetrue_data,  # Include SeeTRUE-Feedback data for MINT reflection
             'num_input_tokens': self.num_input_tokens,
             'num_target_tokens': self.num_target_tokens
         }
@@ -155,6 +171,14 @@ class MCoTDataset(Dataset):
                     f'text_{step}': mod_dict.get(f'text_{step}', [''] * batch_size)
                 }
             }
+            
+            # Add SeeTRUE-Feedback data for reflection step
+            if step == 'reflection':
+                seetrue_batch = []
+                for sample in batch:
+                    seetrue_data = sample.get('seetrue_data')
+                    seetrue_batch.append(seetrue_data if seetrue_data else None)
+                step_data[step]['seetrue_data'] = seetrue_batch
         
         # Collect metadata
         image_ids = [sample['image_id'] for sample in batch]

@@ -24,6 +24,7 @@ from fourm.data import (CenterCropImageAugmenter, EmptyAugmenter,
                   build_wds_fm_pretraining_dataloader)
 from fourm.data.modality_transforms import CaptionTransform
 from fourm.data.modality_info import MODALITY_TRANSFORMS
+from fourm.data.mcot_dataset import build_mcot_pretraining_dataloader
 from .image_augmenter import (
     AbstractImageAugmenter, RandomCropImageAugmenter, PreTokenizedImageAugmenter, 
     CenterCropImageAugmenter, NoImageAugmenter, PaddingImageAugmenter,
@@ -188,6 +189,32 @@ def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_t
             shuffle_buffer_load=dataset_config.get('shuffle_buffer_load', 1_000),
             shuffle_seed=0,
         )
+    
+    elif dataset_config['type'] == 'mcot':
+        
+        # Find the image domain key (e.g., 'rgb@224')
+        image_domain_key = next((d for d in all_domains if d.startswith('rgb')), None)
+        if image_domain_key is None:
+            print("Warning: No domain starting with 'rgb' found in all_domains. Using default for image_augmenter.")
+            image_augmenter_instance = RandomCropImageAugmenter(target_size=input_size)
+        else:
+            image_augmenter_instance = RandomCropImageAugmenter(target_size=input_size, main_domain=image_domain_key)
+
+        loader = build_mcot_pretraining_dataloader(
+            data_path=dataset_config['data_path'], 
+            all_domains=all_domains,
+            modality_info=modality_info, 
+            modality_transforms=modality_transforms,
+            image_augmenter=image_augmenter_instance,
+            text_tokenizer=text_tokenizer,
+            input_tokens_range=(num_input_tokens, num_input_tokens),
+            target_tokens_range=(num_target_tokens, num_target_tokens),
+            num_gpus=num_tasks, 
+            num_workers=num_workers,
+            batch_size=dataset_batch_size, 
+            split='train'
+        )
+        
     else:
         raise NotImplementedError(f'Dataset type {dataset_config["type"]} not implemented.')
 
@@ -304,6 +331,41 @@ def get_val_dataloader(dataset_config, dataset_name, train_configs, modality_inf
             rename_text_to_caption=use_text_to_caption_transform, 
             shuffle_buffer_load=cfgs_get('shuffle_buffer_load', dataset_config, dataset_name, train_configs, 1_000),
             shuffle_seed=0,
+        )
+
+    elif dataset_type == 'mcot':
+
+        # Find the image domain key for validation
+        image_domain_key_val = next((d for d in all_domains if d.startswith('rgb')), None)
+        if image_domain_key_val is None:
+             print("Warning: No domain starting with 'rgb' found in all_domains for validation. Using default.")
+             eval_image_augmenter = CenterCropImageAugmenter(target_size=input_size)
+        else:
+             eval_image_augmenter = CenterCropImageAugmenter(target_size=input_size, main_domain=image_domain_key_val)
+
+        if fixed_eval:
+            input_tokens_range=(fixed_eval_input_tokens, fixed_eval_input_tokens)
+            target_tokens_range=(fixed_eval_target_tokens, fixed_eval_target_tokens)
+        else:
+            # Input and target token ranges
+            num_input_tokens = dataset_config.get('num_input_tokens', num_input_tokens)
+            num_target_tokens = dataset_config.get('num_target_tokens', num_target_tokens)
+            input_tokens_range = (num_input_tokens, num_input_tokens)
+            target_tokens_range = (num_target_tokens, num_target_tokens)
+
+        loader = build_mcot_pretraining_dataloader(
+            data_path=cfgs_get('data_path', dataset_config, dataset_name, train_configs), 
+            all_domains=all_domains,
+            modality_info=modality_info, 
+            modality_transforms=modality_transforms,
+            image_augmenter=eval_image_augmenter,
+            text_tokenizer=text_tokenizer,
+            input_tokens_range=input_tokens_range,
+            target_tokens_range=target_tokens_range,
+            num_gpus=num_tasks, 
+            num_workers=num_workers,
+            batch_size=batch_size, 
+            split='val'
         )
 
     else:
