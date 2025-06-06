@@ -380,6 +380,58 @@ MODALITY_INFO = {
         'id': generate_uint15_hash('tok_clip@448'),
         'pretokenized': True,
     },
+    
+    # MCoT step modalities
+    'planning': {
+        'vocab_size': 30_000,
+        'encoder_embedding': partial(SequenceEncoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'decoder_embedding': partial(SequenceDecoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'min_tokens': 0,
+        'max_tokens': 512,
+        'type': 'seq',
+        'id': generate_uint15_hash('planning'),
+        'shared_vocab': ['caption'],
+    },
+    'acting': {
+        'vocab_size': 30_000,
+        'encoder_embedding': partial(SequenceEncoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'decoder_embedding': partial(SequenceDecoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'min_tokens': 0,
+        'max_tokens': 512,
+        'type': 'seq',
+        'id': generate_uint15_hash('acting'),
+        'shared_vocab': ['caption'],
+    },
+    'reflection': {
+        'vocab_size': 30_000,
+        'encoder_embedding': partial(SequenceEncoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'decoder_embedding': partial(SequenceDecoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'min_tokens': 0,
+        'max_tokens': 512,
+        'type': 'seq',
+        'id': generate_uint15_hash('reflection'),
+        'shared_vocab': ['caption'],
+    },
+    'correction': {
+        'vocab_size': 30_000,
+        'encoder_embedding': partial(SequenceEncoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'decoder_embedding': partial(SequenceDecoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'min_tokens': 0,
+        'max_tokens': 512,
+        'type': 'seq',
+        'id': generate_uint15_hash('correction'),
+        'shared_vocab': ['caption'],
+    },
+    'final_response': {
+        'vocab_size': 30_000,
+        'encoder_embedding': partial(SequenceEncoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'decoder_embedding': partial(SequenceDecoderEmbedding, vocab_size=30_000, max_length=512, padding_idx=0),
+        'min_tokens': 0,
+        'max_tokens': 512,
+        'type': 'seq',
+        'id': generate_uint15_hash('final_response'),
+        'shared_vocab': ['caption'],
+    },
 }
 
 # Note: @res suffix is ignored for modality transforms
@@ -405,6 +457,12 @@ MODALITY_TRANSFORMS = {
     'tok_imagebind': TokTransform(),
     'tok_dinov2_global': TokTransform(),
     'tok_imagebind_global': TokTransform(),
+    # MCoT step transforms
+    'planning': CaptionTransform(aligned_captions=True),
+    'acting': CaptionTransform(aligned_captions=True),
+    'reflection': CaptionTransform(aligned_captions=True),
+    'correction': CaptionTransform(aligned_captions=True),
+    'final_response': CaptionTransform(aligned_captions=True),
     # Other
     'mask_valid': MaskTransform(mask_pool_size=1),
 }

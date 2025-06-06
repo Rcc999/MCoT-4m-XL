@@ -14,10 +14,11 @@ patch_size: 16
 # Training configuration
 batch_size: 32
 epochs: 50
+epoch_size: 90  # Number of training steps per epoch (matches our 90 training examples)
 accum_iter: 1
 blr: 5e-5  # Base learning rate
 weight_decay: 0.05
-min_lr: 1e-6
+min_blr: 1e-6
 
 # Token configuration
 num_input_tokens: 512
@@ -30,7 +31,7 @@ warmup_epochs: 5
 cooldown_epochs: 5
 
 # MCoT specific configuration
-mcot_steps: ["planning", "acting", "reflection", "correction"]
+mcot_steps: "planning,acting,reflection,correction"
 mcot_planning_weight: 1.0
 mcot_acting_weight: 1.2
 mcot_reflection_weight: 1.5

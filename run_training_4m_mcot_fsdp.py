@@ -426,21 +426,34 @@ def setup_data(args):
 
 
 def get_model(args, modality_info):
-    """Create and enhance 4M model with MCoT capabilities - simplified version."""
-    print(f"Creating model: {args.model}")
-    
-    # Create base 4M model using standard factory
+    """Creates and returns model from arguments with MCoT capabilities"""
+    print(f"Creating model: {args.model} for modalities {list(modality_info.keys())}")
+
+    encoder_embeddings = {}
+    for mod in args.in_domains:
+        info = modality_info[mod]
+        if info.get("encoder_embedding", None) is not None:
+            if info["type"] == "img":
+                image_size, patch_size = info.get('input_size', args.input_size), info.get('patch_size', args.patch_size)
+                encoder_embeddings[mod] = info["encoder_embedding"](patch_size=patch_size, image_size=image_size)
+            else:
+                encoder_embeddings[mod] = info["encoder_embedding"]()
+
+    decoder_embeddings = {}
+    for mod in args.out_domains:
+        info = modality_info[mod]
+        if info.get("decoder_embedding", None) is not None:
+            if info["type"] == "img":
+                image_size, patch_size = info.get('input_size', args.input_size), info.get('patch_size', args.patch_size)
+                decoder_embeddings[mod] = info["decoder_embedding"](patch_size=patch_size, image_size=image_size)
+            else:
+                decoder_embeddings[mod] = info["decoder_embedding"]()
+
     model = create_model(
         args.model,
-        input_size=args.input_size,
-        patch_size=args.patch_size,
-        drop_path_rate=getattr(args, 'drop_path', 0.0),
-        drop_rate=getattr(args, 'drop', 0.0),
-        attn_drop_rate=getattr(args, 'attn_drop_rate', 0.0),
-        head_drop_rate=getattr(args, 'head_drop_rate', 0.0),
+        encoder_embeddings=encoder_embeddings,
+        decoder_embeddings=decoder_embeddings,
         modality_info=modality_info,
-        num_input_tokens=args.num_input_tokens,
-        num_target_tokens=args.num_target_tokens,
         num_register_tokens=args.num_register_tokens,
     )
     
@@ -463,35 +476,18 @@ def get_model(args, modality_info):
         # Wrap model with MCoT capabilities
         model = add_mcot_to_model(model, mcot_processor)
     
-    # Load pretrained weights if specified
-    if args.finetune:
-        print(f"Loading pretrained model from: {args.finetune}")
-        if args.finetune.endswith('.safetensors'):
-            state_dict = load_safetensors(args.finetune)
-        else:
-            checkpoint = torch.load(args.finetune, map_location='cpu')
-            if 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            elif 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            else:
-                state_dict = checkpoint
-        
-        # Load with strict=False to allow for new MCoT parameters
-        msg = model.load_state_dict(state_dict, strict=False)
-        print(f"Loaded checkpoint with message: {msg}")
-    
     return model
 
 
 def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = None,
-                    log_writer=None, lr_scheduler=None, start_steps=None, lr_schedule_values=None,
-                    wd_schedule_values=None, num_training_steps_per_epoch=None, update_freq=None,
-                    use_amp=False, args=None):
-    """Train one epoch following base script structure with MCoT enhancements."""
+                    num_input_tokens: int, num_target_tokens: int, loss_type: str, device: torch.device, epoch: int, 
+                    frozen_model_epochs: int, accum_iter, max_norm: float = None, log_writer=None,
+                    lr_scheduler=None, start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
+                    all_domains: List[str] = [], dtype: torch.dtype = torch.float16, loader_len: Optional[int] = None,
+                    output_dir=None, total_batch_size=None, skip_nan_grad=False, args=None):
+    """Train one epoch following original FSDP script structure with MCoT enhancements."""
     
-    model.train(True)
+    model.train()
     
     # Handle frozen model epochs if specified
     frozen_model_epochs = getattr(args, 'frozen_model_epochs', 0)
@@ -520,14 +516,14 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
     optimizer.zero_grad()
     
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        step = data_iter_step // update_freq
-        if step >= num_training_steps_per_epoch:
+        step = data_iter_step // accum_iter
+        if step >= loader_len:
             continue
         
         it = start_steps + step  # global training iteration
         
         # Update learning rate and weight decay
-        if data_iter_step % update_freq == 0:
+        if data_iter_step % accum_iter == 0:
             if lr_schedule_values is not None:
                 for param_group in optimizer.param_groups:
                     if lr_schedule_values[it] is not None:
@@ -561,11 +557,11 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
                 if modality in args.all_domains
             }
         
-        update_grad = (data_iter_step + 1) % update_freq == 0
+        update_grad = (data_iter_step + 1) % accum_iter == 0
         
         # Use gradient sync context for FSDP
         with nullcontext() if update_grad else model.no_sync():
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.cuda.amp.autocast(dtype=dtype, enabled=dtype != torch.float32):
                 # Forward pass with MCoT support
                 if hasattr(model, 'mcot_processor') and mcot_step:
                     # MCoT-enhanced forward pass
@@ -605,7 +601,7 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
                     torch.save(mod_dict, os.path.join(args.output_dir, "debug_mod_dict.pt"))
                 sys.exit(1)
             
-            loss = loss / update_freq
+            loss = loss / accum_iter
             loss.backward()
             
             if update_grad:
@@ -691,12 +687,13 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
 
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, args):
+def evaluate(model, data_loader, device, num_input_tokens, num_target_tokens, loss_type,
+             all_domains: List[str], dtype: torch.dtype = torch.float16, prefix="[Eval] "):
     """Evaluate model following base script structure."""
     model.eval()
     
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Test:'
+    header = prefix
     
     for batch in metric_logger.log_every(data_loader, 10, header):
         # Prepare batch data - handle both formats
@@ -710,7 +707,7 @@ def evaluate(model, data_loader, device, args):
             mod_dict = {
                 modality: {k: v.to(device, non_blocking=True) for k, v in d.items()}
                 for modality, d in batch.items()
-                if modality in args.all_domains
+                if modality in all_domains
             }
             mcot_step = None
             mcot_context = {}
@@ -720,18 +717,18 @@ def evaluate(model, data_loader, device, args):
             if hasattr(model, 'mcot_processor') and mcot_step:
                 outputs = model(
                     mod_dict,
-                    num_encoder_tokens=args.num_input_tokens,
-                    num_decoder_tokens=args.num_target_tokens,
+                    num_encoder_tokens=num_input_tokens,
+                    num_decoder_tokens=num_target_tokens,
                     mcot_step=mcot_step,
                     mcot_context=mcot_context,
-                    loss_type=args.loss_type
+                    loss_type=loss_type
                 )
             else:
                 outputs = model(
                     mod_dict,
-                    num_encoder_tokens=args.num_input_tokens,
-                    num_decoder_tokens=args.num_target_tokens,
-                    loss_type=args.loss_type
+                    num_encoder_tokens=num_input_tokens,
+                    num_decoder_tokens=num_target_tokens,
+                    loss_type=loss_type
                 )
             
             # Extract loss
@@ -798,317 +795,6 @@ def compute_mcot_total_loss(step_losses, step_weights=None):
     return total_loss / total_weight if total_weight > 0 else total_loss
 
 
-def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = None,
-                    log_writer=None, lr_scheduler=None, start_steps=None, lr_schedule_values=None,
-                    wd_schedule_values=None, num_training_steps_per_epoch=None, update_freq=None,
-                    use_amp=False, args=None):
-    """Train one epoch with MCoT-specific processing."""
-    
-    model.train(True)
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', "{:.8f}")
-    metric_logger.add_meter('min_lr', "{:.8f}")
-    # Add MCoT-specific metrics
-    metric_logger.add_meter('seetrue_usage', "{:.3f}")
-    metric_logger.add_meter('reflection_enhanced', "{:.3f}")
-    header = f'Epoch: [{epoch}]'
-    print_freq = 10
-    
-    if loss_scaler is None:
-        model.zero_grad()
-        model.micro_steps = 0
-    else:
-        optimizer.zero_grad()
-
-    # Setup MCoT step weights
-    mcot_step_weights = {
-        'planning': args.mcot_planning_weight,
-        'acting': args.mcot_acting_weight,
-        'reflection': args.mcot_reflection_weight,
-        'correction': args.mcot_correction_weight
-    }
-    
-    mcot_steps = args.mcot_steps.split(',')
-    mcot_steps = [step.strip() for step in mcot_steps]
-    
-    # Track SeeTRUE-Feedback usage for monitoring
-    seetrue_usage_count = 0
-    reflection_enhanced_count = 0
-    total_reflection_samples = 0
-    
-    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        
-        step = data_iter_step // update_freq
-        if step >= num_training_steps_per_epoch:
-            continue
-        
-        it = start_steps + step  # global training iteration
-        
-        # Update learning rate and weight decay
-        if lr_schedule_values is not None:
-            for param_group in optimizer.param_groups:
-                if lr_schedule_values[it] is not None:
-                    param_group['lr'] = lr_schedule_values[it]
-        if wd_schedule_values is not None and len(wd_schedule_values) > it:
-            for param_group in optimizer.param_groups:
-                param_group['weight_decay'] = wd_schedule_values[it]
-
-        # Parse batch data from collate function output
-        # The collate function returns a dictionary with keys: 'mod_dict', 'image_ids', 'mcot_steps', 'target_texts', 'step_data', etc.
-        if not isinstance(batch, dict):
-            print(f"Warning: Expected batch to be dict, got {type(batch)}. Skipping batch.")
-            continue
-            
-        mod_dict = batch.get('mod_dict', {})
-        mcot_steps_batch = batch.get('mcot_steps', [])
-        target_texts_batch = batch.get('target_texts', [])
-        step_data = batch.get('step_data', {})
-        batch_size = batch.get('batch_size', len(mcot_steps_batch))
-        
-        if not mod_dict or not mcot_steps_batch:
-            print("Warning: Empty batch data, skipping.")
-            continue
-        
-        # Process each sample in the batch
-        batch_loss = 0.0
-        batch_samples = 0
-        
-        for i in range(batch_size):
-            if i >= len(mcot_steps_batch) or i >= len(target_texts_batch):
-                continue
-                
-            sample_mcot_step = mcot_steps_batch[i]
-            sample_target_text = target_texts_batch[i]
-            
-            # Create sample mod_dict
-            sample_mod_dict = {}
-            for modality, batch_data in mod_dict.items():
-                if isinstance(batch_data, torch.Tensor):
-                    sample_mod_dict[modality] = batch_data[i:i+1]  # Keep batch dimension
-                elif isinstance(batch_data, list) and i < len(batch_data):
-                    sample_mod_dict[modality] = [batch_data[i]]
-                else:
-                    sample_mod_dict[modality] = batch_data
-            
-            # Process MCoT step for this sample
-            step_losses = {}
-            
-            # Use the current step as specified in batch or default to planning
-            current_step = sample_mcot_step if sample_mcot_step in mcot_steps else 'planning'
-            
-            # Setup context for MCoT processing
-            mcot_context = {}
-            
-            # Extract SeeTRUE-Feedback data if available for reflection step
-            seetrue_data = None
-            if current_step == 'reflection' and step_data:
-                total_reflection_samples += 1
-                
-                # step_data is a dict with step names as keys
-                reflection_step_data = step_data.get('reflection', {})
-                if reflection_step_data and 'seetrue_data' in reflection_step_data:
-                    seetrue_batch = reflection_step_data['seetrue_data']
-                    if isinstance(seetrue_batch, list) and i < len(seetrue_batch):
-                        seetrue_data = seetrue_batch[i]
-                    elif not isinstance(seetrue_batch, list):
-                        seetrue_data = seetrue_batch
-                        
-                    if seetrue_data:
-                        mcot_context['seetrue_data'] = seetrue_data
-                        seetrue_usage_count += 1
-                        reflection_enhanced_count += 1
-                        # Log SeeTRUE usage for monitoring
-                        if args.enable_mint_features:
-                            print(f"✅ Using SeeTRUE-Feedback data for reflection training on sample {i}")
-            
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                # Forward pass for this step with enhanced context
-                outputs = model(
-                    mod_dict=sample_mod_dict,
-                    num_encoder_tokens=args.num_input_tokens,
-                    num_decoder_tokens=args.num_target_tokens,
-                    mcot_step=current_step,
-                    mcot_context=mcot_context
-                )
-                
-                # Extract loss from outputs
-                if isinstance(outputs, tuple) and len(outputs) >= 2:
-                    step_loss = outputs[0]  # loss is first element
-                elif hasattr(outputs, 'loss'):
-                    step_loss = outputs.loss
-                else:
-                    # Skip if no loss can be computed
-                    continue
-                
-                # Weight the step loss
-                weighted_step_loss = step_loss * mcot_step_weights.get(current_step, 1.0)
-                step_losses[current_step] = weighted_step_loss
-            
-            # Add sample loss to batch
-            if step_losses:
-                sample_loss = sum(step_losses.values()) / len(step_losses)
-                batch_loss += sample_loss
-                batch_samples += 1
-        
-        # Compute final batch loss
-        if batch_samples > 0:
-            loss = batch_loss / batch_samples
-        else:
-            # Skip batch if no valid samples
-            continue
-        
-        loss_value = loss.item()
-        
-        if not np.isfinite(loss_value):
-            print(f"Loss is {loss_value}, stopping training")
-            sys.exit(1)
-
-        # Backward pass
-        if loss_scaler is not None:
-            # Use mixed precision training
-            loss_scaler(loss, optimizer, clip_grad=max_norm,
-                       parameters=model.parameters(), create_graph=False,
-                       update_grad=(data_iter_step + 1) % update_freq == 0)
-            if (data_iter_step + 1) % update_freq == 0:
-                optimizer.zero_grad()
-        else:
-            # Standard training
-            loss.backward()
-            if (data_iter_step + 1) % update_freq == 0:
-                if max_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-
-        torch.cuda.synchronize()
-
-        # Update metrics
-        metric_logger.update(loss=loss_value)
-        for step_name, step_loss in step_losses.items():
-            metric_logger.update(**{f'loss_{step_name}': step_loss.item()})
-        
-        # Update SeeTRUE usage metrics
-        if total_reflection_samples > 0:
-            seetrue_usage_rate = seetrue_usage_count / total_reflection_samples
-            reflection_enhanced_rate = reflection_enhanced_count / total_reflection_samples
-            metric_logger.update(seetrue_usage=seetrue_usage_rate)
-            metric_logger.update(reflection_enhanced=reflection_enhanced_rate)
-        
-        min_lr = 10.
-        max_lr = 0.
-        for group in optimizer.param_groups:
-            min_lr = min(min_lr, group["lr"])
-            max_lr = max(max_lr, group["lr"])
-
-        metric_logger.update(lr=max_lr)
-        metric_logger.update(min_lr=min_lr)
-        
-        # Log to wandb
-        if log_writer is not None and (data_iter_step + 1) % update_freq == 0:
-            log_writer.update(loss=loss_value, head="loss")
-            for step_name, step_loss in step_losses.items():
-                log_writer.update(**{f'loss_{step_name}': step_loss.item()}, head="loss")
-            log_writer.update(lr=max_lr, head="opt")
-            log_writer.update(min_lr=min_lr, head="opt")
-            log_writer.set_step()
-
-    # Gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-
-@torch.no_grad()
-def evaluate(model, data_loader, device, args):
-    """Evaluate model on validation set."""
-    criterion = torch.nn.CrossEntropyLoss()
-
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Test:'
-
-    model.eval()
-    mcot_steps = args.mcot_steps.split(',')
-    mcot_steps = [step.strip() for step in mcot_steps]
-
-    for batch in metric_logger.log_every(data_loader, 10, header):
-        # Parse batch data from collate function output
-        if not isinstance(batch, dict):
-            continue
-            
-        mod_dict = batch.get('mod_dict', {})
-        mcot_steps_batch = batch.get('mcot_steps', [])
-        target_texts_batch = batch.get('target_texts', [])
-        batch_size = batch.get('batch_size', len(mcot_steps_batch))
-        
-        if not mod_dict or not mcot_steps_batch:
-            continue
-        
-        # Process each sample in the batch
-        batch_loss = 0.0
-        batch_samples = 0
-        
-        for i in range(batch_size):
-            if i >= len(mcot_steps_batch) or i >= len(target_texts_batch):
-                continue
-                
-            sample_mcot_step = mcot_steps_batch[i]
-            sample_target_text = target_texts_batch[i]
-            
-            # Create sample mod_dict
-            sample_mod_dict = {}
-            for modality, batch_data in mod_dict.items():
-                if isinstance(batch_data, torch.Tensor):
-                    sample_mod_dict[modality] = batch_data[i:i+1]
-                elif isinstance(batch_data, list) and i < len(batch_data):
-                    sample_mod_dict[modality] = [batch_data[i]]
-                else:
-                    sample_mod_dict[modality] = batch_data
-            
-            # Process MCoT step for this sample
-            current_step = sample_mcot_step if sample_mcot_step in mcot_steps else 'planning'
-            mcot_context = {}
-            
-            # Extract SeeTRUE-Feedback data if available for reflection step
-            step_data = batch.get('step_data', {})
-            if current_step == 'reflection' and i < len(step_data) if isinstance(step_data, list) else step_data:
-                sample_step_data = step_data[i] if isinstance(step_data, list) else step_data
-                if isinstance(sample_step_data, dict):
-                    seetrue_data = sample_step_data.get('seetrue_data')
-                    if seetrue_data:
-                        mcot_context['seetrue_data'] = seetrue_data
-            
-            with torch.no_grad():
-                outputs = model(
-                    mod_dict=sample_mod_dict,
-                    num_encoder_tokens=args.num_input_tokens,
-                    num_decoder_tokens=args.num_target_tokens,
-                    mcot_step=current_step,
-                    mcot_context=mcot_context
-                )
-                
-                if isinstance(outputs, tuple) and len(outputs) >= 2:
-                    step_loss = outputs[0]
-                elif hasattr(outputs, 'loss'):
-                    step_loss = outputs.loss
-                else:
-                    continue
-                
-                batch_loss += step_loss
-                batch_samples += 1
-        
-        # Update metrics for this batch
-        if batch_samples > 0:
-            avg_batch_loss = batch_loss / batch_samples
-            metric_logger.update(loss=avg_batch_loss.item())
-
-    # Gather stats
-    metric_logger.synchronize_between_processes()
-    print('* Loss {losses.global_avg:.3f}'.format(losses=metric_logger.loss))
-
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-
 def main(args):
     """Main training function."""
     utils.init_distributed_mode(args)
@@ -1127,11 +813,77 @@ def main(args):
     np.random.seed(seed)
     cudnn.benchmark = True
 
+    # Set up dtype
+    if args.dtype in ['float16', 'fp16']:
+        dtype = torch.float16
+    elif args.dtype in ['bfloat16', 'bf16']:
+        dtype = torch.bfloat16
+    elif args.dtype in ['float32', 'fp32']:
+        dtype = torch.float32
+    else:
+        raise ValueError(f"Invalid dtype: {args.dtype}")
+
     # Setup data
     modality_info, data_loader_train, num_training_steps_per_epoch, data_loaders_val, data_loaders_fixed_eval = setup_data(args)
     
     # Setup model
     model = get_model(args, modality_info)
+    
+    ## Starting from pre-trained model (following the original FSDP script pattern)
+    if args.finetune:
+        actual_model_state_dict = None
+        if args.finetune.endswith('.safetensors'):
+            print(f"Loading .safetensors file from: {args.finetune}")
+            if args.finetune.startswith('https'):
+                hub_dir = torch.hub.get_dir()
+                os.makedirs(hub_dir, exist_ok=True) # Ensure hub directory exists
+                
+                url_path = args.finetune.split('?')[0]
+                filename = os.path.basename(url_path)
+                if not filename: 
+                    filename = "downloaded_model.safetensors" # Fallback filename
+                
+                cached_file_path = os.path.join(hub_dir, filename)
+                
+                if not os.path.exists(cached_file_path):
+                    print(f"Downloading {args.finetune} to {cached_file_path}...")
+                    torch.hub.download_url_to_file(args.finetune, dst=cached_file_path, progress=True)
+                    print(f"Downloaded to: {cached_file_path}")
+                else:
+                    print(f"Using cached file: {cached_file_path}")
+                
+                file_to_load = cached_file_path
+            else: # Local .safetensors file
+                file_to_load = args.finetune
+            # load_safetensors typically returns (state_dict, config_dict)
+            actual_model_state_dict, _ = load_safetensors(file_to_load)
+        else: # Original logic for .pth/.pt files or other URL types
+            print(f"Loading non-safetensors checkpoint from: {args.finetune}")
+            loaded_checkpoint_data = None
+            if args.finetune.startswith('https'):
+                loaded_checkpoint_data = torch.hub.load_state_dict_from_url(
+                    args.finetune, map_location='cpu', progress=True)
+            else:
+                loaded_checkpoint_data = torch.load(args.finetune, map_location='cpu')
+            
+            # Check if loaded_checkpoint_data is the state_dict or contains it under 'model' key
+            if 'model' in loaded_checkpoint_data and isinstance(loaded_checkpoint_data['model'], dict):
+                actual_model_state_dict = loaded_checkpoint_data['model']
+            elif isinstance(loaded_checkpoint_data, dict): # Assume it's the state_dict itself
+                actual_model_state_dict = loaded_checkpoint_data
+            else:
+                raise ValueError(f"Cannot determine model state_dict from {args.finetune}. Loaded data type: {type(loaded_checkpoint_data)}")
+
+        if actual_model_state_dict is None:
+            raise ValueError(f"Failed to load or resolve model state_dict from {args.finetune}")
+
+        # Remove pos_emb
+        final_state_dict = {k: v for k, v in actual_model_state_dict.items() if ".pos_emb" not in k}
+        
+        print("Attempting to load state_dict. Missing keys / unexpected keys (if any) will be shown below:")
+        msg = model.load_state_dict(final_state_dict, strict=False)
+        print(msg)
+    
     model.to(device)
 
     # Setup FSDP
@@ -1140,64 +892,140 @@ def main(args):
     print(f"Model = {args.model}")
     print(f"Number of params: {n_parameters / 1e6:.1f}M")
 
-    # Setup mixed precision
-    mp_policy = None
-    if args.dtype in ['fp16', 'float16']:
-        mp_policy = MixedPrecision(
-            param_dtype=torch.float16,
-            reduce_dtype=torch.float16,
-            buffer_dtype=torch.float16,
-        )
-    elif args.dtype in ['bf16', 'bfloat16']:
-        mp_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        )
+    # Setup dtype for training
+    if args.dtype in ['float16', 'fp16']:
+        dtype = torch.float16
+    elif args.dtype in ['bfloat16', 'bf16']:
+        dtype = torch.bfloat16
+    elif args.dtype in ['float32', 'fp32']:
+        dtype = torch.float32
+    else:
+        raise ValueError(f"Invalid dtype: {args.dtype}")
 
-    # Wrap with FSDP
-    if utils.get_world_size() > 1:
-        model = FSDP(
-            model,
-            auto_wrap_policy=transformer_auto_wrap_policy,
-            mixed_precision=mp_policy,
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            cpu_offload=None,
-            limit_all_gathers=True,
-            device_id=torch.cuda.current_device(),
-        )
+    # Calculate total batch size for training
+    total_batch_size = args.batch_size * args.accum_iter * utils.get_world_size()
+    args.lr = args.blr * total_batch_size / 256
+    args.min_lr = args.min_blr * total_batch_size / 256
+    if hasattr(args, 'frozen_model_blr') and args.frozen_model_blr > 0:
+        args.frozen_model_lr = args.frozen_model_blr * total_batch_size / 256
 
-    # Setup optimizer
-    optimizer = create_optimizer(
-        args, model_without_ddp if hasattr(model, 'module') else model
+    ## FSDP wrapping and sharding        
+    fm_auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            Block, DecoderBlock,
+        },
     )
 
-    # Setup learning rate scheduler
-    lr_schedule_values = utils.cosine_scheduler(
-        args.blr, args.min_blr, args.epochs, num_training_steps_per_epoch,
-        warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
-    )
-    wd_schedule_values = utils.cosine_scheduler(
-        args.weight_decay, args.weight_decay, args.epochs, num_training_steps_per_epoch
-    )
+    sharding_strategy: ShardingStrategy = ShardingStrategy.SHARD_GRAD_OP  #for Zero2 and FULL_SHARD for Zero3
+    
+    if dtype == torch.bfloat16:
+        # Only reduced grads are in bf16 here, autocast will do the job for params
+        mp_policy = MixedPrecision(reduce_dtype=torch.bfloat16)
+    else:
+        mp_policy = None # defaults to fp32
 
-    # Setup loss scaler for mixed precision
+    # model is on CPU before input to FSDP
+    model = FSDP(model,
+        auto_wrap_policy=fm_auto_wrap_policy,
+        mixed_precision=mp_policy,
+        sharding_strategy=sharding_strategy,
+        device_id=torch.cuda.current_device(),
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        use_orig_params=True)
+
+    optimizer = create_optimizer(args, model)
+    # No scaler defined for FSDP 
+
+    # Activation checkpointing
+    if args.use_act_checkpoint:
+        non_reentrant_wrapper = functools.partial(
+        checkpoint_wrapper,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        )
+
+        check_fn = lambda submodule: isinstance(submodule, Block) or isinstance(submodule, DecoderBlock)
+
+        apply_activation_checkpointing(
+        model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
+
+    print(f"FSDP Model = %s" % str(model))
+
+    ## LR and WD schedules
+    if args.weight_decay_end is None:
+        args.weight_decay_end = args.weight_decay
+
+    if args.frozen_model_epochs > 0:
+        frozen_lr_schedule_values = utils.constant_scheduler(args.frozen_model_lr, args.frozen_model_epochs, num_training_steps_per_epoch)
+        frozen_wd_schedule_values = utils.constant_scheduler(args.weight_decay, args.frozen_model_epochs, num_training_steps_per_epoch)
+        main_schedule_epochs = args.epochs - args.frozen_model_epochs
+    else:
+        frozen_lr_schedule_values = np.array([]) 
+        frozen_wd_schedule_values = np.array([])
+        main_schedule_epochs = args.epochs
+
+    if args.scheduler == 'cosine':
+        main_lr_schedule_values = utils.cosine_scheduler(
+            args.lr, args.min_lr, main_schedule_epochs, num_training_steps_per_epoch, 
+            warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps
+        )
+        wd_schedule_values = utils.cosine_scheduler(
+            args.weight_decay, args.weight_decay_end, main_schedule_epochs, num_training_steps_per_epoch
+        )
+    elif 'inverse_sqrt' in args.scheduler:
+        try:
+            timescale = int(args.scheduler.split('-')[-1])
+        except:
+            timescale = 10_000
+        main_lr_schedule_values = utils.inverse_sqrt_scheduler(
+            args.lr, args.min_lr, main_schedule_epochs, num_training_steps_per_epoch, 
+            warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
+            cooldown_epochs=args.cooldown_epochs, cooldown_steps=args.cooldown_steps,
+            timescale=timescale
+        )
+        wd_schedule_values = utils.inverse_sqrt_scheduler(
+            args.weight_decay, args.weight_decay_end, main_schedule_epochs, num_training_steps_per_epoch,
+            cooldown_epochs=args.cooldown_epochs, cooldown_steps=args.cooldown_steps,
+            timescale=timescale
+        )
+    else:
+        raise NotImplementedError(f"Scheduler {args.scheduler} not implemented.")
+    
+    lr_schedule_values = np.concatenate((frozen_lr_schedule_values, main_lr_schedule_values))
+    wd_schedule_values = np.concatenate((frozen_wd_schedule_values, wd_schedule_values))
+    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
+
+    # Setup loss scaler for mixed precision (not used in FSDP but kept for compatibility)
     loss_scaler = utils.NativeScalerWithGradNormCount() if args.dtype in ['fp16', 'bf16'] else None
 
     # Setup logging
     log_writer = None
-    if HAS_WANDB and args.log_wandb and utils.is_main_process():
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name or args.run_name,
-            config=vars(args)
-        )
-        log_writer = wandb
+    if utils.is_main_process():
+        if args.log_wandb:
+            try:
+                import wandb
+                wandb.init(
+                    project=args.wandb_project,
+                    name=args.wandb_run_name if args.wandb_run_name != 'auto' else args.run_name,
+                    entity=args.wandb_entity,
+                    config=vars(args)
+                )
+                log_writer = utils.WandbLogger()
+                print("Wandb logging enabled")
+            except Exception as e:
+                print(f"Failed to initialize wandb: {e}")
+                log_writer = None
+        else:
+            log_writer = utils.TensorboardLogger(log_dir=args.output_dir)
+            print("Tensorboard logging enabled")
 
     # Create output directory
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Auto-load from checkpoint
+    fsdp_utils.auto_load_model_fsdp(
+        args=args, model=model, optimizer=optimizer)
 
     # Training loop
     print(f"Start training for {args.epochs} epochs")
@@ -1205,42 +1033,85 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         
         # Train one epoch
+        if log_writer is not None:
+            log_writer.set_step(epoch * num_training_steps_per_epoch)
         train_stats = train_one_epoch(
-            model, data_loader_train, optimizer, device, epoch, loss_scaler,
-            max_norm=args.clip_grad, log_writer=log_writer,
+            model=model,
+            data_loader=data_loader_train,
+            optimizer=optimizer,
+            num_input_tokens=args.num_input_tokens,
+            num_target_tokens=args.num_target_tokens,
+            loss_type=args.loss_type,
+            device=device,
+            epoch=epoch,
+            frozen_model_epochs=args.frozen_model_epochs,
+            accum_iter=args.accum_iter,
+            max_norm=args.clip_grad,
+            log_writer=log_writer,
             start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values,
             wd_schedule_values=wd_schedule_values,
-            num_training_steps_per_epoch=num_training_steps_per_epoch,
-            update_freq=args.accum_iter,
-            use_amp=(args.dtype in ['fp16', 'bf16']),
+            all_domains=args.all_domains,
+            dtype=dtype,
+            loader_len=num_training_steps_per_epoch,
+            output_dir=args.output_dir,
+            total_batch_size=total_batch_size,
+            skip_nan_grad=args.skip_nan_grad,
             args=args
         )
         
         # Evaluate
-        if data_loaders_val is not None:
-            val_stats = evaluate(model, data_loaders_val, device, args)
-            print(f"Validation loss: {val_stats['loss']:.4f}")
-            
-            if log_writer:
-                for k, v in val_stats.items():
-                    log_writer.log({f"val/{k}": v}, step=epoch)
+        if data_loaders_val is not None and ((epoch + 1) % args.eval_freq == 0 or epoch + 1 == args.epochs):
+            for dataset_name, data_loader_val in data_loaders_val.items():
+                prefix = '[Eval] ' if not dataset_name else f'[Eval ({dataset_name})] '
+                eval_stats = evaluate(model, data_loader_val, device, num_input_tokens=args.num_input_tokens, num_target_tokens=args.num_target_tokens,
+                                    all_domains=args.all_domains, dtype=dtype, prefix=prefix, loss_type=args.loss_type)
+                
+                if log_writer is not None:
+                    log_writer.update({
+                        f"val_{dataset_name}_loss": eval_stats.get('loss', 0.0),
+                        **{f"val_{dataset_name}_{k}": v for k, v in eval_stats.items()}
+                    })
 
-        # Save checkpoint
-        if args.output_dir and (epoch % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs):
-            checkpoint_path = os.path.join(args.output_dir, f'checkpoint-{epoch}.pth')
-            torch.save({
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
-                'args': args,
-            }, checkpoint_path)
-            print(f"Saved checkpoint: {checkpoint_path}")
+        # Fixed evaluation
+        if data_loaders_fixed_eval is not None and ((epoch + 1) % args.eval_freq == 0 or epoch + 1 == args.epochs):
+            for dataset_name, data_loader_fixed_eval in data_loaders_fixed_eval.items():
+                prefix = '[Fixed Eval] ' if not dataset_name else f'[Fixed Eval ({dataset_name})] '
+                eval_stats = evaluate(model, data_loader_fixed_eval, device, num_input_tokens=args.fixed_eval_input_tokens, 
+                                    num_target_tokens=args.fixed_eval_target_tokens,
+                                    all_domains=args.all_domains, dtype=dtype, prefix=prefix, loss_type=args.loss_type)
+                
+                if log_writer is not None:
+                    log_writer.update({
+                        f"fixed_eval_{dataset_name}_loss": eval_stats.get('loss', 0.0),
+                        **{f"fixed_eval_{dataset_name}_{k}": v for k, v in eval_stats.items()}
+                    })
+
+        # Save checkpoint using FSDP-compatible method
+        if args.output_dir:
+            if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
+                fsdp_utils.save_model_fsdp(args=args, model=model, optimizer=optimizer, epoch=epoch)
+                if epoch + 1 == args.epochs:
+                    use_s3 = len(args.s3_save_dir) > 0
+                    fsdp_utils.save_model_fsdp(
+                        args=args, model=model, optimizer=optimizer,
+                        epoch=epoch, ckpt_name='final', use_s3=use_s3)
 
         # Log training stats
-        if log_writer:
-            for k, v in train_stats.items():
-                log_writer.log({f"train/{k}": v}, step=epoch)
+        log_stats = {**{k: v for k, v in train_stats.items()},
+                     'epoch': epoch,
+                     'n_parameters': n_parameters,
+                     'input_tokens_seen_b': (epoch + 1) * num_training_steps_per_epoch * (total_batch_size / args.accum_iter) * args.num_input_tokens / 1e9,
+                     'target_tokens_seen_b': (epoch + 1) * num_training_steps_per_epoch * (total_batch_size / args.accum_iter) * args.num_target_tokens / 1e9,
+                     'total_tokens_seen_b': (epoch + 1) * num_training_steps_per_epoch * (total_batch_size / args.accum_iter) * (args.num_input_tokens + args.num_target_tokens) / 1e9,
+                    }
+
+        if args.output_dir and utils.is_main_process():
+            if log_writer is not None:
+                log_writer.update(log_stats)
+
+            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

@@ -30,6 +30,53 @@ from torchvision import transforms
 from webdataset.filters import pipelinefilter, reraise_exception
 from webdataset.handlers import warn_and_continue
 
+
+def custom_fourm_collate(batch):
+    """
+    Custom collate function for FourM data that properly handles nested dictionary structures
+    with mask tensors that need to be stacked from 1D to 2D.
+    """
+    if len(batch) == 0:
+        return {}
+    
+    # Check if this is a batch of dictionaries with modality data
+    if isinstance(batch[0], dict) and all(isinstance(item, dict) for item in batch):
+        # Check if any items have the nested mask structure
+        has_mask_structure = any(
+            isinstance(v, dict) and all(key in v for key in ['tensor', 'input_mask', 'target_mask', 'decoder_attention_mask'])
+            for item in batch
+            for v in item.values()
+            if isinstance(v, dict)
+        )
+        
+        if has_mask_structure:
+            # Handle nested modality dictionaries
+            collated = {}
+            for key in batch[0].keys():
+                if isinstance(batch[0][key], dict):
+                    # This is a modality with mask structure
+                    modality_batch = [item[key] for item in batch]
+                    collated[key] = {}
+                    
+                    # Collate each sub-key separately
+                    for sub_key in modality_batch[0].keys():
+                        sub_batch = [mod[sub_key] for mod in modality_batch]
+                        if isinstance(sub_batch[0], torch.Tensor):
+                            # Stack tensors, ensuring proper dimensionality
+                            collated[key][sub_key] = torch.stack(sub_batch, dim=0)
+                        else:
+                            # Use default collate for non-tensor items
+                            collated[key][sub_key] = default_collate(sub_batch)
+                else:
+                    # Regular field, use default collate
+                    field_batch = [item[key] for item in batch]
+                    collated[key] = default_collate(field_batch)
+            
+            return collated
+    
+    # Fall back to default collate for other structures
+    return default_collate(batch)
+
 try:
     # Optionally load huggingface datasets
     from datasets import load_dataset
@@ -380,7 +427,7 @@ def build_wds_fm_pretraining_dataloader(
         map(tok_to_int64), # Convert pre-computed tokens to int64
         map(partial(rename_modalities, modality_paths=modality_paths)), # Rename modalities to their corresponding names in modality_paths
         map(transform), # Apply data augmentation and masking
-        wds.batched(batch_size, collation_fn=default_collate, partial=False)
+        wds.batched(batch_size, collation_fn=custom_fourm_collate, partial=False)
             if batch_size is not None else map(identity), # Batching
     )
 
@@ -420,7 +467,7 @@ def build_wds_divae_dataloader(
         map(tok_to_int64), # Convert pre-computed tokens to int64
         map(partial(rename_modalities, modality_paths=modality_paths)), # Rename modalities to their corresponding names in modality_paths
         map(transform), # Apply data augmentation and masking
-        wds.batched(batch_size, collation_fn=default_collate, partial=False)
+        wds.batched(batch_size, collation_fn=custom_fourm_collate, partial=False)
             if batch_size is not None else map(identity), # Batching
     )
 
@@ -539,7 +586,7 @@ def build_huggingface_pretraining_dataloader(
         map(prepare_fn),  # First apply our custom preparation function to filter and map fields
         wds.select(filter_none),  # Skip any samples that were marked as None/invalid
         map(transform),  # Apply data augmentation and masking
-        wds.batched(batch_size, collation_fn=default_collate, partial=False)
+        wds.batched(batch_size, collation_fn=custom_fourm_collate, partial=False)
             if batch_size is not None else map(identity),  # Batching
     )
 
@@ -622,7 +669,7 @@ class MixtureDataset(IterableDataset):
 def build_mixture_dataloader(data_iters, weights, modality_info, batch_size, num_workers, epoch_size, num_gpus):
     mixture_pipe = wds.DataPipeline(
         MixtureDataset(data_iters, weights, modality_info),
-        wds.batched(batch_size, collation_fn=default_collate, partial=False),
+        wds.batched(batch_size, collation_fn=custom_fourm_collate, partial=False),
     ).with_epoch(epoch_size // (num_gpus * max(1, num_workers) * batch_size)) # Pre-define iterator length
     
     mixture_loader = wds.WebLoader(mixture_pipe, num_workers=num_workers, batch_size=None)

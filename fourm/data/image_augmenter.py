@@ -18,6 +18,7 @@ import numpy as np
 import torchvision
 
 from fourm.utils import to_2tuple
+from fourm.data.modality_transforms import get_transform_key  # Add import
 
 
 class AbstractImageAugmenter(ABC):
@@ -44,7 +45,13 @@ class RandomCropImageAugmenter(AbstractImageAugmenter):
         if crop_settings is not None:
             raise ValueError("Crop settings are provided but not used by this augmenter.")
 
-        image = mod_dict[self.main_domain] if self.main_domain is not None else mod_dict[list(mod_dict.keys())[0]]
+        # Enforce main_domain presence and select image tensor based on base name (no fallback)
+        if self.main_domain is None:
+            raise ValueError("RandomCropImageAugmenter requires a main_domain to select an image modality.")
+        matching_keys = [k for k in mod_dict.keys() if get_transform_key(k) == self.main_domain]
+        if not matching_keys:
+            raise KeyError(f"Domain '{self.main_domain}' not found in mod_dict keys: {list(mod_dict.keys())}")
+        image = mod_dict[matching_keys[0]]
         # With torchvision 0.13+, can also be: orig_size = TF.get_dimensions(image)
         orig_width, orig_height = image.size
         orig_size = (orig_height, orig_width)

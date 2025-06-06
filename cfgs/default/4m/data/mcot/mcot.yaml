@@ -3,12 +3,12 @@ train:
     mcot:
       type: mcot
       use_wds: false
-      in_domains: rgb@224-caption
-      out_domains: caption
+      in_domains: rgb@224-caption-planning-acting
+      out_domains: caption-reflection-correction-final_response
       input_alphas: "1.0"
       target_alphas: "1.0"
       alphas_config: null
-      data_path: /work/com-304/MCoT-4m-XL-1/mcot_dataset_cache/processed_mcot_steps
+      data_path: mcot_data/mcot_dataset_cache/processed_mcot_steps
       aligned_captions: true
       hflip: 0.5
       crop_scale: [0.5, 1.0]
@@ -20,9 +20,9 @@ val:
     mcot:
       type: mcot
       use_wds: false
-      in_domains: rgb@224-caption
-      out_domains: caption
-      data_path: /work/com-304/MCoT-4m-XL-1/mcot_dataset_cache/processed_mcot_steps
+      in_domains: rgb@224-caption-planning-acting
+      out_domains: caption-reflection-correction-final_response
+      data_path: mcot_data/mcot_dataset_cache/processed_mcot_steps
 
 transform_keys:
   - normal

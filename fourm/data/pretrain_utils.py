@@ -22,14 +22,30 @@ from fourm.data import (CenterCropImageAugmenter, EmptyAugmenter,
                   PreTokenizedImageAugmenter,RandomCropImageAugmenter, build_fm_pretraining_dataset,
                   build_huggingface_pretraining_dataloader,
                   build_wds_fm_pretraining_dataloader)
-from fourm.data.modality_transforms import CaptionTransform
+from fourm.data.mcot_dataset import MCoTDatasetFromDirectory
+from fourm.data.modality_transforms import CaptionTransform, UnifiedDataTransform
+from fourm.data.masking import UnifiedMasking
 from fourm.data.modality_info import MODALITY_TRANSFORMS
-from fourm.data.mcot_dataset import build_mcot_pretraining_dataloader
+from torchvision import transforms
 from .image_augmenter import (
     AbstractImageAugmenter, RandomCropImageAugmenter, PreTokenizedImageAugmenter, 
     CenterCropImageAugmenter, NoImageAugmenter, PaddingImageAugmenter,
     ScaleJitteringImageAugmenter, EmptyAugmenter
 )
+
+
+class TransformedMCoTDataset(torch.utils.data.Dataset):
+    """Simple wrapper to apply transforms to MCoT dataset."""
+    def __init__(self, dataset, transform):
+        self.dataset = dataset
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        sample = self.dataset[idx]
+        return self.transform(sample)
 
 
 def setup_sampling_mod_info(dataset_config, modality_info):
@@ -189,32 +205,58 @@ def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_t
             shuffle_buffer_load=dataset_config.get('shuffle_buffer_load', 1_000),
             shuffle_seed=0,
         )
-    
     elif dataset_config['type'] == 'mcot':
+        # MCoT dataset handling - use simplified approach
+        image_augmenter = RandomCropImageAugmenter(
+            target_size=input_size, 
+            hflip=dataset_config.get('hflip', True), 
+            crop_scale=tuple(dataset_config.get('crop_scale', [0.8, 1.0])),
+            crop_ratio=tuple(dataset_config.get('crop_ratio', [0.75, 1.333])),
+        )
         
-        # Find the image domain key (e.g., 'rgb@224')
-        image_domain_key = next((d for d in all_domains if d.startswith('rgb')), None)
-        if image_domain_key is None:
-            print("Warning: No domain starting with 'rgb' found in all_domains. Using default for image_augmenter.")
-            image_augmenter_instance = RandomCropImageAugmenter(target_size=input_size)
-        else:
-            image_augmenter_instance = RandomCropImageAugmenter(target_size=input_size, main_domain=image_domain_key)
+        # Input and target token ranges
+        num_input_tokens = dataset_config.get('num_input_tokens', num_input_tokens)
+        num_target_tokens = dataset_config.get('num_target_tokens', num_target_tokens)
+        min_input_tokens = dataset_config.get('min_input_tokens', min_input_tokens)
+        min_target_tokens = dataset_config.get('min_target_tokens', min_target_tokens)
+        min_input_tokens = num_input_tokens if min_input_tokens is None else min_input_tokens
+        min_target_tokens = num_target_tokens if min_target_tokens is None else min_target_tokens
 
-        loader = build_mcot_pretraining_dataloader(
-            data_path=dataset_config['data_path'], 
+        # Create the base MCoT dataset
+        base_dataset = MCoTDatasetFromDirectory(
+            data_path=dataset_config['data_path'],
             all_domains=all_domains,
-            modality_info=modality_info, 
+            modality_info=modality_info,
             modality_transforms=modality_transforms,
-            image_augmenter=image_augmenter_instance,
+            image_augmenter=image_augmenter,
             text_tokenizer=text_tokenizer,
-            input_tokens_range=(num_input_tokens, num_input_tokens),
-            target_tokens_range=(num_target_tokens, num_target_tokens),
-            num_gpus=num_tasks, 
-            num_workers=num_workers,
-            batch_size=dataset_batch_size, 
+            input_tokens_range=(min_input_tokens, num_input_tokens),
+            target_tokens_range=(min_target_tokens, num_target_tokens),
             split='train'
         )
         
+        # Apply the standard transform pipeline using the same pattern as build_fm_pretraining_dataset
+        transform = transforms.Compose([
+            UnifiedDataTransform(transforms_dict=modality_transforms, image_augmenter=image_augmenter),
+            UnifiedMasking(modality_info=modality_info, text_tokenizer=text_tokenizer,
+                           input_tokens_range=(min_input_tokens, num_input_tokens), 
+                           target_tokens_range=(min_target_tokens, num_target_tokens),
+                           sampling_weights=sampling_weights),
+        ])
+        
+        dataset_train = TransformedMCoTDataset(base_dataset, transform)
+        
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=utils.get_rank(), shuffle=True, drop_last=True,
+        )
+        
+        # DataLoader has batch size 1 as it then gets collated through the Mixture dataloader
+        loader = torch.utils.data.DataLoader(
+            dataset_train, sampler=sampler_train,
+            batch_size=1, num_workers=0,
+            pin_memory=False, drop_last=True,
+            collate_fn=lambda x: x[0],
+        )
     else:
         raise NotImplementedError(f'Dataset type {dataset_config["type"]} not implemented.')
 
@@ -334,15 +376,12 @@ def get_val_dataloader(dataset_config, dataset_name, train_configs, modality_inf
         )
 
     elif dataset_type == 'mcot':
-
-        # Find the image domain key for validation
-        image_domain_key_val = next((d for d in all_domains if d.startswith('rgb')), None)
-        if image_domain_key_val is None:
-             print("Warning: No domain starting with 'rgb' found in all_domains for validation. Using default.")
-             eval_image_augmenter = CenterCropImageAugmenter(target_size=input_size)
-        else:
-             eval_image_augmenter = CenterCropImageAugmenter(target_size=input_size, main_domain=image_domain_key_val)
-
+        # MCoT validation dataset handling
+        eval_image_augmenter = CenterCropImageAugmenter(
+            target_size=input_size, 
+            main_domain='rgb'  # Use base domain name, not resolution-suffixed
+        )
+        
         if fixed_eval:
             input_tokens_range=(fixed_eval_input_tokens, fixed_eval_input_tokens)
             target_tokens_range=(fixed_eval_target_tokens, fixed_eval_target_tokens)
@@ -350,22 +389,52 @@ def get_val_dataloader(dataset_config, dataset_name, train_configs, modality_inf
             # Input and target token ranges
             num_input_tokens = dataset_config.get('num_input_tokens', num_input_tokens)
             num_target_tokens = dataset_config.get('num_target_tokens', num_target_tokens)
-            input_tokens_range = (num_input_tokens, num_input_tokens)
-            target_tokens_range = (num_target_tokens, num_target_tokens)
+            min_input_tokens = dataset_config.get('min_input_tokens', min_input_tokens)
+            min_target_tokens = dataset_config.get('min_target_tokens', min_target_tokens)
+            min_input_tokens = num_input_tokens if min_input_tokens is None else min_input_tokens
+            min_target_tokens = num_target_tokens if min_target_tokens is None else min_target_tokens
+            input_tokens_range = (min_input_tokens, num_input_tokens)
+            target_tokens_range = (min_target_tokens, num_target_tokens)
 
-        loader = build_mcot_pretraining_dataloader(
-            data_path=cfgs_get('data_path', dataset_config, dataset_name, train_configs), 
+        base_dataset_val = MCoTDatasetFromDirectory(
+            data_path=cfgs_get('data_path', dataset_config, dataset_name, train_configs),
             all_domains=all_domains,
-            modality_info=modality_info, 
+            modality_info=modality_info,
             modality_transforms=modality_transforms,
             image_augmenter=eval_image_augmenter,
             text_tokenizer=text_tokenizer,
             input_tokens_range=input_tokens_range,
             target_tokens_range=target_tokens_range,
-            num_gpus=num_tasks, 
-            num_workers=num_workers,
-            batch_size=batch_size, 
             split='val'
+        )
+
+        # Apply the standard transform pipeline for validation
+        transform_val = transforms.Compose([
+            UnifiedDataTransform(transforms_dict=modality_transforms, image_augmenter=eval_image_augmenter),
+            UnifiedMasking(modality_info=modality_info, text_tokenizer=text_tokenizer,
+                           input_tokens_range=input_tokens_range, 
+                           target_tokens_range=target_tokens_range,
+                           sampling_weights=sampling_weights),
+        ])
+        
+        dataset_val = TransformedMCoTDataset(base_dataset_val, transform_val)
+
+        print("Warning: Eval stats may vary slightly as the masking applied on images is random.")
+        if dist_eval:
+            if len(dataset_val) % num_tasks != 0:
+                print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+                    'This will slightly alter validation results as extra duplicate entries are added to achieve '
+                    'equal num of samples per-process.')
+            sampler_val = torch.utils.data.DistributedSampler(
+                dataset_val, num_replicas=num_tasks, rank=utils.get_rank(), shuffle=False)
+        else:
+            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        loader = torch.utils.data.DataLoader(
+            dataset_val, sampler=sampler_val,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_mem,
+            drop_last=False,
         )
 
     else:

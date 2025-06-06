@@ -25,7 +25,7 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import numpy as np
-from fourm.data.modality_info import ModalityInfo
+from fourm.data.modality_info import MODALITY_INFO
 from fourm.data.modality_transforms import get_transform_key
 
 
@@ -37,7 +37,7 @@ class MCoTDataset(Dataset):
     
     def __init__(self, 
                  data: List[Dict[str, Any]], 
-                 modality_info: ModalityInfo,
+                 modality_info: Dict[str, Any],
                  input_size: int = 224,
                  num_input_tokens: int = 256, 
                  num_target_tokens: int = 256,
@@ -205,7 +205,7 @@ class MCoTDatasetFromWgetOutput(Dataset):
     
     def __init__(self, 
                  dataset_dir: str,
-                 modality_info: ModalityInfo,
+                 modality_info: Dict[str, Any],
                  input_size: int = 224,
                  num_input_tokens: int = 256,
                  num_target_tokens: int = 256,
