@@ -159,6 +159,59 @@ python fourm_inference_vqa.py \
     --split validation
 ```
 
+#### VQA Inference Script Usage
+
+The `fourm_inference_vqa.py` script performs comprehensive VQA inference with parameter sweeping:
+
+**Basic Usage:**
+
+```bash
+python fourm_inference_vqa.py
+```
+
+**Configuration:**
+Edit the script parameters at the top of `main_inference()`:
+
+- `model_name`: HuggingFace model identifier (default: 'EPFL-VILAB/4M-7-T2I_XL_CC12M')
+- `finetuned_weights_path`: Path to fine-tuned checkpoint (default: 'checkpoint-2.safetensors')
+- `test_cases_file`: JSON file with test cases (default: 'test_cases.json')
+- `output_dir`: Directory for results (default: 'vqa_outputs')
+
+**Test Cases Format:**
+Create a `test_cases.json` file:
+
+```json
+{
+  "test_cases": [
+    {
+      "image_path": "path/to/image1.jpg",
+      "questions": [
+        "What color is the car?",
+        "How many people are in the image?"
+      ]
+    },
+    {
+      "image_path": "path/to/image2.jpg",
+      "questions": ["What is the person doing?", "What objects are visible?"]
+    }
+  ]
+}
+```
+
+**Parameter Sweeping:**
+The script automatically tests different generation parameters:
+
+- **Temperature**: [0.3, 0.5, 0.7] - Controls randomness
+- **Top-p**: [0.9, 0.95, 0.98] - Nucleus sampling threshold
+- **Top-k**: [40, 50, 60] - Number of top tokens to consider
+
+**Output:**
+Results are saved as JSON in `vqa_outputs/vqa_results.json` with:
+
+- Generated answers for each parameter combination
+- Raw token sequences
+- Generation metadata and timestamps
+
 ### 2. MCoT Training
 
 **Single GPU Training:**
@@ -245,7 +298,6 @@ mcot_reflection_weight: 1.5
 mcot_correction_weight: 1.3
 enable_mint_features: true
 
-
 use_act_checkpoint: true
 dtype: "bfloat16"
 clip_grad: 1.0
@@ -292,8 +344,6 @@ preprocessing:
    python mcot_data/mcot_dataset_wget.py --force_download
    ```
 
-
-
 ## References
 
 - [4M Paper](https://arxiv.org/abs/2312.06647): Massively Multimodal Masked Modeling
@@ -303,9 +353,8 @@ preprocessing:
 
 ## Team
 
-- **Rayane Charif** 
-- **Andrew Siminszky** 
-- **Charles Mercier** 
-
+- **Rayane Charif**
+- **Andrew Siminszky**
+- **Charles Mercier**
 
 **Note**: This is a research project developed for COM-304. The implementation builds upon the original 4M framework and extends it with MCoT capabilities for enhanced multimodal reasoning.
