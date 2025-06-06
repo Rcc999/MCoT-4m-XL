@@ -88,7 +88,6 @@ class MCoTDatasetFromDirectory(Dataset):
         self.target_tokens_range = target_tokens_range
         self.split = split
         
-        # Discover all valid example directories (must contain mcot_annotations.json)
         split_dir = self.data_path / split
         if not split_dir.exists():
             raise ValueError(f"Split directory {split_dir} does not exist")
@@ -116,32 +115,24 @@ class MCoTDatasetFromDirectory(Dataset):
         """
         example_dir = self.example_dirs[idx]
         
-        # Load MCoT annotations (contains step outputs and metadata)
         annotations_file = example_dir / "mcot_annotations.json"
         with open(annotations_file, 'r') as f:
             annotations = json.load(f)
         
-        # Load image (create placeholder if missing to avoid crashes)
         image_file = example_dir / "image.jpg"
         if image_file.exists():
             image = Image.open(image_file).convert('RGB')
         else:
-            # Create placeholder image if file missing
             image = Image.new('RGB', (224, 224), color=(128, 128, 128))
         
-        # Build modality dict with only requested modalities (all_domains)
         mod_dict = {}
         
-        # Include image if any RGB modality is requested 
         if any(domain.startswith('rgb') for domain in self.all_domains):
             mod_dict['rgb'] = image  # Raw PIL image, will be processed by image_augmenter in UnifiedDataTransform
         
-        # Include text caption if requested
         if 'caption' in self.all_domains:
             mod_dict['caption'] = annotations.get('prompt', annotations.get('caption', 'Default caption'))
         
-        # Include MCoT step outputs only if specifically requested
-        # This allows training on subsets of the MCoT process
         mcot_mappings = {
             'planning': annotations.get('planning', 'Planning step data'),
             'acting': annotations.get('acting', 'Acting step data'), 

@@ -495,54 +495,45 @@ def prepare_hf_sample_for_domains(sample, expected_domains):
     """
     processed_sample = {}
     
-    # Create a mapping from base domain (e.g., 'rgb') to full domain name (e.g., 'rgb@224')
     base_to_full_domain_map = {}
     for full_domain_name in expected_domains:
         base_name = full_domain_name.split('@')[0]
         base_to_full_domain_map[base_name] = full_domain_name
 
-    # Handle 'rgb' based domains
     if 'rgb' in base_to_full_domain_map:
         full_rgb_domain_key = base_to_full_domain_map['rgb']
         if 'image' in sample:
             processed_sample[full_rgb_domain_key] = sample['image']
         else:
-            # If 'rgb' (or variant like 'rgb@224') is expected but 'image' field is missing
             return None 
         
-    # Handle 'caption' based domains
     if 'caption' in base_to_full_domain_map:
         full_caption_domain_key = base_to_full_domain_map['caption']
-        if 'question' in sample:  # For VQAv2 dataset
+        if 'question' in sample:
             processed_sample[full_caption_domain_key] = sample['question']
-        elif 'text' in sample:  # For other datasets
+        elif 'text' in sample:
             processed_sample[full_caption_domain_key] = sample['text']
-        # Handle MCoT-specific fields
-        elif 'prompt' in sample:  # Base prompt for MCoT
+        elif 'prompt' in sample:
             processed_sample[full_caption_domain_key] = sample['prompt']
-        elif 'planning' in sample:  # MCoT planning step
+        elif 'planning' in sample:
             processed_sample[full_caption_domain_key] = sample['planning']
-        elif 'acting' in sample:  # MCoT acting step
+        elif 'acting' in sample:
             processed_sample[full_caption_domain_key] = sample['acting']
-        elif 'reflection' in sample:  # MCoT reflection step
+        elif 'reflection' in sample:
             processed_sample[full_caption_domain_key] = sample['reflection']
-        elif 'correction' in sample:  # MCoT correction step
+        elif 'correction' in sample:
             processed_sample[full_caption_domain_key] = sample['correction']
         else:
-            # If 'caption' is expected but no suitable text field is present
             return None
     
-    # Handle MCoT-specific metadata (preserve for step-aware training)
     mcot_fields = ['mcot_step', 'image_id', 'prompt', 'planning', 'acting', 'reflection', 'correction']
     for field in mcot_fields:
         if field in sample:
             processed_sample[field] = sample[field]
     
-    # Final check: ensure all expected domains are now keys in processed_sample
     if all(domain_key in processed_sample for domain_key in expected_domains):
         return processed_sample
     else:
-        # Skip this sample if any expected domain is missing
         return None
 
 

@@ -1,0 +1,48 @@
+    # Config for FSDP
+    # VQA Finetuning based on 4M-7-T2I_XL_CC12M
+
+run_name: vqav2_finetune_4m-7-t2i-xl_full
+
+num_input_tokens: 256
+num_target_tokens: 64
+loss_type: mod
+
+# --- Model Configuration ---
+model: fm_xlarge_24e_24d_swiglu_nobias
+finetune: 'EPFL-VILAB/4M-7-T2I_XL_CC12M'
+
+patch_size: 16
+input_size: 224
+dtype: bfloat16
+tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
+
+# --- Training Parameters ---
+epochs: 5
+total_tokens: -1
+opt: adamw
+blr: 0.00002
+min_blr: 0.
+warmup_epochs: 2
+warmup_tokens: -1
+
+batch_size: 8
+skip_nan_grad: True
+
+# --- Data Configuration ---
+data_config: "cfgs/default/4m/data/vqav2/vqav2.yaml"
+eval_freq: 1
+fixed_eval: True
+epoch_size: 443553
+
+# --- Saving ---
+save_ckpt_freq: 1
+output_dir: '/work/com-304/vqav2_finetune_4m-7-t2i-xl_full'
+
+# --- Wandb Logging ---
+log_wandb: True
+wettiko_wandb: False
+wettiko_sync_sweep_wandb: False
+wettiko_entity: ''
+wandb_project: 'MCoT-4M'
+wandb_run_name: 'vqav2_ft_4m7t2ixl_full_run1'
+wandb_tags: ['vqav2', 'finetune', '4m-7-t2i-xl', 'full_dataset']

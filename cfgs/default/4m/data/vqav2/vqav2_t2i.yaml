@@ -1,0 +1,43 @@
+
+train:
+  datasets:
+    vqav2:
+      type: huggingface
+      data_path: ./vqav2_data/vqa_dataset_wget.py 
+      hf_data_dir: "/work/com-304/vqav2_data_raw"
+      in_domains: rgb@224-caption
+      out_domains: caption
+      input_alphas: "1.0"
+      target_alphas: "1.0"
+      alphas_config: null
+      shuffle_buffer_load: 1_000
+  weights: [1.0]
+
+val:
+  datasets:
+    vqav2:
+      type: huggingface
+      data_path: ./vqav2_data/vqa_dataset_wget.py
+      hf_data_dir: "/work/com-304/vqav2_data_raw"
+      in_domains: rgb@224-caption
+      out_domains: caption
+
+transform_keys:
+  - normal
+
+extras:
+  text_to_caption: false 
+  insert_sep_between_answers: true 
+  insert_image_at_beginning: true
+
+
+
+val_split:
+  question_file: "/work/com-304/vqav2_data_raw/questions_val/v2_OpenEnded_mscoco_val2014_questions.json"
+  annotation_file: "/work/com-304/vqav2_data_raw/annotations_val/v2_mscoco_val2014_annotations.json"
+  image_root: "/work/com-304/vqav2_data_raw/images_val/val2014"
+
+
+answer_processing:
+  insert_s2_token: true
+  max_ans_tokens: 62

@@ -111,12 +111,9 @@ class VQAv2Dataset(datasets.GeneratorBasedBuilder):
         )
 
     def _split_generators(self, dl_manager):
-        # Get the manual directory path provided by the user (if any) via load_dataset(..., data_dir=...)
         user_manual_dir = dl_manager.manual_dir
 
         if user_manual_dir is None:
-            # If no manual_dir is specified, default to "vqa_v2_manual_downloads" in the current working directory.
-            # This is based on the user's command `cache_dir='.'` and the original script's implied name.
             current_working_dir = Path(os.getcwd())
             data_dir = current_working_dir / "vqa_v2_manual_downloads"
             print(
@@ -127,9 +124,6 @@ class VQAv2Dataset(datasets.GeneratorBasedBuilder):
         else:
             data_dir = Path(user_manual_dir)
 
-        # Ensure the target data_dir exists. This directory will store downloaded zips and extracted contents.
-        # The original script created it, so we maintain that behavior.
-        # Using os.makedirs with exist_ok=True is safer.
         if not data_dir.exists():
             os.makedirs(data_dir, exist_ok=True)
 
@@ -140,7 +134,6 @@ class VQAv2Dataset(datasets.GeneratorBasedBuilder):
             for dir_name in _URLS.keys():
                 url = _URLS[dir_name].get(split_name)
                 if url:
-                    # data_dir is now a Path object, so direct / operator can be used.
                     downloaded_file = data_dir / Path(url).name
                     extracted_path = data_dir / f"{dir_name}_{split_name}"
 
@@ -151,14 +144,10 @@ class VQAv2Dataset(datasets.GeneratorBasedBuilder):
 
                         if downloaded_file.suffix == ".zip":
                             print(f"Extracting {downloaded_file} to {extracted_path}")
-                            os.makedirs(extracted_path, exist_ok=True) # Ensure extraction target dir exists
+                            os.makedirs(extracted_path, exist_ok=True)
                             subprocess.run(["unzip", str(downloaded_file), "-d", str(extracted_path)], check=True)
                         else:
                             print(f"Skipping extraction for non-zip file: {downloaded_file}")
-                            # If the file is not a zip, the original script pointed extracted_path to the file itself.
-                            # This might be problematic if _SUB_FOLDER_OR_FILE_NAME expects extracted_path to be a directory.
-                            # For now, maintaining original logic. If this causes issues, it might need to be
-                            # shutil.copy(downloaded_file, extracted_path) if extracted_path is meant to be a dir.
                             extracted_path = downloaded_file 
 
                     expected_final_path = extracted_path / _SUB_FOLDER_OR_FILE_NAME[dir_name][split_name]
@@ -187,7 +176,6 @@ class VQAv2Dataset(datasets.GeneratorBasedBuilder):
         ]
 
     def _generate_examples(self, questions_path, annotations_path, images_path):
-        # Ensure paths are Path objects if they are not None
         questions_path = Path(questions_path) if questions_path else None
         annotations_path = Path(annotations_path) if annotations_path else None
         images_path = Path(images_path) if images_path else None
@@ -205,13 +193,12 @@ class VQAv2Dataset(datasets.GeneratorBasedBuilder):
             with open(annotations_path, "r", encoding='utf-8') as f:
                  dataset = json.load(f)
 
-            qa = {ann["question_id"]: [] for ann in dataset["annotations"]} # Initialize with empty list
+            qa = {ann["question_id"]: [] for ann in dataset["annotations"]}
             for ann in dataset["annotations"]:
                 qa[ann["question_id"]] = ann
 
             for question in questions["questions"]:
                 annotation = qa[question["question_id"]]
-                # Original asserts:
                 assert len(set(question.keys()) ^ set(["image_id", "question", "question_id"])) == 0
                 assert (
                     len(
@@ -228,26 +215,25 @@ class VQAv2Dataset(datasets.GeneratorBasedBuilder):
                         )
                     )
                     == 0
-                )
-                record = question.copy() # Use copy to avoid modifying the original question dict from questions list
+                )       
+                record = question.copy()
                 record.update(annotation)
-                if not images_path or not images_path.exists(): # images_path is a directory
+                if not images_path or not images_path.exists():
                     raise FileNotFoundError(f"Images directory not found or path is None: {images_path}")
                 record["image"] = str(images_path / f"COCO_{images_path.name}_{record['image_id']:0>12}.jpg")
                 yield question["question_id"], record
         else:
-            # This branch is for test sets that don't have annotations
             for question in questions["questions"]:
-                record = question.copy() # Use copy
+                record = question.copy()
                 record.update(
                     {
                         "question_type": None,
                         "multiple_choice_answer": None,
-                        "answers": None, # Or [] if an empty list is more appropriate for the schema
+                        "answers": None,
                         "answer_type": None,
                     }
                 )
-                if not images_path or not images_path.exists(): # images_path is a directory
+                if not images_path or not images_path.exists():
                     raise FileNotFoundError(f"Images directory not found or path is None: {images_path}")
                 record["image"] = str(images_path / f"COCO_{images_path.name}_{question['image_id']:0>12}.jpg")
                 yield question["question_id"], record

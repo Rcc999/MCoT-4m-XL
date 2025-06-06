@@ -50,9 +50,7 @@ class TransformedMCoTDataset(torch.utils.data.Dataset):
 
 
 def setup_sampling_mod_info(dataset_config, modality_info):
-    # Subset of modality info for each dataset
 
-    # Input and output modalities for one dataset
     in_domains = sorted(dataset_config['in_domains'].split('-'))
     out_domains = sorted(dataset_config['out_domains'].split('-'))
     all_domains = sorted(list(set(in_domains) | set(out_domains)))
@@ -60,7 +58,6 @@ def setup_sampling_mod_info(dataset_config, modality_info):
     mod_info = copy.deepcopy(modality_info)
     mod_info = {mod: mod_info[mod] for mod in all_domains}
 
-    # Dirichlet concentration parameter (Alpha)
     if dataset_config.get('alphas_config', None) is None:
         for mod in mod_info:
             mod_info[mod]["input_alphas"] = [0.]
@@ -207,7 +204,6 @@ def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_t
             shuffle_seed=0,
         )
     elif dataset_config['type'] == 'mcot':
-        # MCoT dataset handling - use simplified approach
         image_augmenter = RandomCropImageAugmenter(
             target_size=input_size, 
             hflip=dataset_config.get('hflip', True), 
@@ -215,7 +211,6 @@ def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_t
             crop_ratio=tuple(dataset_config.get('crop_ratio', [0.75, 1.333])),
         )
         
-        # Input and target token ranges
         num_input_tokens = dataset_config.get('num_input_tokens', num_input_tokens)
         num_target_tokens = dataset_config.get('num_target_tokens', num_target_tokens)
         min_input_tokens = dataset_config.get('min_input_tokens', min_input_tokens)
@@ -223,7 +218,6 @@ def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_t
         min_input_tokens = num_input_tokens if min_input_tokens is None else min_input_tokens
         min_target_tokens = num_target_tokens if min_target_tokens is None else min_target_tokens
 
-        # Create the base MCoT dataset
         base_dataset = MCoTDatasetFromDirectory(
             data_path=dataset_config['data_path'],
             all_domains=all_domains,
@@ -236,7 +230,6 @@ def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_t
             split='train'
         )
         
-        # Apply the standard transform pipeline using the same pattern as build_fm_pretraining_dataset
         transform = transforms.Compose([
             UnifiedDataTransform(transforms_dict=modality_transforms, image_augmenter=image_augmenter),
             UnifiedMasking(modality_info=modality_info, text_tokenizer=text_tokenizer,
@@ -251,7 +244,6 @@ def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_t
             dataset_train, num_replicas=num_tasks, rank=utils.get_rank(), shuffle=True, drop_last=True,
         )
         
-        # DataLoader has batch size 1 as it then gets collated through the Mixture dataloader
         loader = torch.utils.data.DataLoader(
             dataset_train, sampler=sampler_train,
             batch_size=1, num_workers=0,

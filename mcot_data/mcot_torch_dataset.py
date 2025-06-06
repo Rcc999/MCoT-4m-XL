@@ -88,7 +88,6 @@ class MCoTDataset(Dataset):
         self.num_target_tokens = num_target_tokens
         self.mcot_steps = mcot_steps
         
-        # Set up transforms for each modality (image, text, etc.)
         self.transforms = {}
         for mod_name, mod_info in modality_info.items():
             self.transforms[mod_name] = get_transform_key(mod_info, input_size)
@@ -112,19 +111,15 @@ class MCoTDataset(Dataset):
         """
         sample = self.data[idx]
         
-        # Load image with fallback to placeholder if file is missing
         image_path = sample.get('image', '')
         if os.path.exists(image_path):
             image = Image.open(image_path).convert('RGB')
         else:
-            # Create placeholder image if file missing - prevents training crashes
             image = Image.new('RGB', (self.input_size, self.input_size), color=(128, 128, 128))
         
-        # Apply image transforms (resize, normalize, etc.)
         if 'rgb' in self.transforms:
             image_tensor = self.transforms['rgb'](image)
         else:
-            # Fallback transform if rgb transform not configured
             from torchvision import transforms
             transform = transforms.Compose([
                 transforms.Resize((self.input_size, self.input_size)),
@@ -133,7 +128,6 @@ class MCoTDataset(Dataset):
             ])
             image_tensor = transform(image)
         
-        # Extract text for each MCoT step
         step_texts = {}
         seetrue_data = None
         
@@ -141,7 +135,6 @@ class MCoTDataset(Dataset):
             step_text = sample.get(step, f"No {step} data available.")
             step_texts[step] = step_text
             
-            # Extract enhanced reflection data from SeeTRUE-Feedback for MINT features
             if step == 'reflection' and sample.get('dataset_source') == 'seetrue_feedback_as_mint_reflection':
                 seetrue_data = {
                     'bbox_artifacts': sample.get('bbox_artifacts', []),
@@ -154,19 +147,15 @@ class MCoTDataset(Dataset):
                     'human_feedback': sample.get('human_feedback', [])
                 }
         
-        # Create modality dictionary compatible with 4M model training
         mod_dict = {
             'rgb': image_tensor.unsqueeze(0),  # [1, C, H, W]
         }
         
-        # Add text modality for each MCoT step
         for step in self.mcot_steps:
             mod_dict[f'text_{step}'] = step_texts[step]
         
-        # Add input prompt as primary text modality
         mod_dict['text_input'] = sample.get('prompt', 'Generate image')
         
-        # Set target text (final result or correction step)
         target_text = sample.get('final_response', step_texts.get('correction', 'Complete MCoT process.'))
         
         return {
@@ -175,7 +164,7 @@ class MCoTDataset(Dataset):
             'mcot_step': sample.get('mcot_step', 'planning'),
             'step_texts': step_texts,
             'target_text': target_text,
-            'seetrue_data': seetrue_data,  # Enhanced reflection data from SeeTRUE-Feedback
+            'seetrue_data': seetrue_data,
             'num_input_tokens': self.num_input_tokens,
             'num_target_tokens': self.num_target_tokens
         }
@@ -192,21 +181,17 @@ class MCoTDataset(Dataset):
         """
         batch_size = len(batch)
         
-        # Collect all modalities
         mod_dict = {}
         
-        # Batch RGB images
         if 'rgb' in batch[0]['mod_dict']:
             rgb_tensors = [sample['mod_dict']['rgb'].squeeze(0) for sample in batch]
             mod_dict['rgb'] = torch.stack(rgb_tensors, dim=0)
-        
-        # Batch text modalities
+
         text_modalities = ['text_input'] + [f'text_{step}' for step in self.mcot_steps]
         for text_mod in text_modalities:
             if text_mod in batch[0]['mod_dict']:
                 mod_dict[text_mod] = [sample['mod_dict'][text_mod] for sample in batch]
         
-        # Collect step-specific data
         step_data = {}
         for step in self.mcot_steps:
             step_data[step] = {
@@ -217,7 +202,6 @@ class MCoTDataset(Dataset):
                 }
             }
             
-            # Add SeeTRUE-Feedback data for reflection step
             if step == 'reflection':
                 seetrue_batch = []
                 for sample in batch:
@@ -225,7 +209,6 @@ class MCoTDataset(Dataset):
                     seetrue_batch.append(seetrue_data if seetrue_data else None)
                 step_data[step]['seetrue_data'] = seetrue_batch
         
-        # Collect metadata
         image_ids = [sample['image_id'] for sample in batch]
         mcot_steps = [sample['mcot_step'] for sample in batch]
         target_texts = [sample['target_text'] for sample in batch]
@@ -265,7 +248,6 @@ class MCoTDatasetFromWgetOutput(Dataset):
         self.mcot_steps = mcot_steps
         self.split = split
         
-        # Find all example directories
         split_dir = self.dataset_dir / split
         if not split_dir.exists():
             raise ValueError(f"Split directory {split_dir} does not exist")
@@ -280,7 +262,6 @@ class MCoTDatasetFromWgetOutput(Dataset):
         
         print(f"Found {len(self.example_dirs)} examples in {split} split")
         
-        # Setup transforms
         self.transforms = {}
         for mod_name, mod_info in modality_info.items():
             self.transforms[mod_name] = get_transform_key(mod_info, input_size)
@@ -289,27 +270,21 @@ class MCoTDatasetFromWgetOutput(Dataset):
         return len(self.example_dirs)
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Load example from wget output directory structure."""
         example_dir = self.example_dirs[idx]
         
-        # Load annotations
         annotations_file = example_dir / "mcot_annotations.json"
         with open(annotations_file, 'r') as f:
             annotations = json.load(f)
         
-        # Load image
         image_file = example_dir / "image.jpg"
         if image_file.exists():
             image = Image.open(image_file).convert('RGB')
         else:
-            # Create placeholder image
             image = Image.new('RGB', (self.input_size, self.input_size), color=(128, 128, 128))
         
-        # Apply image transforms  
         if 'rgb' in self.transforms:
             image_tensor = self.transforms['rgb'](image)
         else:
-            # Fallback transform
             from torchvision import transforms
             transform = transforms.Compose([
                 transforms.Resize((self.input_size, self.input_size)),
@@ -318,25 +293,22 @@ class MCoTDatasetFromWgetOutput(Dataset):
             ])
             image_tensor = transform(image)
         
-        # Extract step texts
         step_texts = {}
         for step in self.mcot_steps:
             step_texts[step] = annotations.get(step, f"No {step} data available.")
-        
-        # Create modality dictionary
+
         mod_dict = {
             'rgb': image_tensor.unsqueeze(0),
             'text_input': annotations.get('prompt', 'Generate image')
         }
         
-        # Add step-specific text modalities
         for step in self.mcot_steps:
             mod_dict[f'text_{step}'] = step_texts[step]
         
         return {
             'mod_dict': mod_dict,
             'image_id': annotations.get('image_id', example_dir.name),
-            'mcot_step': 'planning',  # Default step
+            'mcot_step': 'planning',
             'step_texts': step_texts,
             'target_text': annotations.get('final_response', step_texts.get('correction', 'Complete MCoT process.')),
             'num_input_tokens': self.num_input_tokens,

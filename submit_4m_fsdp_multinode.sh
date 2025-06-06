@@ -7,37 +7,30 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G             # Monitor this, might need more CPU RAM for loading large ckpts
-#SBATCH --output=4m_mcot_fsdp_train_%j.out # Added job ID to output
-#SBATCH --error=4m_mcot_fsdp_train_%j.err # Added job ID to error
+#SBATCH --mem=64G             
+#SBATCH --output=4m_mcot_fsdp_train_%j.out 
+#SBATCH --error=4m_mcot_fsdp_train_%j.err 
 
-# === Accept arguments ===
-# Argument 1: Path to the main YAML config file
 CONFIG_FILE=$1
-# Argument 2: WandB API Key
 WANDB_KEY=$2
-# Argument 3 (Optional): WandB Entity (Defaults to as8148-epfl if not provided)
 WANDB_ENTITY=${3:-as8148-epfl}
 
-# === Initialization ===
-set -x # Print commands before executing them
-cat $0 # Print the script itself to the output log
-export MASTER_PORT=25678 # Use a specific port
-export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1) # Get master node hostname
+set -x 
+cat $0 
+export MASTER_PORT=25678 
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1) 
 export WANDB_API_KEY=$WANDB_KEY
 export NCCL_DEBUG=INFO
-export OMP_NUM_THREADS=1 # Recommended for multi-process torch
+export OMP_NUM_THREADS=1 
 
 echo "Arguments provided: CONFIG_FILE=$CONFIG_FILE, WANDB_ENTITY=$WANDB_ENTITY"
 echo "Master Addr: $MASTER_ADDR"
 echo "Master Port: $MASTER_PORT"
 echo "Node list: $SLURM_JOB_NODELIST"
 
-# Pass the CONFIG_FILE and WANDB_ENTITY variables into the environment of the srun command
 export CONFIG_FILE="$CONFIG_FILE"
 export WANDB_ENTITY="$WANDB_ENTITY"
 
-# === Run main script ===
 srun --label bash -c "
   export TORCHRUN_ARGS=\"--node-rank=\${SLURM_PROCID} \
      --master-addr=\${MASTER_ADDR} \

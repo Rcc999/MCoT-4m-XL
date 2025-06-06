@@ -73,15 +73,13 @@ class MCoTStepProcessor(nn.Module):
         self.device = device
         self.enable_mint = enable_mint
         
-        # MCoT step configuration - defines the four reasoning steps
+
         default_steps = ["planning", "acting", "reflection", "correction"]
         self.mcot_steps = mcot_steps if mcot_steps is not None else default_steps
         
-        # Training weights for each step (reflection gets higher weight as it's most critical)
         default_weights = {"planning": 1.0, "acting": 1.2, "reflection": 1.5, "correction": 1.3}
         self.step_weights = step_weights if step_weights is not None else default_weights
         
-        # Instructions for each MCoT step - these guide the model's behavior
         self.step_instructions = {
             "planning": "Create a detailed dense caption and layout plan with bounding boxes for objects. Focus on spatial relationships and compositional elements.",
             "acting": "Generate the image based on the planning output. Use the dense caption and layout information to create a high-quality image.",
@@ -91,10 +89,8 @@ class MCoTStepProcessor(nn.Module):
         
         self.step_to_id = {step: i for i, step in enumerate(self.step_instructions.keys())}
         
-        # Learnable embeddings to condition the model for each step
         self.step_embeddings = nn.Embedding(len(self.step_instructions), dim)
         
-        # Confidence threshold for reflection step artifact detection
         self.reflection_confidence_threshold = 0.5
         
         print(f"MCoTStepProcessor initialized with dim={dim}, enable_mint={enable_mint}")
@@ -139,14 +135,12 @@ class MCoTStepProcessor(nn.Module):
             
         instruction = self.step_instructions[step]
         
-        # Add context from previous steps (e.g., planning output for acting step)
         context_str = ""
         if context:
             for prev_step in ["planning", "acting", "reflection"]:
                 if prev_step in context and prev_step != step:
                     context_str += f"\n{prev_step.title()}: {context[prev_step]}"
         
-        # Create the final prompt with instructions and context
         if step == "planning":
             formatted_prompt = f"{instruction}\n\nUser request: {base_prompt}"
         else:
@@ -179,13 +173,11 @@ class MCoTWrapper(nn.Module):
         self.base_model = base_model
         self.dim = getattr(base_model, 'dim', 768)
         
-        # Initialize MCoT processor for step-specific logic
         if mcot_processor is not None:
             self.step_processor = mcot_processor
         else:
             self.step_processor = MCoTStepProcessor(self.dim)
         
-        # Copy important attributes from base model so we behave identically
         self.modality_info = getattr(base_model, 'modality_info', {})
         
     def forward(self, 
@@ -202,11 +194,9 @@ class MCoTWrapper(nn.Module):
         Otherwise behaves exactly like the base model.
         """
         
-        # Apply MCoT conditioning if step is specified
         if mcot_step is not None and mcot_step in self.step_processor.step_to_id:
             mod_dict = self._apply_mcot_conditioning(mod_dict, mcot_step, mcot_context)
         
-        # Forward through base model
         return self.base_model(
             mod_dict=mod_dict,
             num_encoder_tokens=num_encoder_tokens,
@@ -224,14 +214,12 @@ class MCoTWrapper(nn.Module):
         for modality, mod_data in mod_dict.items():
             conditioned_mod_dict[modality] = mod_data.copy()
             
-            # Apply step conditioning to text-based modalities
             if modality in ['caption', 'text'] and 'tensor' in mod_data:
                 if 'input_text' in mod_data:
                     base_prompt = mod_data['input_text']
                     formatted_prompt = self.step_processor.format_step_prompt(base_prompt, step, context)
                     conditioned_mod_dict[modality]['input_text'] = formatted_prompt
-                
-                # Add step embedding to token sequence
+                    
                 if 'tensor' in mod_data and mod_data['tensor'].dim() == 3:
                     tokens = mod_data['tensor']
                     batch_size = tokens.shape[0]

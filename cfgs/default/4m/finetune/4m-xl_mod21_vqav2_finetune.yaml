@@ -1,7 +1,7 @@
 run_name: vqav2_finetune_4m-xl_mod21
 
 num_input_tokens: 256
-num_target_tokens: 64 # Adjusted for VQA answer length
+num_target_tokens: 64
 loss_type: mod
 
 model: fm_xlarge_24e_24d_swiglu_nobias
@@ -10,16 +10,16 @@ input_size: 224
 dtype: bfloat16
 tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
 
-finetune: 'https://huggingface.co/EPFL-VILAB/4M-21_XL/resolve/main/model.safetensors' # IMPORTANT: Using the Hugging Face URL for the 4m21xl model checkpoint
+finetune: 'https://huggingface.co/EPFL-VILAB/4M-21_XL/resolve/main/model.safetensors'
 
-epochs: 10 # Adjusted from -1
-total_tokens: -1 # Adjusted from 5
+epochs: 5
+total_tokens: -1
 opt: adamw
 blr: 0.00002
 min_blr: 0.
-warmup_epochs: 1 # Adjusted from -1
-warmup_tokens: -1 # Adjusted from 0.4
-batch_size: 32 #32
+warmup_epochs: 1
+warmup_tokens: -1
+batch_size: 32 
 clip_grad: 3.0
 use_act_checkpoint: True
 skip_nan_grad: True

@@ -70,7 +70,7 @@ Each example follows the MCoT pipeline: Planning → Acting → Reflection → C
 
 _URLS = {
     "actplan": {
-        "local_json_file": "actplan.json"  # Local file containing action planning data
+        "local_json_file": "actplan.json"
     },
     "richhf18k": {
         "tfrecord_urls": {
@@ -80,7 +80,7 @@ _URLS = {
         }
     },
     "seetrue_feedback": {
-        "hf_dataset_name": "mismatch-quest/SeeTRUE-Feedback"  # Hugging Face dataset
+        "hf_dataset_name": "mismatch-quest/SeeTRUE-Feedback"
     },
     "brush_data": {
         "base_tar_url": "https://huggingface.co/datasets/random123123/BrushData/resolve/main/",
@@ -93,7 +93,7 @@ _URLS = {
 
 
 class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
-    VERSION = datasets.Version("1.1.2") # Incremented version due to cleanup feature
+    VERSION = datasets.Version("1.1.2")
 
     BUILDER_CONFIGS = [
         datasets.BuilderConfig(name="default", version=VERSION, description="Default MCoT dataset configuration with cleanup")
@@ -131,29 +131,26 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             dl_manager: Hugging Face datasets download manager
             base_data_dir: Base directory for storing raw datasets
         """
-        print("🚀 Step 1: Downloading all datasets first...")
+        print("Downloading all datasets first...")
         
-        # Create cache directories
         seetrue_cache_dir = base_data_dir / "seetrue_feedback_raw" / "hf_cache"
         
-        # Download SeeTRUE-Feedback
-        print(f"📦 Downloading SeeTRUE-Feedback dataset...")
+        print(f"Downloading SeeTRUE-Feedback dataset...")
         dataset = datasets.load_dataset(
             _URLS["seetrue_feedback"]["hf_dataset_name"],
             split="test",
             cache_dir=str(seetrue_cache_dir),
             trust_remote_code=True
         )
-        print(f"✅ SeeTRUE-Feedback downloaded successfully")
+        print(f"SeeTRUE-Feedback downloaded successfully")
         
-        print("🎉 All dataset downloads completed! Now processing...")
+        print("All dataset downloads completed! Now processing...")
 
     def _split_generators(self, dl_manager):
         user_manual_dir = dl_manager.manual_dir
         base_data_dir = Path(user_manual_dir) if user_manual_dir else Path(os.getcwd()) / "mcot_downloads"
         base_data_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download all datasets first
         self._download_all_datasets_first(dl_manager, base_data_dir)
 
         processed_data_dir = base_data_dir / "processed_mcot_steps"
@@ -163,28 +160,22 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         seetrue_raw_dir = base_data_dir / "seetrue_feedback_raw"
         brush_raw_dir = base_data_dir / "brush_data_raw"
 
-        print("🔄 Step 2: Processing downloaded datasets...")
-        # Process actplan data for planning step
+        print("Processing downloaded datasets...")
         self._process_actplan(processed_data_dir)
 
-        # Process RichHF-18K for reflection training
         self._download_and_prepare_richhf18k(dl_manager, richhf_raw_dir, _URLS["richhf18k"])
         self._process_richhf18k(richhf_raw_dir, processed_data_dir)
 
-        # Process SeeTRUE-Feedback for reflection training  
         self._download_and_prepare_seetrue_feedback(dl_manager, seetrue_raw_dir, _URLS["seetrue_feedback"])
         self._process_seetrue_feedback(seetrue_raw_dir, processed_data_dir)
 
-        # Process BrushData for correction step
         self._download_and_prepare_brush_data(dl_manager, brush_raw_dir, _URLS["brush_data"])
         self._process_brush_data(brush_raw_dir, processed_data_dir)
 
         self._generate_mcot_examples(processed_data_dir)
         
-        # Cleanup raw and intermediate files
         print("MCoT dataset construction complete. Starting cleanup of raw and intermediate files...")
         
-        # 1. Delete Raw Data Directories
         raw_data_paths_to_clean = [richhf_raw_dir, seetrue_raw_dir, brush_raw_dir]
         for raw_path in raw_data_paths_to_clean:
             if raw_path.exists():
@@ -192,7 +183,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 shutil.rmtree(raw_path)
                 print(f"Successfully removed {raw_path}")
 
-        # 2. Delete Intermediate Processed JSON Files
         intermediate_json_files = [
             processed_data_dir / "planning_data.json",
             processed_data_dir / "richhf_reflection_data.json",
@@ -225,7 +215,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         """Download RichHF-18K TFRecord files using direct wget"""
         richhf_raw_dir.mkdir(parents=True, exist_ok=True)
         
-        print("🎯 Downloading RichHF-18K TFRecord files using direct wget...")
+        print("Downloading RichHF-18K TFRecord files using direct wget...")
         
         tfrecord_urls = urls.get("tfrecord_urls", {})
         
@@ -235,37 +225,36 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             
             if target_path.exists():
                 file_size = target_path.stat().st_size
-                if file_size > 1024:  # File is larger than 1KB
-                    print(f"✅ {filename} already exists ({file_size:,} bytes)")
+                if file_size > 1024:
+                    print(f"{filename} already exists ({file_size:,} bytes)")
                     continue
                 else:
-                    print(f"⚠️ {filename} exists but is too small ({file_size} bytes). Re-downloading...")
+                    print(f"{filename} exists but is too small ({file_size} bytes). Re-downloading...")
             
             try:
-                print(f"📥 Downloading {filename} from {url}...")
+                print(f"Downloading {filename} from {url}...")
                 result = subprocess.run(
                     ["wget", "-O", str(target_path), url],
                     check=True
                 )
                 
-                # Verify the downloaded file
                 if target_path.exists():
                     file_size = target_path.stat().st_size
-                    if file_size > 1024:  # Verify it's not a placeholder
-                        print(f"✅ Successfully downloaded {filename} ({file_size:,} bytes)")
+                    if file_size > 1024:
+                        print(f"Successfully downloaded {filename} ({file_size:,} bytes)")
                     else:
-                        print(f"⚠️ Downloaded {filename} but file seems too small ({file_size} bytes)")
+                        print(f"Downloaded {filename} but file seems too small ({file_size} bytes)")
                 else:
-                    print(f"❌ Failed to download {filename} - file not found after wget")
+                    print(f"Failed to download {filename} - file not found after wget")
                     
             except subprocess.CalledProcessError as e:
-                print(f"❌ Failed to download {filename}: {e}")
+                print(f"Failed to download {filename}: {e}")
                 raise RuntimeError(f"Failed to download {filename}")
             except Exception as e:
-                print(f"❌ Unexpected error downloading {filename}: {e}")
+                print(f" Unexpected error downloading {filename}: {e}")
                 raise
         
-        print("✅ RichHF-18K TFRecord download process completed.")
+        print("RichHF-18K TFRecord download process completed.")
 
 
     def _download_and_prepare_seetrue_feedback(self, dl_manager, seetrue_raw_dir, urls):
@@ -274,7 +263,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         cache_dir = seetrue_raw_dir / "hf_cache"
         cache_dir.mkdir(exist_ok=True, parents=True)
         
-        print(f"📦 Downloading SeeTRUE-Feedback dataset...")
+        print(f"Downloading SeeTRUE-Feedback dataset...")
         
         try:
             dataset = datasets.load_dataset(
@@ -284,16 +273,14 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 trust_remote_code=True
             )
             
-            # Save dataset to JSON for processing
             dataset_path = seetrue_raw_dir / "seetrue_data.json"
             dataset.to_json(str(dataset_path))
-            print(f"✅ SeeTRUE-Feedback dataset downloaded successfully ({len(dataset)} samples)")
+            print(f"SeeTRUE-Feedback dataset downloaded successfully ({len(dataset)} samples)")
             
-            # Create success flag
             (seetrue_raw_dir / "seetrue_download_completed.flag").touch()
             
         except Exception as e:
-            print(f"❌ Could not download SeeTRUE-Feedback dataset: {e}")
+            print(f"Could not download SeeTRUE-Feedback dataset: {e}")
             raise
 
 
@@ -303,7 +290,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         tars_dir = brush_raw_dir / "tars"
         tars_dir.mkdir(exist_ok=True)
         
-        print("🎯 Downloading BrushData using direct wget (limited to 20GB)...")
+        print("Downloading BrushData using direct wget (limited to 20GB)...")
         
         base_url = urls.get("base_tar_url", "")
         tar_files = urls.get("tar_files", [])
@@ -317,7 +304,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         
         for i, tar_filename in enumerate(tar_files):
             if total_size_gb >= MAX_SIZE_GB:
-                print(f"🛑 Reached 20GB limit, stopping BrushData download")
+                print(f"Reached 20GB limit, stopping BrushData download")
                 break
                 
             tar_url = base_url + tar_filename
@@ -331,27 +318,25 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 continue
             
             try:
-                print(f"📦 Downloading BrushData {tar_filename} ({i+1}/{len(tar_files)})...")
+                print(f"Downloading BrushData {tar_filename} ({i+1}/{len(tar_files)})...")
                 downloaded_path = dl_manager.download_and_extract(tar_url)
                 
-                # Copy to our tars directory
                 if Path(downloaded_path).is_file():
                     shutil.copy(downloaded_path, tar_local_path)
                     file_size_gb = tar_local_path.stat().st_size / (1024**3)
                     downloaded_files.append(tar_local_path)
                     total_size_gb += file_size_gb
-                    print(f"✅ {tar_filename} downloaded ({file_size_gb:.1f}GB, total: {total_size_gb:.1f}GB)")
+                    print(f"{tar_filename} downloaded ({file_size_gb:.1f}GB, total: {total_size_gb:.1f}GB)")
                 else:
-                    print(f"⚠️ {tar_filename} download failed")
+                    print(f"{tar_filename} download failed")
                     
             except Exception as e:
-                print(f"⚠️ Failed to download {tar_filename}: {e}")
+                print(f"Failed to download {tar_filename}: {e}")
                 continue
         
-        print(f"✅ BrushData direct download completed! Downloaded {len(downloaded_files)} TAR files ({total_size_gb:.1f}GB)")
+        print(f"BrushData direct download completed! Downloaded {len(downloaded_files)} TAR files ({total_size_gb:.1f}GB)")
         (brush_raw_dir / "brush_direct_download_completed.flag").touch()
         
-        # Save list of downloaded files for processing
         with open(brush_raw_dir / "downloaded_tars.json", 'w') as f:
             json.dump([str(p) for p in downloaded_files], f)
 
@@ -372,21 +357,19 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         """
         planning_samples = []
         
-        # Load actplan.json from the mcot_data directory
         actplan_json_path = Path(__file__).parent / "actplan.json"
         
         if not actplan_json_path.exists():
             raise FileNotFoundError(f"actplan.json not found at {actplan_json_path}")
         
-        print(f"📊 Loading actplan dataset from {actplan_json_path}...")
+        print(f"Loading actplan dataset from {actplan_json_path}...")
         
         try:
             with open(actplan_json_path, 'r') as f:
                 actplan_data = json.load(f)
             
-            print(f"✅ Loaded {len(actplan_data)} entries from actplan dataset")
+            print(f"Loaded {len(actplan_data)} entries from actplan dataset")
             
-            # Process each actplan entry
             processed_count = 0
             
             for entry in actplan_data:
@@ -395,17 +378,13 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 dense_captions = entry.get("dense_captions", [])
                 bounding_boxes = entry.get("bounding_boxes", [])
                 
-                # Use the first original caption as the prompt for acting step
                 prompt = original_captions[0] if original_captions else f"Generate image for {image_id}"
                 
-                # Use the first dense caption as the main planning description
                 dense_caption = dense_captions[0] if dense_captions else "No dense caption available"
                 
-                # Create planning text following MINT methodology
                 planning_text = f"Planning: Dense scene analysis based on detailed captioning. "
                 planning_text += f"Dense caption: {dense_caption}. "
                 
-                # Add bounding box information for spatial planning
                 if bounding_boxes:
                     bbox_descriptions = []
                     for bbox in bounding_boxes:
@@ -415,23 +394,21 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                     
                     planning_text += f"Spatial layout with bounding boxes: {'; '.join(bbox_descriptions)}. "
                 
-                # Add alternative captions for variation
                 if len(original_captions) > 1:
-                    alt_captions = "; ".join(original_captions[1:3])  # Use 2nd and 3rd captions
+                    alt_captions = "; ".join(original_captions[1:3])
                     planning_text += f"Alternative descriptions: {alt_captions}. "
                 
                 if len(dense_captions) > 1:
-                    alt_dense = dense_captions[1]  # Use 2nd dense caption
+                    alt_dense = dense_captions[1]
                     planning_text += f"Alternative dense description: {alt_dense}. "
                 
                 planning_text += "Actplan structured captioning and spatial analysis complete."
                 
-                # Create planning sample with proper prompt field for acting step
                 planning_sample = {
                     "image_id": image_id,
-                    "prompt": prompt,  # This is crucial - provides proper prompt for acting step
+                    "prompt": prompt,
                     "planning": planning_text,
-                    "image": None,  # No images in actplan dataset
+                    "image": None,
                     "original_captions": original_captions,
                     "dense_captions": dense_captions,
                     "bounding_boxes": bounding_boxes
@@ -441,16 +418,14 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 processed_count += 1
                 
                 if processed_count % 500 == 0:
-                    print(f"📈 Processed {processed_count} actplan samples...")
+                    print(f"Processed {processed_count} actplan samples...")
             
-            print(f"✅ Processed {len(planning_samples)} actplan planning samples")
+            print(f"Processed {len(planning_samples)} actplan planning samples")
             
-            # Save processed data
             with open(processed_data_dir / "planning_data.json", 'w') as f:
                 serializable_samples = []
                 for ps in planning_samples:
                     s_ps = ps.copy()
-                    # Remove image field for JSON serialization (it's None anyway)
                     if "image" in s_ps:
                         s_ps.pop("image")
                     serializable_samples.append(s_ps)
@@ -459,7 +434,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             self.actplan_planning_samples_with_images = planning_samples
             
         except Exception as e:
-            print(f"❌ Error processing actplan dataset: {e}")
+            print(f"Error processing actplan dataset: {e}")
             raise
 
 
@@ -473,30 +448,19 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         """
         reflection_samples = []
         
-        # MINT paper: "For the reflection task, we leveraged the RichHF-18K dataset and the additional 5,000 images 
-        # generated by MINT, which were manually annotated to identify the bounding boxes of incorrectly generated 
-        # objects, along with their corresponding prompt contents."
-        # RichHF-18K provides human feedback for reflection and artifact identification
+        print("Using FULL RichHF-18K dataset (no sample limits)")
         
-        # Look for TFRecord files downloaded directly via wget
-        # Process directly downloaded TFRecord files
-        # Use full RichHF-18K dataset as per MINT paper methodology
-        print("🎯 Using FULL RichHF-18K dataset (no sample limits)")
-        
-        # Look for TFRecord files in the direct download location
         tfrecord_files = list(richhf_raw_dir.glob("*.tfrecord"))
         
         print(f"Found {len(tfrecord_files)} TFRecord files in RichHF-18K directory")
         
-        # Process TFRecord files (preferred format)
         if tfrecord_files:
-            print(f"🔄 Processing {len(tfrecord_files)} TFRecord files...")
+            print(f"Processing {len(tfrecord_files)} TFRecord files...")
             for tfrecord_file in tfrecord_files:
-                print(f"📂 Processing TFRecord: {tfrecord_file}")
+                print(f"Processing TFRecord: {tfrecord_file}")
                 
-                # Check if file is a valid TFRecord
                 file_size = tfrecord_file.stat().st_size
-                if file_size < 1000:  # Likely too small to be valid
+                if file_size < 1000:
                     raise ValueError(f"{tfrecord_file.name} appears to be too small (size: {file_size} bytes) - download failure")
                 
                 dataset = tf.data.TFRecordDataset(str(tfrecord_file))
@@ -504,14 +468,12 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 skipped_count = 0
                 total_records = 0
                 
-                # Process ALL records in the TFRecord file (no limit)
                 for i, raw_record in enumerate(dataset):
                     total_records += 1
                     example = tf.train.Example()
                     example.ParseFromString(raw_record.numpy())
                     features = example.features.feature
                     
-                    # Extract TFRecord data using ACTUAL RichHF-18K schema
                     filename = self._get_string_feature(features, 'filename')
                     artifact_score = self._get_float_feature(features, 'artifact_score') 
                     misalignment_score = self._get_float_feature(features, 'misalignment_score')
@@ -519,9 +481,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                     aesthetics_score = self._get_float_feature(features, 'aesthetics_score')
                     prompt_misalignment_label = self._get_string_feature(features, 'prompt_misalignment_label')
                     
-                    # Generate prompt from filename (remove path and extension)
                     if filename:
-                        # Extract base filename and convert to a reasonable prompt
                         base_filename = filename.split('/')[-1].replace('.png', '').replace('.jpg', '')
                         prompt = f"Generate image: {base_filename}"
                     else:
@@ -547,9 +507,9 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                             skipped_count += 1
                         
                 success_rate = (processed_count / total_records * 100) if total_records > 0 else 0
-                print(f"✅ RichHF TFRecord Summary: {processed_count}/{total_records} samples processed successfully ({success_rate:.1f}%), {skipped_count} samples skipped from {tfrecord_file.name}")
+                print(f"RichHF TFRecord Summary: {processed_count}/{total_records} samples processed successfully ({success_rate:.1f}%), {skipped_count} samples skipped from {tfrecord_file.name}")
                         
-        print(f"✅ RichHF-18K Processing Complete: {len(reflection_samples)} total reflection samples successfully processed")
+        print(f"RichHF-18K Processing Complete: {len(reflection_samples)} total reflection samples successfully processed")
 
         with open(processed_data_dir / "richhf_reflection_data.json", 'w') as f:
             json.dump(reflection_samples, f)
@@ -558,15 +518,12 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
     def _process_richhf_reflection_sample(self, data, image_id):
         """Process individual RichHF-18K sample for reflection task following MINT methodology"""
         prompt = data.get("prompt", data.get("text", data.get("caption", "")))
-        
-        # Extract artifact and quality information for reflection analysis
         artifact_score = data.get("artifact_score", 0.0)
         misalignment_score = data.get("misalignment_score", 0.0)
         overall_score = data.get("overall_score", 0.0)
         aesthetics_score = data.get("aesthetics_score", 0.0)
         prompt_misalignment_label = data.get("prompt_misalignment_label", "")
         
-        # Extract feedback information
         feedback = data.get("feedback", data.get("human_feedback", ""))
         quality_score = data.get("quality_score", data.get("quality", data.get("score", data.get("rating", 0.5))))
         feedback_score = data.get("feedback_score", 0.0)
@@ -576,22 +533,20 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             print(f"⚠️ Skipping RichHF sample {image_id}: Missing prompt data")
             return None
             
-        # Generate reflection text following MINT paper specifications for artifact identification
         reflection_text = "Reflection: Analyzing generated image for artifacts and misalignments. "
         reflection_text += f"Original prompt: '{prompt}' "
         
-        # Focus on artifact detection and bounding box identification (core MINT reflection task)
-        if artifact_score > 0.3:  # Threshold for significant artifacts
+        if artifact_score > 0.3:
             reflection_text += f"Artifact detection: High artifact presence (score: {artifact_score:.3f}). "
             reflection_text += "Identifying bounding boxes of incorrectly generated objects. "
             
-        if misalignment_score > 0.3:  # Threshold for significant misalignment
+        if misalignment_score > 0.3:
             reflection_text += f"Prompt misalignment detected (score: {misalignment_score:.3f}). "
             if prompt_misalignment_label:
                 reflection_text += f"Misalignment type: {prompt_misalignment_label}. "
             reflection_text += "Analyzing correspondence between prompt content and visual elements. "
             
-        if overall_score < 0.6:  # Low quality threshold
+        if overall_score < 0.6:
             reflection_text += f"Quality assessment: Below threshold (score: {overall_score:.3f}). "
             reflection_text += "Identifying specific regions requiring correction. "
             
@@ -599,7 +554,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             feedback_clean = feedback[:200] if len(feedback) > 200 else feedback
             reflection_text += f"Human feedback analysis: {feedback_clean} "
             
-        # Add MINT-specific reflection components
         reflection_text += "Generating artifact heatmap for targeted correction. "
         reflection_text += "Self-reflection on generation accuracy and aesthetic quality. "
         reflection_text += "Preparing bounding box annotations for incorrectly generated objects."
@@ -617,7 +571,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             "feedback": feedback,
             "feedback_score": feedback_score,
             "aspect_scores": aspect_scores,
-            # MINT-specific fields for reflection task
             "requires_artifact_correction": artifact_score > 0.3,
             "requires_alignment_correction": misalignment_score > 0.3,
             "requires_quality_improvement": overall_score < 0.6
@@ -655,13 +608,11 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         reflection_samples = []
         
         try:
-            print("🔄 Loading SeeTRUE-Feedback as MINT reflection data replacement")
+            print("Loading SeeTRUE-Feedback as MINT reflection data replacement")
             
-            # First try to load from JSON file if it exists
             seetrue_data_file = seetrue_raw_dir / "seetrue_data.json"
             if seetrue_data_file.exists():
                 print(f"📁 Loading SeeTRUE data from cached JSONL file...")
-                # SeeTRUE data is saved in JSONL format by HuggingFace datasets.to_json()
                 seetrue_data = []
                 processed_count = 0
                 skipped_count = 0
@@ -670,33 +621,30 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                     for i, line in enumerate(f):
                         total_lines += 1
                         try:
-                            # Parse each line as a separate JSON object (JSONL format)
                             sample = json.loads(line.strip())
                             
-                            # Process SeeTRUE-Feedback following MINT paper methodology
                             processed_sample = self._process_seetrue_as_mint_reflection(sample, i)
                             if processed_sample:
                                 reflection_samples.append(processed_sample)
                                 processed_count += 1
                                 
                                 if processed_count % 1000 == 0:
-                                    print(f"   ✅ Processed {processed_count} SeeTRUE samples for reflection training")
+                                    print(f"  Processed {processed_count} SeeTRUE samples for reflection training")
                             else:
                                 skipped_count += 1
                         except json.JSONDecodeError as e:
                             skipped_count += 1
-                            print(f"⚠️ Skipping malformed JSON line {i}: {e}")
+                            print(f"Skipping malformed JSON line {i}: {e}")
                             
                 success_rate = (processed_count / total_lines * 100) if total_lines > 0 else 0
-                print(f"✅ JSONL Processing Summary: {processed_count}/{total_lines} samples processed successfully ({success_rate:.1f}%), {skipped_count} samples skipped")
+                print(f"JSONL Processing Summary: {processed_count}/{total_lines} samples processed successfully ({success_rate:.1f}%), {skipped_count} samples skipped")
                 
             else:
-                # Try to load directly using datasets library
                 try:
                     if datasets is not None:
                         seetrue_hf_dataset = datasets.load_dataset(
                             _URLS["seetrue_feedback"]["hf_dataset_name"],
-                            split="test",  # Use 'test' split instead of 'train'
+                            split="test",
                             cache_dir=str(seetrue_raw_dir / "hf_cache"),
                             trust_remote_code=True
                         )
@@ -704,20 +652,19 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                         processed_count = 0
                         skipped_count = 0
                         for i, sample in enumerate(seetrue_hf_dataset):
-                            # Process SeeTRUE-Feedback following MINT paper methodology
                             processed_sample = self._process_seetrue_as_mint_reflection(sample, i)
                             if processed_sample:
                                 reflection_samples.append(processed_sample)
                                 processed_count += 1
                                 
                                 if processed_count % 1000 == 0:
-                                    print(f"   ✅ Processed {processed_count} SeeTRUE samples for reflection training")
+                                    print(f"Processed {processed_count} SeeTRUE samples for reflection training")
                             else:
                                 skipped_count += 1
                                 
                         total_samples = len(seetrue_hf_dataset)
                         success_rate = (processed_count / total_samples * 100) if total_samples > 0 else 0
-                        print(f"✅ SeeTRUE Processing Summary: {processed_count}/{total_samples} samples processed successfully ({success_rate:.1f}%), {skipped_count} samples skipped")
+                        print(f" SeeTRUE Processing Summary: {processed_count}/{total_samples} samples processed successfully ({success_rate:.1f}%), {skipped_count} samples skipped")
                     else:
                         raise ImportError("datasets library not available")
                         
@@ -727,7 +674,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         except Exception as e:
             raise RuntimeError(f"Error processing SeeTRUE-Feedback dataset: {e}")
         
-        print(f"✅ SeeTRUE-Feedback Processing Complete: {len(reflection_samples)} total reflection samples successfully processed")
+        print(f"SeeTRUE-Feedback Processing Complete: {len(reflection_samples)} total reflection samples successfully processed")
         
         with open(processed_data_dir / "seetrue_reflection_data.json", 'w') as f:
             json.dump(reflection_samples, f)
@@ -755,16 +702,13 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             Dict containing MINT-formatted reflection data, or None if processing fails
         """
         try:
-            # Extract core data from actual SeeTRUE sample format
             prompt = sample.get("image_caption", "")
             image = sample.get("image")
             
-            # Extract human feedback and misalignment data
             human_feedback = sample.get("human_feedback", [])
             caption_misalignment = sample.get("caption_misalignment", "")
             visual_misalignment = sample.get("visual_misalignment", "")
             
-            # Extract bounding box data (these are strings in the actual dataset)
             bbox_grounding_dino_str = sample.get("bbox_GroundingDino", "")
             bbox_pali_str = sample.get("bbox_PaLI", "")
             
@@ -774,32 +718,27 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                     missing_fields.append("prompt")
                 if not image:
                     missing_fields.append("image")
-                print(f"⚠️ Skipping SeeTRUE sample {sample_id}: Missing required fields: {', '.join(missing_fields)}")
+                print(f"Skipping SeeTRUE sample {sample_id}: Missing required fields: {', '.join(missing_fields)}")
                 return None
                 
-            # Generate MINT-style reflection text using actual SeeTRUE data
             reflection_text = "Reflection: Analyzing generated image for artifacts and misalignments using SeeTRUE-Feedback methodology. "
             reflection_text += f"Original prompt: '{prompt}' "
             
-            # Process misalignment detection
             misalignment_detected = False
             if caption_misalignment and visual_misalignment:
                 misalignment_detected = True
                 reflection_text += f"Misalignment detected: Expected '{caption_misalignment}' but found '{visual_misalignment}'. "
             
-            # Process human feedback
             if isinstance(human_feedback, list) and human_feedback:
-                feedback_summary = "; ".join(human_feedback[:2])  # Take first 2 feedback items
+                feedback_summary = "; ".join(human_feedback[:2])
                 reflection_text += f"Human feedback: {feedback_summary}. "
             elif isinstance(human_feedback, str) and human_feedback:
                 reflection_text += f"Human feedback: {human_feedback[:150]}. "
             
-            # Parse and process GroundingDino bounding boxes
             detected_artifacts = []
             grounding_dino_objects = []
             if bbox_grounding_dino_str:
                 try:
-                    # Parse the GroundingDino bbox string (it's JSON-like)
                     import ast
                     bbox_data = ast.literal_eval(bbox_grounding_dino_str)
                     if isinstance(bbox_data, dict):
@@ -807,8 +746,7 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                         labels = bbox_data.get("labels", [])
                         
                         for i, (box, label) in enumerate(zip(boxes, labels)):
-                            # Extract confidence from label if available (format: 'object(confidence)')
-                            confidence = 0.8  # Default confidence
+                            confidence = 0.8
                             clean_label = label
                             if '(' in label and ')' in label:
                                 try:
@@ -824,7 +762,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                                 "label": clean_label
                             })
                             
-                            # Add to detected artifacts if confidence is high
                             if confidence > 0.5:
                                 detected_artifacts.append({
                                     "bbox": box,
@@ -839,18 +776,17 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 except Exception as e:
                     print(f"Warning: Failed to parse GroundingDino bbox data: {e}")
             
-            # Parse and process PaLI bounding boxes (simpler format: "x1 y1 x2 y2 label")
             pali_objects = []
             if bbox_pali_str:
                 try:
                     parts = bbox_pali_str.strip().split()
-                    if len(parts) >= 5:  # x1 y1 x2 y2 label1 label2...
+                    if len(parts) >= 5:
                         x1, y1, x2, y2 = map(float, parts[:4])
                         label = " ".join(parts[4:])
                         
                         pali_objects.append({
                             "bbox": [x1, y1, x2, y2],
-                            "confidence": 0.7,  # Default confidence for PaLI
+                            "confidence": 0.7,
                             "label": label
                         })
                         
@@ -866,12 +802,10 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 except Exception as e:
                     print(f"Warning: Failed to parse PaLI bbox data: {e}")
             
-            # Calculate derived scores based on detection data
-            artifact_score = min(len(detected_artifacts) * 0.2, 1.0)  # Simple artifact scoring
+            artifact_score = min(len(detected_artifacts) * 0.2, 1.0)
             misalignment_score = 0.8 if misalignment_detected else 0.1
             overall_quality = max(0.2, 1.0 - artifact_score - (misalignment_score * 0.5))
             
-            # Add artifact score analysis
             if artifact_score > 0.3:
                 reflection_text += f"High artifact presence (score: {artifact_score:.3f}). "
                 reflection_text += "Generating artifact heatmap for targeted correction. "
@@ -884,7 +818,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 reflection_text += f"Below quality threshold (score: {overall_quality:.3f}). "
                 reflection_text += "Identifying specific regions requiring enhancement. "
                 
-            # Add MINT-specific reflection components
             reflection_text += "Performing multi-modal chain of thought analysis. "
             reflection_text += "Self-reflection on generation accuracy and semantic alignment. "
             if detected_artifacts:
@@ -892,7 +825,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             else:
                 reflection_text += "No major artifacts detected, focusing on quality enhancement."
             
-            # Return MINT-formatted reflection data
             return {
                 "image_id": f"seetrue_{sample_id}",
                 "prompt": prompt,
@@ -905,7 +837,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 "artifact_confidence": max(artifact_score, misalignment_score),
                 "grounding_dino_count": len(grounding_dino_objects),
                 "pali_detection_count": len(pali_objects),
-                # MINT-specific fields for reflection task
                 "requires_artifact_correction": artifact_score > 0.3 or len(detected_artifacts) > 0,
                 "requires_alignment_correction": misalignment_detected or misalignment_score > 0.3,
                 "requires_quality_improvement": overall_quality < 0.6,
@@ -913,16 +844,15 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             }
             
         except Exception as e:
-            print(f"⚠️ Skipping SeeTRUE sample {sample_id}: Failed to process - {e}")
+            print(f"Skipping SeeTRUE sample {sample_id}: Failed to process - {e}")
             return None
 
     def _process_brush_data(self, brush_raw_dir, processed_data_dir):
         """Process BrushData from direct wget downloads (limited to 20GB)"""
         correction_samples = []
         
-        print("🔄 Processing BrushData from direct wget downloads...")
+        print("Processing BrushData from direct wget downloads...")
         
-        # Check if we have direct downloads
         downloaded_tars_file = brush_raw_dir / "downloaded_tars.json"
         tars_dir = brush_raw_dir / "tars"
         
@@ -930,14 +860,13 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             try:
                 with open(downloaded_tars_file, 'r') as f:
                     tar_file_paths = [Path(p) for p in json.load(f)]
-                print(f"📂 Found {len(tar_file_paths)} downloaded TAR files for BrushData")
+                print(f"Found {len(tar_file_paths)} downloaded TAR files for BrushData")
             except Exception as e:
-                print(f"⚠️ Could not read downloaded TAR files list: {e}")
+                print(f"Could not read downloaded TAR files list: {e}")
                 tar_file_paths = []
         else:
-            # Fallback: look for TAR files in directory
             tar_file_paths = list(tars_dir.glob("*.tar")) if tars_dir.exists() else []
-            print(f"📂 Found {len(tar_file_paths)} TAR files in {tars_dir}")
+            print(f"Found {len(tar_file_paths)} TAR files in {tars_dir}")
         
         if not tar_file_paths:
             raise FileNotFoundError("No BrushData TAR files found")
@@ -945,30 +874,20 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             raise ImportError("Webdataset library not available. Cannot process BrushData TAR files.")
         else:
             processed_sample_count = 0
-            MAX_SAMPLES = 2000  # Process more samples since we limited download size
             
             for i, tar_file_path in enumerate(tar_file_paths):
-                if processed_sample_count >= MAX_SAMPLES:
-                    print(f"🛑 Reached {MAX_SAMPLES} sample limit, stopping processing")
-                    break
                     
-                print(f"🔄 Processing BrushData TAR file ({i+1}/{len(tar_file_paths)}): {tar_file_path.name}")
+                print(f"Processing BrushData TAR file ({i+1}/{len(tar_file_paths)}): {tar_file_path.name}")
                 try:
-                    # BrushData TAR files already contain processed data with 'image', 'caption', etc. keys
-                    # Don't use .decode() or .rename() as the data is already structured
                     dataset_shard = wds.WebDataset(str(tar_file_path))
                     
                     for sample_idx, sample in enumerate(dataset_shard):
-                        if processed_sample_count >= MAX_SAMPLES:
-                            break
-                        
-                        # Debug: Print comprehensive sample structure for first few samples
-                        if sample_idx < 3:  # Debug first 3 samples from first TAR file
-                            print(f"🔍 DEBUG Sample {sample_idx} structure:")
+
+                        if sample_idx < 3:
+                            print(f"DEBUG Sample {sample_idx} structure:")
                             print(f"   Available keys: {list(sample.keys())}")
                             for key, value in sample.items():
                                 if isinstance(value, bytes):
-                                    # Try to decode bytes to understand content
                                     try:
                                         decoded_str = value.decode('utf-8')
                                         print(f"   {key}: bytes→string ('{decoded_str[:100]}...' if len > 100)")
@@ -983,7 +902,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                                 else:
                                     print(f"   {key}: {type(value)} - {str(value)[:100]}...")
                         
-                        # Handle image data - it might be raw bytes that need to be converted to PIL
                         image_pil = None
                         mask_pil = None
                         
@@ -995,30 +913,25 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                                     image_pil = Image.open(BytesIO(image_data))
                                 except Exception as e:
                                     raise ValueError(f"Could not decode image data: {e}")
-                            elif hasattr(image_data, 'mode'):  # Already a PIL image
+                            elif hasattr(image_data, 'mode'):
                                 image_pil = image_data
                         
-                        # Handle mask/segmentation data - BrushData uses RLE JSON format
                         mask_pil = None
                         segmentation_data = None
                         if "segmentation" in sample:
                             mask_data = sample["segmentation"]
                             if isinstance(mask_data, bytes):
                                 try:
-                                    # First try: decode as JSON (RLE format)
                                     seg_text = mask_data.decode('utf-8')
                                     segmentation_data = json.loads(seg_text)
                                     
-                                    if sample_idx < 3:  # Debug output
+                                    if sample_idx < 3:
                                         print(f"   segmentation: RLE JSON with {len(segmentation_data.get('mask', []))} masks")
                                     
-                                    # Successfully parsed RLE data - we'll use this for mask generation
-                                    # For now, mark as having segmentation data (we could convert RLE to PIL later if needed)
                                     has_segmentation_data = True
                                     
                                 except json.JSONDecodeError:
                                     try:
-                                        # Second try: direct image decoding (fallback)
                                         from io import BytesIO
                                         mask_pil = Image.open(BytesIO(mask_data))
                                         has_segmentation_data = True
@@ -1032,10 +945,10 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                                     if sample_idx < 3:
                                         print(f"   segmentation: failed to parse as JSON - {e}")
                                     has_segmentation_data = False
-                            elif hasattr(mask_data, 'mode'):  # Already a PIL image
+                            elif hasattr(mask_data, 'mode'):
                                 mask_pil = mask_data
                                 has_segmentation_data = True
-                            elif isinstance(mask_data, dict):  # Already parsed JSON
+                            elif isinstance(mask_data, dict):
                                 segmentation_data = mask_data
                                 has_segmentation_data = True
                                 if sample_idx < 3:
@@ -1046,7 +959,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                         if image_pil is None:
                             raise ValueError(f"Sample {sample_idx} does not contain valid image data")
                         
-                        # Use either PIL mask or RLE segmentation data to determine if we have mask info
                         has_actual_mask = mask_pil is not None or segmentation_data is not None
                         
                         caption_text = ""
@@ -1074,21 +986,21 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                             "has_mask": has_actual_mask,
                             "task_type": task_type_content,
                             "caption": caption_text,
-                            "segmentation_rle": segmentation_data,  # Store RLE data for potential future use
-                            "mask_pil": None,  # Don't store PIL objects in JSON
-                            "has_image": True,  # Flag to indicate image availability
-                            "tar_file_path": str(tar_file_path),  # Store TAR file path for image reloading
-                            "sample_key": sample.get('__key__', sample_idx)  # Store sample key for identification
+                            "segmentation_rle": segmentation_data,
+                            "mask_pil": None,
+                            "has_image": True,
+                            "tar_file_path": str(tar_file_path),
+                            "sample_key": sample.get('__key__', sample_idx)
                         })
                         processed_sample_count += 1
                         
                         if processed_sample_count % 100 == 0:
-                            print(f"📈 Processed {processed_sample_count} BrushData samples...")
+                            print(f"Processed {processed_sample_count} BrushData samples...")
                             
                 except Exception as e_tar:
                     raise RuntimeError(f"Error processing TAR file {tar_file_path}: {e_tar}") 
                     
-            print(f"✅ Processed {processed_sample_count} samples from {len(tar_file_paths)} BrushData TAR files")
+            print(f"Processed {processed_sample_count} samples from {len(tar_file_paths)} BrushData TAR files")
 
         if not correction_samples:
             raise RuntimeError("No correction data was successfully processed from BrushData TAR files")
@@ -1108,29 +1020,27 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 missing_fields.append("tar_file_path")
             if sample_key is None:
                 missing_fields.append("sample_key")
-            print(f"⚠️ Warning: Cannot reload image - missing required fields: {', '.join(missing_fields)}")
+            print(f"Warning: Cannot reload image - missing required fields: {', '.join(missing_fields)}")
             return None
             
         try:
-            # Open the specific TAR file and find the sample
             dataset_shard = wds.WebDataset(tar_file_path)
             
             for sample in dataset_shard:
                 if sample.get('__key__') == sample_key:
-                    # Found the matching sample, extract image
                     if "image" in sample:
                         image_data = sample["image"]
                         if isinstance(image_data, bytes):
                             from io import BytesIO
                             return Image.open(BytesIO(image_data))
-                        elif hasattr(image_data, 'mode'):  # Already a PIL image
+                        elif hasattr(image_data, 'mode'):
                             return image_data
                     break
                     
         except Exception as e:
-            print(f"⚠️ Warning: Could not reload image from TAR file {tar_file_path}: {e}")
+            print(f"Warning: Could not reload image from TAR file {tar_file_path}: {e}")
             
-        print(f"⚠️ Warning: Failed to find or load image with key '{sample_key}' from TAR file {tar_file_path}")
+        print(f"Warning: Failed to find or load image with key '{sample_key}' from TAR file {tar_file_path}")
         return None
 
     def _generate_mint_correction_text(self, has_mask=True, task_type="inpainting", caption="", mask_coverage=0.0):
@@ -1182,13 +1092,11 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         average_radius = math.sqrt(H*H + W*W) / 8
         mask = Image.new('L', (W, H), 0)
         
-        # Generate random number of brush strokes (authentic BrushNet uses np.random.randint)
         for _ in range(np.random.randint(1, max_tries)):
             num_vertex = np.random.randint(min_num_vertex, max_num_vertex)
             angle_min = mean_angle - np.random.uniform(0, angle_range)
             angle_max = mean_angle + np.random.uniform(0, angle_range)
             
-            # Generate angles for each vertex (authentic BrushNet approach)
             angles = []
             vertex = []
             for i in range(num_vertex):
@@ -1197,10 +1105,8 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 else:
                     angles.append(np.random.uniform(angle_min, angle_max))
             
-            # Start with random position
             vertex.append((int(np.random.randint(0, W)), int(np.random.randint(0, H))))
             
-            # Generate subsequent vertices
             for i in range(num_vertex):
                 r = np.clip(
                     np.random.normal(loc=average_radius, scale=average_radius//2),
@@ -1209,12 +1115,10 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 new_y = np.clip(vertex[-1][1] + r * math.sin(angles[i]), 0, H)
                 vertex.append((int(new_x), int(new_y)))
 
-            # Draw the brush stroke
             draw = ImageDraw.Draw(mask)
             width = int(np.random.uniform(min_width, max_width))
             draw.line(vertex, fill=1, width=width)
             
-            # Draw ellipses at each vertex for brush tip effect (authentic BrushNet approach)
             for v in vertex:
                 draw.ellipse((v[0] - width//2,
                             v[1] - width//2,
@@ -1222,7 +1126,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                             v[1] + width//2),
                             fill=1)
         
-        # Apply random transformations (authentic BrushNet approach)
         if np.random.random() > 0.5:
             mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
         if np.random.random() > 0.5:
@@ -1238,8 +1141,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
     def _brushnet_random_mask_gen(self, h, w):
         """Generate random mask following authentic BrushNet methodology"""
         mask = np.ones((h, w), np.uint8)
-        # hole denoted as 0, reserved as 1 (authentic BrushNet approach)
-        # Use np.logical_and as in authentic implementation
         brush_mask = self._brushnet_random_brush_gen(4, h, w)
         mask = np.logical_and(mask, 1 - brush_mask).astype(np.float32)
         return mask
@@ -1258,45 +1159,45 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                 for ps_json in planning_samples_json:
                     ps_json["image"] = None 
                     planning_samples.append(ps_json)
-                print(f"📄 Loaded {len(planning_samples)} planning samples from JSON")
+                print(f"Loaded {len(planning_samples)} planning samples from JSON")
             except FileNotFoundError: 
-                print(f"❌ ERROR: planning_data.json not found in {processed_data_dir}")
+                print(f"ERROR: planning_data.json not found in {processed_data_dir}")
                 raise FileNotFoundError("planning_data.json not found - required for MCoT examples generation")
             except Exception as e:
-                print(f"❌ ERROR: Failed to load planning_data.json: {e}")
+                print(f"ERROR: Failed to load planning_data.json: {e}")
                 raise
         
         if not richhf_reflection_samples:
             try:
                 with open(processed_data_dir / "richhf_reflection_data.json", 'r') as f: richhf_reflection_samples = json.load(f)
-                print(f"📄 Loaded {len(richhf_reflection_samples)} RichHF reflection samples from JSON")
+                print(f"Loaded {len(richhf_reflection_samples)} RichHF reflection samples from JSON")
             except FileNotFoundError: 
-                print(f"❌ ERROR: richhf_reflection_data.json not found in {processed_data_dir}")
+                print(f"ERROR: richhf_reflection_data.json not found in {processed_data_dir}")
                 raise FileNotFoundError("richhf_reflection_data.json not found - required for MCoT examples generation")
             except Exception as e:
-                print(f"❌ ERROR: Failed to load richhf_reflection_data.json: {e}")
+                print(f"ERROR: Failed to load richhf_reflection_data.json: {e}")
                 raise
         
         if not seetrue_reflection_samples:
             try:
                 with open(processed_data_dir / "seetrue_reflection_data.json", 'r') as f: seetrue_reflection_samples = json.load(f)
-                print(f"📄 Loaded {len(seetrue_reflection_samples)} SeeTRUE reflection samples from JSON")
+                print(f"Loaded {len(seetrue_reflection_samples)} SeeTRUE reflection samples from JSON")
             except FileNotFoundError: 
-                print(f"❌ ERROR: seetrue_reflection_data.json not found in {processed_data_dir}")
+                print(f"ERROR: seetrue_reflection_data.json not found in {processed_data_dir}")
                 raise FileNotFoundError("seetrue_reflection_data.json not found - required for MCoT examples generation")
             except Exception as e:
-                print(f"❌ ERROR: Failed to load seetrue_reflection_data.json: {e}")
+                print(f"ERROR: Failed to load seetrue_reflection_data.json: {e}")
                 raise
 
         if not correction_samples:
             try:
                 with open(processed_data_dir / "correction_data.json", 'r') as f: correction_samples = json.load(f)
-                print(f"📄 Loaded {len(correction_samples)} BrushData correction samples from JSON")
+                print(f"Loaded {len(correction_samples)} BrushData correction samples from JSON")
             except FileNotFoundError: 
-                print(f"❌ ERROR: correction_data.json not found in {processed_data_dir}")
+                print(f"ERROR: correction_data.json not found in {processed_data_dir}")
                 raise FileNotFoundError("correction_data.json not found - required for MCoT examples generation")
             except Exception as e:
-                print(f"❌ ERROR: Failed to load correction_data.json: {e}")
+                print(f"ERROR: Failed to load correction_data.json: {e}")
                 raise
 
         mcot_examples = []
@@ -1305,52 +1206,43 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         num_seetrue_reflection = len(seetrue_reflection_samples) if seetrue_reflection_samples else 0
         num_correction = len(correction_samples) if correction_samples else 0
 
-        print(f"📊 MCoT Data Summary:")
-        print(f"   📝 Planning samples: {num_planning}")
-        print(f"   🤔 RichHF reflection samples: {num_richhf_reflection}")
-        print(f"   👁️  SeeTRUE reflection samples: {num_seetrue_reflection}")
-        print(f"   🎨 BrushData correction samples: {num_correction}")
+        print(f"MCoT Data Summary:")
+        print(f"    Planning samples: {num_planning}")
+        print(f"    RichHF reflection samples: {num_richhf_reflection}")
+        print(f"    SeeTRUE reflection samples: {num_seetrue_reflection}")
+        print(f"    BrushData correction samples: {num_correction}")
 
         if num_planning == 0: 
-            print(f"❌ ERROR: No planning samples available to generate MCoT examples")
+            print(f"ERROR: No planning samples available to generate MCoT examples")
             raise RuntimeError("No planning samples available to generate MCoT examples") 
 
         for i in range(num_planning):
             planning_sample = planning_samples[i]
             image_id = planning_sample.get("image_id", f"mcot_{i}")
             
-            # For MCoT examples, we need actual images. Since planning samples (ActPlan) are text-only,
-            # we skip MCoT generation when no images are available (fail fast approach)
             if not hasattr(self, 'brush_correction_samples') or not self.brush_correction_samples:
-                print(f"❌ ERROR: No BrushData correction samples with images available for MCoT generation")
+                print(f"ERROR: No BrushData correction samples with images available for MCoT generation")
                 print(f"   This means either BrushData failed to download or process correctly")
                 break
                 
-            # Use image from correction samples that have actual PIL images  
             correction_s = correction_samples[i % num_correction] if num_correction > 0 else {}
             
-            # Reload PIL image from TAR file using stored metadata
             pil_image_obj = None
             if correction_s.get("has_image", False):
                 try:
                     pil_image_obj = self._reload_image_from_tar(correction_s)
                     if pil_image_obj is None:
-                        print(f"⚠️ Warning: Failed to reload image from TAR file for sample {i}")
+                        print(f"Warning: Failed to reload image from TAR file for sample {i}")
                 except Exception as e:
-                    print(f"⚠️ Warning: Error reloading image for sample {i}: {e}")
+                    print(f"Warning: Error reloading image for sample {i}: {e}")
                     pil_image_obj = None
             
-            # Skip examples without valid PIL images (fail fast approach)
             if not isinstance(pil_image_obj, Image.Image):
-                print(f"⚠️ Warning: Skipping MCoT example {i} - no valid PIL image (type: {type(pil_image_obj)})")
+                print(f"Warning: Skipping MCoT example {i} - no valid PIL image (type: {type(pil_image_obj)})")
                 continue
 
-            # MINT paper uses both RichHF-18K AND manually annotated images for reflection
-            # We use SeeTrue as replacement for the 5,000 manually annotated MINT images
-            # Combine both datasets to fully replicate MINT reflection methodology
             reflection_s = {}
             if num_richhf_reflection > 0 and num_seetrue_reflection > 0:
-                # Use both sources - randomly choose between RichHF and SeeTrue
                 if i % 2 == 0:
                     reflection_s = richhf_reflection_samples[i % num_richhf_reflection]
                 else:
@@ -1360,7 +1252,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             elif num_seetrue_reflection > 0:
                 reflection_s = seetrue_reflection_samples[i % num_seetrue_reflection]
 
-            # For acting step, we'll use planning prompt since RichHF is now used for reflection
             acting_prompt = planning_sample.get("prompt", f"Generate image for {image_id}")
             acting_text = f"Generating image based on prompt: {acting_prompt}"
 
@@ -1379,33 +1270,33 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             }
             mcot_examples.append(mcot_example)
 
-        print(f"🎯 Generated {len(mcot_examples)} total MCoT examples")
+        print(f"Generated {len(mcot_examples)} total MCoT examples")
         
         random.shuffle(mcot_examples)
         split_idx = int(0.9 * len(mcot_examples))
         train_examples = mcot_examples[:split_idx]
         val_examples = mcot_examples[split_idx:]
 
-        print(f"📂 Creating train split with {len(train_examples)} examples...")
+        print(f"Creating train split with {len(train_examples)} examples...")
         self._save_mcot_examples_split(train_examples, processed_data_dir / "train")
         
-        print(f"📂 Creating val split with {len(val_examples)} examples...")
+        print(f"Creating val split with {len(val_examples)} examples...")
         self._save_mcot_examples_split(val_examples, processed_data_dir / "val")
-        
-        print(f"✅ MCoT examples saved successfully!")
-        print(f"   📁 Train directory: {processed_data_dir / 'train'}")
-        print(f"   📁 Val directory: {processed_data_dir / 'val'}")
+
+        print(f"MCoT examples saved successfully!")
+        print(f"Train directory: {processed_data_dir / 'train'}")
+        print(f"Val directory: {processed_data_dir / 'val'}")
 
     def _save_mcot_examples_split(self, examples, output_dir_split):
-        print(f"📁 Creating split directory: {output_dir_split}")
+        print(f"Creating split directory: {output_dir_split}")
         output_dir_split.mkdir(parents=True, exist_ok=True)
         
         if not output_dir_split.exists():
-            print(f"❌ ERROR: Failed to create directory {output_dir_split}")
+            print(f"ERROR: Failed to create directory {output_dir_split}")
             raise RuntimeError(f"Could not create directory {output_dir_split}")
         
-        print(f"✅ Directory created successfully: {output_dir_split}")
-        print(f"📄 Saving {len(examples)} examples to {output_dir_split}")
+        print(f"Directory created successfully: {output_dir_split}")
+        print(f"Saving {len(examples)} examples to {output_dir_split}")
         
         for i, example in enumerate(examples):
             image_id_val = example.get('image_id', f"unknown_{i}")
@@ -1426,20 +1317,20 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
                     try:
                         pil_image.convert("RGB").save(image_file_path, "JPEG")
                     except Exception as e:
-                        print(f"❌ ERROR: Could not save PIL image for {image_id_val}: {e}")
+                        print(f"ERROR: Could not save PIL image for {image_id_val}: {e}")
                         raise RuntimeError(f"Could not save PIL image for {image_id_val}: {e}")
                 else:
-                    print(f"❌ ERROR: No valid PIL image provided for {image_id_val} (type: {type(pil_image)})")
+                    print(f"ERROR: No valid PIL image provided for {image_id_val} (type: {type(pil_image)})")
                     raise ValueError(f"No valid PIL image provided for {image_id_val}")
                     
                 if (i + 1) % 10 == 0:
-                    print(f"   ✅ Saved {i + 1}/{len(examples)} examples")
+                    print(f"Saved {i + 1}/{len(examples)} examples")
                     
             except Exception as e:
-                print(f"❌ ERROR: Failed to save example {image_id_val}: {e}")
+                print(f"ERROR: Failed to save example {image_id_val}: {e}")
                 raise
         
-        print(f"✅ Successfully saved all {len(examples)} examples to {output_dir_split}")
+        print(f"Successfully saved all {len(examples)} examples to {output_dir_split}")
 
     def _generate_examples(self, data_dir):
         data_path = Path(data_dir)
@@ -1470,7 +1361,6 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             }
 
 
-# Main execution block for direct script usage
 if __name__ == "__main__":
     import argparse
     
@@ -1488,15 +1378,12 @@ if __name__ == "__main__":
     print(f"Output directory: {args.output_dir}")
     print(f"Cache directory: {args.cache_dir}")
     
-    # Process data directly without using HuggingFace datasets builder framework
     try:
-        # Create directory structure
         output_path = Path(args.output_dir)
         cache_path = Path(args.cache_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         cache_path.mkdir(parents=True, exist_ok=True)
         
-        # Create a simple download manager-like object
         class SimpleDownloadManager:
             def __init__(self, cache_dir):
                 self.cache_dir = cache_dir
@@ -1512,21 +1399,17 @@ if __name__ == "__main__":
                 if not local_path.exists():
                     print(f"Downloading {url} using wget...")
                     try:
-                        # Use wget with robust options:
-                        # -c: continue partial downloads
-                        # --timeout=0: no connection timeout (wait indefinitely)
-                        # --tries=3: retry up to 3 times
-                        # --progress=bar: show progress bar
+
                         wget_cmd = [
                             'wget',
-                            '-c',                    # Continue partial downloads
-                            '--timeout=0',           # No connection timeout (wait indefinitely)
-                            '--tries=3',             # Reasonable number of retries
-                            '--wait=5',              # Wait 5 seconds between retries
-                            '--progress=bar:force',  # Force progress bar display
-                            '--show-progress',       # Show download progress
-                            '--user-agent=Mozilla/5.0 (compatible; Research Bot)', # Add user agent
-                            '-O', str(local_path),   # Output to specific file
+                            '-c',
+                            '--timeout=0',
+                            '--tries=3',
+                            '--wait=5',
+                            '--progress=bar:force',
+                            '--show-progress',
+                            '--user-agent=Mozilla/5.0 (compatible; Research Bot)',
+                            '-O', str(local_path),
                             url
                         ]
                         
@@ -1534,38 +1417,37 @@ if __name__ == "__main__":
                         result = subprocess.run(
                             wget_cmd, 
                             check=True, 
-                            capture_output=False,  # Show wget output directly
+                            capture_output=False,
                             text=True,
-                            timeout=None  # No subprocess timeout - allow downloads to complete
+                            timeout=None
                         )
-                        print(f"✅ Download completed: {local_path}")
+                        print(f"Download completed: {local_path}")
                         
                     except subprocess.CalledProcessError as e:
-                        print(f"❌ wget failed with exit code {e.returncode}: {url}")
+                        print(f"wget failed with exit code {e.returncode}: {url}")
                         if local_path.exists():
-                            local_path.unlink()  # Remove partial/corrupted file
+                            local_path.unlink()
                         raise
                     except FileNotFoundError:
-                        print("❌ wget not found. Please install wget or use alternative download method.")
+                        print("wget not found. Please install wget or use alternative download method.")
                         raise
                 else:
-                    print(f"📁 File already exists: {local_path}")
+                    print(f"File already exists: {local_path}")
                 
-                # Extract if it's a zip file
                 if filename.endswith('.zip'):
                     extract_dir = local_path.parent / filename.replace('.zip', '')
                     if not extract_dir.exists():
-                        print(f"📦 Extracting {local_path}...")
+                        print(f"Extracting {local_path}...")
                         try:
                             with zipfile.ZipFile(local_path, 'r') as zip_ref:
                                 zip_ref.extractall(extract_dir)
-                            print(f"✅ Extraction completed: {extract_dir}")
+                            print(f"Extraction completed: {extract_dir}")
                         except zipfile.BadZipFile:
-                            print(f"❌ Corrupted zip file: {local_path}")
-                            local_path.unlink()  # Remove corrupted file
+                            print(f"Corrupted zip file: {local_path}")
+                            local_path.unlink()
                             raise
                     else:
-                        print(f"📁 Already extracted: {extract_dir}")
+                        print(f"Already extracted: {extract_dir}")
                     return str(extract_dir)
                     
                 return str(local_path)
@@ -1574,11 +1456,9 @@ if __name__ == "__main__":
                 """Placeholder for download_config - not needed for our direct processing"""
                 pass
         
-        # Create dataset builder and process data
         dataset_builder = MCoTWgetDataset()
         dl_manager = SimpleDownloadManager(str(cache_path))
         
-        # Call the split generators directly to process the data
         print("Processing MCoT dataset components...")
         split_generators = dataset_builder._split_generators(dl_manager)
         

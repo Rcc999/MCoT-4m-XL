@@ -1,29 +1,21 @@
-# MCoT Data Pipeline Configuration
-# 
-# This configuration defines the data pipeline for Multi-step Chain of Thought training.
-# It specifies input/output modalities, data augmentation, and processing parameters.
-#
-# Key concepts:
-# - in_domains: What the model receives as input (image + caption)
-# - out_domains: What the model learns to generate (MCoT step sequence)
-# - alphas: Sampling weights for different sequence lengths/modalities
+
 
 train:
   datasets:
     mcot:
-      type: mcot                    # Use MCoT dataset type
-      use_wds: false               # Use directory format, not WebDataset
-      in_domains: rgb@224-caption  # Input: 224x224 RGB image + text caption
-      out_domains: caption-planning-acting-reflection-correction-final_response  # Output: Full MCoT sequence
-      input_alphas: "3.0-2.5-2.0-1.5-1.0-1.0"    # Sampling weights for input modalities
-      target_alphas: "3.0-2.5-2.0-1.5-1.0-1.0"   # Sampling weights for target modalities
-      alphas_config: null          # Use alphas above instead of separate config
-      data_path: mcot_data/mcot_dataset_cache/processed_mcot_steps  # Path to processed MCoT data
-      aligned_captions: true       # Use aligned image-caption pairs
-      hflip: 0.5                  # Horizontal flip augmentation probability
-      crop_scale: [0.5, 1.0]      # Random crop scale range
-      crop_ratio: [0.75, 1.3333]  # Random crop aspect ratio range
-  weights: [1.0]                  # Dataset weight (single dataset = 1.0)
+      type: mcot
+      use_wds: false
+      in_domains: rgb@224-caption
+      out_domains: caption-planning-acting-reflection-correction-final_response
+      input_alphas: "3.0-2.5-2.0-1.5-1.0-1.0"
+      target_alphas: "3.0-2.5-2.0-1.5-1.0-1.0"
+      alphas_config: null
+      data_path: mcot_data/mcot_dataset_cache/processed_mcot_steps
+      aligned_captions: true
+      hflip: 0.5
+      crop_scale: [0.5, 1.0]
+      crop_ratio: [0.75, 1.3333]
+  weights: [1.0]
 
 val:
   datasets:
@@ -32,12 +24,12 @@ val:
       use_wds: false
       in_domains: rgb@224-caption
       out_domains: caption-planning-acting-reflection-correction-final_response
-      data_path: mcot_data/mcot_dataset_cache/processed_mcot_steps  # Same path for validation
+      data_path: mcot_data/mcot_dataset_cache/processed_mcot_steps
 
 transform_keys:
-  - normal                        # Use standard image transforms
+  - normal
 
 extras:
-  text_to_caption: false          # Don't convert generic text to caption format
-  insert_sep_between_answers: true # Add separators between MCoT step outputs
-  insert_image_at_beginning: true  # Place image tokens at start of sequence
+  text_to_caption: false
+  insert_sep_between_answers: true
+  insert_image_at_beginning: true
