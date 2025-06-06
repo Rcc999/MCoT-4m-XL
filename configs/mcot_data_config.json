@@ -1,10 +1,10 @@
 {
   "name": "mcot_training_data",
-  "description": "MCoT training dataset with step-specific data",
+  "description": "Configuration for MCoT training data - defines datasets, modalities, and preprocessing settings",
   "datasets": [
     {
       "name": "mcot_base",
-      "type": "multimodal_dataset_folder",
+      "type": "multimodal_dataset_folder", 
       "path": "data/mcot_training_dataset.json",
       "split": "train",
       "modalities": ["rgb", "caption", "planning", "acting", "reflection", "correction"],
@@ -18,7 +18,7 @@
     "acting": 1.0, 
     "reflection": 1.0,
     "correction": 1.0
-  },
+    },
   "preprocessing": {
     "image_size": 224,
     "patch_size": 16,

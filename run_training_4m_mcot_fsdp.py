@@ -13,15 +13,17 @@
 # limitations under the License.
 
 """
-4M MCoT Training Script with MINT Paper Features
-Based on the proven run_training_4m_fsdp.py but adapted for MCoT training.
+Multi-step Chain of Thought (MCoT) Training for 4M Models
 
-This script adds MCoT capabilities to 4M training, incorporating:
-- Step-specific loss computation for Planning, Acting, Reflection, Correction
-- Artifact heatmap generation during reflection
-- Reflection-guided mask generation for correction
-- MINT paper methodology integration
-- SeeTRUE-Feedback dataset integration for enhanced reflection training
+This script trains 4M models using the MCoT reasoning framework, which breaks down
+image generation into four sequential steps:
+1. Planning: Analyze the prompt and plan the visual layout
+2. Acting: Generate the initial image based on the plan
+3. Reflection: Evaluate the generated image and identify issues
+4. Correction: Fix identified problems to improve the final result
+
+The training uses specialized loss functions for each step and integrates
+artifact detection capabilities for better reflection performance.
 """
 
 import argparse
@@ -69,6 +71,7 @@ except ImportError:
 
 
 def get_args():
+    """Parse command line arguments for MCoT training with FSDP."""
     config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
     parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
                         help='YAML config file specifying default arguments')
@@ -179,7 +182,7 @@ def get_args():
     parser.add_argument('--text_tokenizer_path', default='fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json',
                         help="Path to trained text tokenizer")
 
-    # Eval
+    # Evaluation configuration for MCoT training validation
     parser.add_argument('--eval_freq', default=10, type=int, help="frequency of evaluation")
     parser.add_argument('--dist_eval', action='store_true', default=False,
                         help='Enabling distributed evaluation')
@@ -255,7 +258,7 @@ def get_args():
     parser.add_argument('--enable_mint_features', action='store_true',
                         help="Enable MINT paper features (artifact heatmaps, reflection-guided masks)")
 
-    # Parse config file if there is one
+    # Load config file if provided
     args_config, remaining = config_parser.parse_known_args()
 
     if args_config.config:
@@ -263,22 +266,23 @@ def get_args():
             cfg = yaml.safe_load(f)
             parser.set_defaults(**cfg)            
 
-    # The main arg parser parses the rest of the args, the usual
-    # defaults will have been overridden if config file is specified.
+    # Parse remaining arguments
     args = parser.parse_args(remaining)
-
-    # Add the config path as a final args if given
     args.config_path = args_config.config
 
     return args
 
 
 def setup_modality_info(args):
-    """Setup modality information based on args - matches base script structure."""
-    # Global modality info
+    """
+    Configure modality information for 4M model with MCoT extensions.
+    
+    Sets up token limits and processing parameters for each modality type,
+    including the new MCoT step modalities (planning, acting, reflection, correction).
+    """
     modality_info = {mod: MODALITY_INFO[mod] for mod in MODALITY_INFO.keys()}
     
-    # Max tokens
+    # Calculate max tokens for image modalities based on patch size
     for mod in modality_info:
         image_size, patch_size = modality_info[mod].get('input_size', args.input_size), modality_info[mod].get('patch_size', args.patch_size)
         num_patches = (image_size // patch_size) ** 2
@@ -289,7 +293,13 @@ def setup_modality_info(args):
 
 
 def setup_data(args):
-    """Setup data loaders following base 4M script structure with MCoT data integration."""
+    """
+    Initialize data loaders for MCoT training.
+    
+    Sets up the data pipeline with proper tokenization, modality transforms,
+    and MCoT-specific dataset handling. Supports both single-dataset and 
+    mixture training configurations.
+    """
     text_tokenizer = Tokenizer.from_file(args.text_tokenizer_path)
     
     # Load data config
@@ -439,6 +449,7 @@ def get_model(args, modality_info):
             else:
                 encoder_embeddings[mod] = info["encoder_embedding"]()
 
+    # Create decoder embeddings for output modalities
     decoder_embeddings = {}
     for mod in args.out_domains:
         info = modality_info[mod]
@@ -449,6 +460,7 @@ def get_model(args, modality_info):
             else:
                 decoder_embeddings[mod] = info["decoder_embedding"]()
 
+    # Create base 4M model
     model = create_model(
         args.model,
         encoder_embeddings=encoder_embeddings,
@@ -457,7 +469,7 @@ def get_model(args, modality_info):
         num_register_tokens=args.num_register_tokens,
     )
     
-    # Enhance with MCoT capabilities if specified
+    # Add MCoT reasoning capabilities if configured
     if hasattr(args, 'mcot_steps') and args.mcot_steps:
         print("Adding MCoT capabilities to base model...")
         mcot_processor = MCoTStepProcessor(
@@ -473,7 +485,7 @@ def get_model(args, modality_info):
             }
         )
         
-        # Wrap model with MCoT capabilities
+        # Wrap model with MCoT wrapper (non-invasive enhancement)
         model = add_mcot_to_model(model, mcot_processor)
     
     return model
@@ -485,7 +497,12 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
                     lr_scheduler=None, start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
                     all_domains: List[str] = [], dtype: torch.dtype = torch.float16, loader_len: Optional[int] = None,
                     output_dir=None, total_batch_size=None, skip_nan_grad=False, args=None):
-    """Train one epoch following original FSDP script structure with MCoT enhancements."""
+    """
+    Train for one epoch with MCoT-aware loss computation.
+    
+    Handles step-specific loss weighting for MCoT training while maintaining
+    compatibility with standard 4M training. Uses FSDP for distributed training.
+    """
     
     model.train()
     
@@ -515,7 +532,7 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
     
     optimizer.zero_grad()
     
-    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header=header)):
         step = data_iter_step // accum_iter
         if step >= loader_len:
             continue
@@ -695,7 +712,7 @@ def evaluate(model, data_loader, device, num_input_tokens, num_target_tokens, lo
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = prefix
     
-    for batch in metric_logger.log_every(data_loader, 10, header):
+    for batch in metric_logger.log_every(data_loader, 10, header=header):
         # Prepare batch data - handle both formats
         if isinstance(batch, dict) and 'mod_dict' in batch:
             # MCoT format batch
@@ -796,7 +813,18 @@ def compute_mcot_total_loss(step_losses, step_weights=None):
 
 
 def main(args):
-    """Main training function."""
+    """
+    Main training loop for MCoT with FSDP distributed training.
+    
+    Handles the complete training pipeline:
+    1. Initialize distributed training and devices
+    2. Set up model, data loaders, and optimizers  
+    3. Wrap model with MCoT capabilities
+    4. Run training loop with step-specific loss weighting
+    5. Handle checkpointing and evaluation
+    
+    Uses PyTorch FSDP for efficient multi-GPU training of large models.
+    """
     utils.init_distributed_mode(args)
 
     print(f"Job dir: {os.path.dirname(os.path.realpath(__file__))}")
@@ -804,16 +832,17 @@ def main(args):
 
     device = torch.device(args.device)
     
-    # Set num_tasks for distributed training - essential for data loading
+    # Configure distributed training
     num_tasks = utils.get_world_size()
     args.num_tasks = num_tasks
     
+    # Set random seeds for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     cudnn.benchmark = True
 
-    # Set up dtype
+    # Configure mixed precision training
     if args.dtype in ['float16', 'fp16']:
         dtype = torch.float16
     elif args.dtype in ['bfloat16', 'bf16']:
@@ -1003,21 +1032,14 @@ def main(args):
     if utils.is_main_process():
         if args.log_wandb:
             try:
-                import wandb
-                wandb.init(
-                    project=args.wandb_project,
-                    name=args.wandb_run_name if args.wandb_run_name != 'auto' else args.run_name,
-                    entity=args.wandb_entity,
-                    config=vars(args)
-                )
-                log_writer = utils.WandbLogger()
+                log_writer = utils.WandbLogger(args)
                 print("Wandb logging enabled")
             except Exception as e:
                 print(f"Failed to initialize wandb: {e}")
                 log_writer = None
         else:
-            log_writer = utils.TensorboardLogger(log_dir=args.output_dir)
-            print("Tensorboard logging enabled")
+            log_writer = None
+            print("No logging enabled")
 
     # Create output directory
     if args.output_dir:

@@ -1,3 +1,28 @@
+"""
+MCoT Dataset Download and Processing Script
+
+This script downloads and processes multiple datasets to create training data for 
+Multi-step Chain of Thought (MCoT) reasoning. It combines data from several sources:
+
+1. **ActPlan**: Replaces Visual Genome, provides action planning data
+2. **RichHF-18K**: Human feedback data for multimodal reasoning  
+3. **SeeTRUE-Feedback**: Artifact detection and feedback data (used for MINT reflection)
+4. **BrushData**: Image editing and correction data
+
+The script processes each dataset and formats them into a unified JSON structure
+suitable for MCoT training, where each example contains:
+- Original prompt/instruction
+- Planning step output  
+- Acting step output
+- Reflection step output (with artifact detection)
+- Correction step output
+
+Usage:
+    python mcot_dataset_wget.py --output_dir ./processed_data --max_samples 1000
+
+The script handles missing files gracefully and can resume interrupted downloads.
+"""
+
 import csv
 import json
 import os
@@ -32,13 +57,20 @@ _CITATION = """
 """
 
 _DESCRIPTION = """
-Multimodal Chain of Thought (MCoT) dataset combining data from actplan (replacing Visual Genome), RichHF-18K,
-SeeTRUE-Feedback, and BrushData to create a step-by-step multimodal reasoning pipeline.
+Multi-step Chain of Thought (MCoT) Dataset for Enhanced Image Generation
+
+This dataset combines multiple sources to create a comprehensive training set for MCoT reasoning:
+- ActPlan: Action planning and spatial reasoning data  
+- RichHF-18K: Human feedback for multimodal tasks
+- SeeTRUE-Feedback: Artifact detection and quality assessment
+- BrushData: Image editing and correction examples
+
+Each example follows the MCoT pipeline: Planning → Acting → Reflection → Correction
 """
 
 _URLS = {
     "actplan": {
-        "local_json_file": "actplan.json"  # Located in same directory as this script
+        "local_json_file": "actplan.json"  # Local file containing action planning data
     },
     "richhf18k": {
         "tfrecord_urls": {
@@ -48,7 +80,7 @@ _URLS = {
         }
     },
     "seetrue_feedback": {
-        "hf_dataset_name": "mismatch-quest/SeeTRUE-Feedback"
+        "hf_dataset_name": "mismatch-quest/SeeTRUE-Feedback"  # Hugging Face dataset
     },
     "brush_data": {
         "base_tar_url": "https://huggingface.co/datasets/random123123/BrushData/resolve/main/",
@@ -89,7 +121,16 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
         )
 
     def _download_all_datasets_first(self, dl_manager, base_data_dir):
-        """Download all datasets first using wget, then process from cache"""
+        """
+        Download all datasets to local cache before processing.
+        
+        This approach prevents re-downloading if processing fails partway through.
+        Downloads happen in parallel where possible for efficiency.
+        
+        Args:
+            dl_manager: Hugging Face datasets download manager
+            base_data_dir: Base directory for storing raw datasets
+        """
         print("🚀 Step 1: Downloading all datasets first...")
         
         # Create cache directories
@@ -315,7 +356,20 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
             json.dump([str(p) for p in downloaded_files], f)
 
     def _process_actplan(self, processed_data_dir):
-        """Process actplan dataset that has short captions, dense captions, and bounding boxes"""
+        """
+        Process ActPlan dataset into MCoT planning step format.
+        
+        ActPlan contains action planning data with:
+        - Short captions (basic descriptions)
+        - Dense captions (detailed descriptions) 
+        - Bounding boxes (spatial layouts)
+        
+        This data is perfect for the MCoT planning step, which requires
+        detailed descriptions and spatial reasoning.
+        
+        Args:
+            processed_data_dir: Directory to save processed planning examples
+        """
         planning_samples = []
         
         # Load actplan.json from the mcot_data directory
@@ -681,16 +735,20 @@ class MCoTWgetDataset(datasets.GeneratorBasedBuilder):
 
     def _process_seetrue_as_mint_reflection(self, sample, sample_id):
         """
-        Process SeeTRUE-Feedback sample into MINT reflection format using actual SeeTRUE data structure.
+        Convert SeeTRUE-Feedback data into MINT-style reflection format.
+        
+        SeeTRUE provides human feedback about image-caption misalignments, which is perfect 
+        for the MCoT reflection step. This function extracts:
+        - Artifact locations (bounding boxes)
+        - Misalignment descriptions  
+        - Human feedback comments
+        - Confidence scores for detected issues
+        
+        This enhanced reflection data helps the model learn to identify and articulate
+        problems in generated images more effectively.
         
         Args:
-            sample: SeeTRUE-Feedback sample with actual format:
-                   - image_caption: string
-                   - human_feedback: string  
-                   - caption_misalignment: string
-                   - visual_misalignment: string
-                   - bbox_GroundingDino: string (JSON-like)
-                   - bbox_PaLI: string (bbox coordinates)
+            sample: SeeTRUE-Feedback sample with human annotations
             sample_id: Unique identifier for the sample
             
         Returns:

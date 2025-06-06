@@ -1,60 +1,71 @@
-# MCoT Training Configuration for SLURM/SCITAS
-# Based on 4M FSDP training with MCoT enhancements
+# MCoT Training Configuration 
+# 
+# This configuration file defines all parameters for training 4M models with 
+# Multi-step Chain of Thought (MCoT) reasoning capabilities.
+#
+# MCoT breaks image generation into 4 sequential steps:
+# 1. Planning: Create detailed descriptions and layout plans
+# 2. Acting: Generate initial image based on the plan
+# 3. Reflection: Analyze the image for artifacts and issues  
+# 4. Correction: Apply targeted fixes to improve the result
+#
+# The configuration supports both single-node and multi-node training with FSDP.
 
-# Data configuration
-data_config: "cfgs/default/4m/data/mcot/mcot.yaml"
+# === Data Configuration ===
+data_config: "cfgs/default/4m/data/mcot/mcot.yaml"  # Path to data pipeline config
 text_tokenizer_path: "fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
 
-# Model configuration
-model: "fm_base_12e_12d_swiglu_nobias"
-finetune: "https://huggingface.co/EPFL-VILAB/4M-7_B_CC12M/resolve/main/model.safetensors"
-input_size: 224
-patch_size: 16
+# === Model Configuration ===
+model: "fm_base_12e_12d_swiglu_nobias"  # Base 4M architecture 
+finetune: "https://huggingface.co/EPFL-VILAB/4M-7_B_CC12M/resolve/main/model.safetensors"  # Pretrained weights
+input_size: 224  # Image input resolution
+patch_size: 16   # Vision transformer patch size
 
-# Training configuration
-batch_size: 32
-epochs: 50
-epoch_size: 90  # Number of training steps per epoch (matches our 90 training examples)
-accum_iter: 1
-blr: 5e-5  # Base learning rate
-weight_decay: 0.05
-min_blr: 1e-6
+# === Training Configuration ===
+batch_size: 32      # Batch size per GPU
+epochs: 2           # Number of complete passes through dataset  
+epoch_size: -1      # Auto-detect dataset size (-1 = use full dataset)
+accum_iter: 1       # Gradient accumulation steps
+blr: 5e-5           # Base learning rate
+weight_decay: 0.05  # Weight decay for regularization
+min_blr: 1e-6       # Minimum learning rate for scheduler
 
-# Token configuration
-num_input_tokens: 512
-num_target_tokens: 512
-min_input_tokens: 64
-min_target_tokens: 64
+# === Token Budget Configuration ===
+num_input_tokens: 1024   # Maximum input sequence length
+num_target_tokens: 1024  # Maximum target sequence length  
+min_input_tokens: 64     # Minimum input tokens (for variable length)
+min_target_tokens: 64    # Minimum target tokens (for variable length)
 
-# Scheduler configuration
-warmup_epochs: 5
-cooldown_epochs: 5
+# === Learning Rate Scheduler ===
+scheduler: "inverse_sqrt-10000"  # Inverse sqrt scheduler with 10k warmup
+warmup_epochs: 5                 # Learning rate warmup period
+cooldown_epochs: 5               # Learning rate cooldown period
 
-# MCoT specific configuration
-mcot_steps: "planning,acting,reflection,correction"
-mcot_planning_weight: 1.0
-mcot_acting_weight: 1.2
-mcot_reflection_weight: 1.5
-mcot_correction_weight: 1.3
-enable_mint_features: true
+# === MCoT-Specific Configuration ===
+mcot_steps: "planning,acting,reflection,correction"  # MCoT step sequence
+mcot_planning_weight: 1.0    # Loss weight for planning step
+mcot_acting_weight: 1.2      # Loss weight for acting step (slightly higher)
+mcot_reflection_weight: 1.5  # Loss weight for reflection step (highest - most critical)
+mcot_correction_weight: 1.3  # Loss weight for correction step
+enable_mint_features: true   # Enable MINT paper enhancements (artifact detection)
 
-# FSDP configuration
-use_act_checkpoint: true
-dtype: "bfloat16"
-clip_grad: 1.0
+# === FSDP & Performance Configuration ===
+use_act_checkpoint: true  # Enable activation checkpointing to save memory
+dtype: "bfloat16"        # Mixed precision training (bfloat16 for stability)
+clip_grad: 1.0           # Gradient clipping for training stability
 
-# Evaluation configuration
-eval_freq: 5
-fixed_eval: true
-fixed_eval_input_tokens: 256
-fixed_eval_target_tokens: 256
-fixed_eval_batch_size: 16
+# === Evaluation Configuration ===
+eval_freq: 5                      # Evaluate every 5 epochs
+fixed_eval: true                  # Use fixed evaluation set
+fixed_eval_input_tokens: 256      # Input tokens for evaluation
+fixed_eval_target_tokens: 256     # Target tokens for evaluation
+fixed_eval_batch_size: 16         # Batch size for evaluation
 
-# Logging configuration
-save_ckpt_freq: 10
-log_wandb: true
-wandb_project: "4m-mcot-scitas"
+# === Logging & Checkpointing ===
+save_ckpt_freq: 10           # Save checkpoint every 10 epochs
+log_wandb: true              # Enable Weights & Biases logging
+wandb_project: "4m-mcot-scitas"  # W&B project name
 
-# System configuration
-num_workers: 5
-pin_mem: true
+# === System Configuration ===
+num_workers: 5  # DataLoader worker processes
+pin_mem: true   # Pin memory for faster GPU transfer

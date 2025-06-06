@@ -13,8 +13,26 @@
 # limitations under the License.
 
 """
-MCoT Dataset implementation for 4M model training.
-Handles directory structure with image.jpg and mcot_annotations.json files.
+MCoT Dataset Implementation for 4M Model Training
+
+This dataset handles the directory structure used by MCoT training data:
+- Each example is a folder containing an image and MCoT annotations
+- Supports both train/val splits
+- Integrates with 4M's modality system for seamless training
+
+Expected directory structure:
+    dataset_dir/
+        train/
+            example_001/
+                image.jpg
+                mcot_annotations.json
+            example_002/
+                ...
+        val/
+            example_003/
+                ...
+
+The annotations JSON contains the MCoT step outputs (planning, acting, reflection, correction).
 """
 
 import json
@@ -32,17 +50,21 @@ from fourm.data.modality_transforms import get_transform_key
 
 class MCoTDatasetFromDirectory(Dataset):
     """
-    PyTorch Dataset that loads MCoT data from directory structure.
-    Expected structure:
-    dataset_dir/
-        train/ or val/
-            example_1/
-                image.jpg
-                mcot_annotations.json
-            example_2/
-                image.jpg
-                mcot_annotations.json
-            ...
+    PyTorch Dataset that loads MCoT training data from directory structure.
+    
+    This dataset is designed for the standard MCoT data format where each example
+    is stored as a folder containing:
+    - image.jpg: The reference image
+    - mcot_annotations.json: MCoT step outputs and metadata
+    
+    The dataset automatically discovers all valid examples and handles missing files
+    gracefully (creates placeholder images if needed).
+    
+    Args:
+        data_path: Root directory containing train/val folders
+        all_domains: List of modalities to include (e.g., ['rgb', 'caption', 'planning'])
+        split: 'train' or 'val'
+        Other args: Standard 4M dataset parameters for transforms and tokenization
     """
     
     def __init__(self, 
@@ -66,7 +88,7 @@ class MCoTDatasetFromDirectory(Dataset):
         self.target_tokens_range = target_tokens_range
         self.split = split
         
-        # Find all example directories
+        # Discover all valid example directories (must contain mcot_annotations.json)
         split_dir = self.data_path / split
         if not split_dir.exists():
             raise ValueError(f"Split directory {split_dir} does not exist")
@@ -85,15 +107,21 @@ class MCoTDatasetFromDirectory(Dataset):
         return len(self.example_dirs)
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Load example from directory structure."""
+        """
+        Load a single MCoT example from the directory structure.
+        
+        Returns a dictionary containing only the modalities requested in all_domains.
+        This allows flexible training - you can train on just images + captions,
+        or include specific MCoT steps, etc.
+        """
         example_dir = self.example_dirs[idx]
         
-        # Load annotations
+        # Load MCoT annotations (contains step outputs and metadata)
         annotations_file = example_dir / "mcot_annotations.json"
         with open(annotations_file, 'r') as f:
             annotations = json.load(f)
         
-        # Load image
+        # Load image (create placeholder if missing to avoid crashes)
         image_file = example_dir / "image.jpg"
         if image_file.exists():
             image = Image.open(image_file).convert('RGB')
@@ -101,18 +129,19 @@ class MCoTDatasetFromDirectory(Dataset):
             # Create placeholder image if file missing
             image = Image.new('RGB', (224, 224), color=(128, 128, 128))
         
-        # Build mod_dict with only the modalities requested in all_domains
+        # Build modality dict with only requested modalities (all_domains)
         mod_dict = {}
         
-        # Always include image modalities if requested 
+        # Include image if any RGB modality is requested 
         if any(domain.startswith('rgb') for domain in self.all_domains):
             mod_dict['rgb'] = image  # Raw PIL image, will be processed by image_augmenter in UnifiedDataTransform
         
-        # Include text modalities if requested
+        # Include text caption if requested
         if 'caption' in self.all_domains:
             mod_dict['caption'] = annotations.get('prompt', annotations.get('caption', 'Default caption'))
         
-        # Include MCoT step modalities only if they are in all_domains
+        # Include MCoT step outputs only if specifically requested
+        # This allows training on subsets of the MCoT process
         mcot_mappings = {
             'planning': annotations.get('planning', 'Planning step data'),
             'acting': annotations.get('acting', 'Acting step data'), 

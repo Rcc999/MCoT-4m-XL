@@ -13,18 +13,29 @@
 # limitations under the License.
 
 """
-Implementation of the Multimodal Chain of Thought (MCoT) methodology
-as described in the MINT paper. This module adds MCoT capabilities
-to the 4M model through step-specific processing and state management.
+Multi-step Chain of Thought (MCoT) Implementation for 4M Models
 
-The MCoT process follows four sequential steps:
-1. Planning: Caption and layout planning with comprehensive descriptions and spatial layouts
-2. Acting: Image generation based on the planning outputs  
-3. Reflection: Artifact detection and self-assessment of generated images
-4. Correction: Targeted inpainting and correction based on reflection insights
+This module extends the 4M multimodal transformer with MCoT reasoning capabilities.
+Instead of generating images in one shot, MCoT breaks the process into four steps:
 
-Note: This implementation works with the existing 4M transformer architecture
-without requiring expert routing or architectural changes.
+1. **Planning**: Analyze the prompt and create a detailed plan with descriptions and spatial layouts
+2. **Acting**: Generate the initial image based on the planning step
+3. **Reflection**: Evaluate the generated image and identify potential issues or artifacts  
+4. **Correction**: Apply targeted fixes to improve the final result
+
+Key Features:
+- Works with existing 4M architecture (no architectural changes needed)
+- Step-specific conditioning through embeddings and prompt formatting
+- Configurable step weights for training
+- MINT paper integration for artifact detection and confidence scoring
+
+Usage:
+    # Wrap any 4M model with MCoT capabilities
+    mcot_model = add_mcot_to_model(base_4m_model)
+    
+    # Use with step conditioning
+    output = mcot_model(mod_dict, num_encoder_tokens, num_decoder_tokens, 
+                       mcot_step="planning")
 """
 
 import torch
@@ -42,9 +53,16 @@ except ImportError:
 
 class MCoTStepProcessor(nn.Module):
     """
-    Enhanced MCoT step processor with MINT paper features:
-    - Artifact heatmap generation with confidence scoring
-    - Reflection-guided mask generation for targeted correction
+    Processes MCoT steps with step-specific conditioning and prompt formatting.
+    
+    This class handles the logic for each MCoT step, including:
+    - Step-specific embeddings for model conditioning
+    - Prompt formatting with context from previous steps
+    - Configurable weights for different steps during training
+    - MINT-style artifact detection features
+    
+    The processor maintains no state between steps - each step gets fresh context
+    from the previous steps' outputs.
     """
     
     def __init__(self, dim: int = 768, device: str = 'cuda', enable_mint: bool = False,
@@ -55,15 +73,15 @@ class MCoTStepProcessor(nn.Module):
         self.device = device
         self.enable_mint = enable_mint
         
-        # Configure MCoT steps
+        # MCoT step configuration - defines the four reasoning steps
         default_steps = ["planning", "acting", "reflection", "correction"]
         self.mcot_steps = mcot_steps if mcot_steps is not None else default_steps
         
-        # Configure step weights
+        # Training weights for each step (reflection gets higher weight as it's most critical)
         default_weights = {"planning": 1.0, "acting": 1.2, "reflection": 1.5, "correction": 1.3}
         self.step_weights = step_weights if step_weights is not None else default_weights
         
-        # Step configurations
+        # Instructions for each MCoT step - these guide the model's behavior
         self.step_instructions = {
             "planning": "Create a detailed dense caption and layout plan with bounding boxes for objects. Focus on spatial relationships and compositional elements.",
             "acting": "Generate the image based on the planning output. Use the dense caption and layout information to create a high-quality image.",
@@ -73,10 +91,10 @@ class MCoTStepProcessor(nn.Module):
         
         self.step_to_id = {step: i for i, step in enumerate(self.step_instructions.keys())}
         
-        # Step embeddings for conditioning
+        # Learnable embeddings to condition the model for each step
         self.step_embeddings = nn.Embedding(len(self.step_instructions), dim)
         
-        # Enhanced reflection processing
+        # Confidence threshold for reflection step artifact detection
         self.reflection_confidence_threshold = 0.5
         
         print(f"MCoTStepProcessor initialized with dim={dim}, enable_mint={enable_mint}")
@@ -105,20 +123,30 @@ class MCoTStepProcessor(nn.Module):
         return step_emb
 
     def format_step_prompt(self, base_prompt: str, step: str, context: Optional[Dict[str, Any]] = None) -> str:
-        """Format the prompt for a specific MCoT step."""
+        """
+        Format prompts for specific MCoT steps by adding step instructions and context.
+        
+        Args:
+            base_prompt: Original user prompt (e.g., "Draw a cat on a sofa")
+            step: Current MCoT step ("planning", "acting", "reflection", "correction")
+            context: Results from previous steps to provide context
+            
+        Returns:
+            Formatted prompt with step instructions and previous step context
+        """
         if step not in self.step_instructions:
             return base_prompt
             
         instruction = self.step_instructions[step]
         
-        # Build context from previous steps
+        # Add context from previous steps (e.g., planning output for acting step)
         context_str = ""
         if context:
             for prev_step in ["planning", "acting", "reflection"]:
                 if prev_step in context and prev_step != step:
                     context_str += f"\n{prev_step.title()}: {context[prev_step]}"
         
-        # Format the complete prompt
+        # Create the final prompt with instructions and context
         if step == "planning":
             formatted_prompt = f"{instruction}\n\nUser request: {base_prompt}"
         else:
@@ -133,8 +161,16 @@ class MCoTStepProcessor(nn.Module):
 
 class MCoTWrapper(nn.Module):
     """
-    Wrapper that adds MCoT capabilities to an existing 4M model.
-    This enables step-specific processing without changing the base architecture.
+    Wrapper that adds MCoT reasoning to any existing 4M model.
+    
+    This wrapper preserves the original model's interface while adding MCoT capabilities.
+    It intercepts forward passes to apply step-specific conditioning when needed.
+    
+    Key features:
+    - Non-invasive: doesn't modify the base model architecture
+    - Step conditioning: adds embeddings and formats prompts for each MCoT step
+    - Transparent: behaves like the original model when MCoT is not used
+    - Flexible: works with any 4M model variant
     """
     
     def __init__(self, base_model: nn.Module, mcot_processor: Optional[MCoTStepProcessor] = None):
@@ -143,13 +179,13 @@ class MCoTWrapper(nn.Module):
         self.base_model = base_model
         self.dim = getattr(base_model, 'dim', 768)
         
-        # MCoT step processor
+        # Initialize MCoT processor for step-specific logic
         if mcot_processor is not None:
             self.step_processor = mcot_processor
         else:
             self.step_processor = MCoTStepProcessor(self.dim)
         
-        # Copy important attributes from base model
+        # Copy important attributes from base model so we behave identically
         self.modality_info = getattr(base_model, 'modality_info', {})
         
     def forward(self, 
@@ -159,7 +195,12 @@ class MCoTWrapper(nn.Module):
                 mcot_step: Optional[str] = None,
                 mcot_context: Optional[Dict[str, Any]] = None,
                 **kwargs) -> Union[Dict[str, torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-        """Forward pass with optional MCoT step conditioning."""
+        """
+        Forward pass with optional MCoT step conditioning.
+        
+        When mcot_step is provided, applies step-specific conditioning to inputs.
+        Otherwise behaves exactly like the base model.
+        """
         
         # Apply MCoT conditioning if step is specified
         if mcot_step is not None and mcot_step in self.step_processor.step_to_id:

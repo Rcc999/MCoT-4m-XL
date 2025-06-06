@@ -23,6 +23,7 @@ from fourm.data import (CenterCropImageAugmenter, EmptyAugmenter,
                   build_huggingface_pretraining_dataloader,
                   build_wds_fm_pretraining_dataloader)
 from fourm.data.mcot_dataset import MCoTDatasetFromDirectory
+from fourm.data.unified_datasets import custom_fourm_collate
 from fourm.data.modality_transforms import CaptionTransform, UnifiedDataTransform
 from fourm.data.masking import UnifiedMasking
 from fourm.data.modality_info import MODALITY_TRANSFORMS
@@ -176,7 +177,7 @@ def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_t
                 dataset_train, sampler=sampler_train,
                 batch_size=1, num_workers=0,
                 pin_memory=False, drop_last=True,
-                collate_fn=lambda x: x[0],
+                collate_fn=custom_fourm_collate,
             )
 
     elif dataset_config['type'] == 'huggingface':
@@ -255,7 +256,7 @@ def get_train_dataloader(dataset_config, modality_info, sampling_weights, text_t
             dataset_train, sampler=sampler_train,
             batch_size=1, num_workers=0,
             pin_memory=False, drop_last=True,
-            collate_fn=lambda x: x[0],
+            collate_fn=custom_fourm_collate,
         )
     else:
         raise NotImplementedError(f'Dataset type {dataset_config["type"]} not implemented.')
@@ -339,6 +340,7 @@ def get_val_dataloader(dataset_config, dataset_name, train_configs, modality_inf
             num_workers=num_workers,
             pin_memory=pin_mem,
             drop_last=False,
+            collate_fn=custom_fourm_collate,
         )
 
     elif dataset_type == 'huggingface':
@@ -435,6 +437,7 @@ def get_val_dataloader(dataset_config, dataset_name, train_configs, modality_inf
             num_workers=num_workers,
             pin_memory=pin_mem,
             drop_last=False,
+            collate_fn=custom_fourm_collate,
         )
 
     else:

@@ -33,49 +33,41 @@ from webdataset.handlers import warn_and_continue
 
 def custom_fourm_collate(batch):
     """
-    Custom collate function for FourM data that properly handles nested dictionary structures
+    Custom collate function for FourM data that properly handles modality dictionaries
     with mask tensors that need to be stacked from 1D to 2D.
+    
+    Expected structure:
+    batch = [
+        {
+            'modality_name': {
+                'tensor': torch.Tensor,
+                'input_mask': torch.Tensor,  # 1D -> needs to become 2D
+                'target_mask': torch.Tensor,  # 1D -> needs to become 2D  
+                'decoder_attention_mask': torch.Tensor  # 1D -> needs to become 2D
+            },
+            ...
+        },
+        ...
+    ]
     """
-    if len(batch) == 0:
-        return {}
-    
-    # Check if this is a batch of dictionaries with modality data
-    if isinstance(batch[0], dict) and all(isinstance(item, dict) for item in batch):
-        # Check if any items have the nested mask structure
-        has_mask_structure = any(
-            isinstance(v, dict) and all(key in v for key in ['tensor', 'input_mask', 'target_mask', 'decoder_attention_mask'])
-            for item in batch
-            for v in item.values()
-            if isinstance(v, dict)
-        )
-        
-        if has_mask_structure:
-            # Handle nested modality dictionaries
-            collated = {}
-            for key in batch[0].keys():
-                if isinstance(batch[0][key], dict):
-                    # This is a modality with mask structure
-                    modality_batch = [item[key] for item in batch]
-                    collated[key] = {}
-                    
-                    # Collate each sub-key separately
-                    for sub_key in modality_batch[0].keys():
-                        sub_batch = [mod[sub_key] for mod in modality_batch]
-                        if isinstance(sub_batch[0], torch.Tensor):
-                            # Stack tensors, ensuring proper dimensionality
-                            collated[key][sub_key] = torch.stack(sub_batch, dim=0)
-                        else:
-                            # Use default collate for non-tensor items
-                            collated[key][sub_key] = default_collate(sub_batch)
-                else:
-                    # Regular field, use default collate
-                    field_batch = [item[key] for item in batch]
-                    collated[key] = default_collate(field_batch)
+    # Collate nested modality dictionaries
+    collated = {}
+    for key in batch[0].keys():
+        if isinstance(batch[0][key], dict) and 'tensor' in batch[0][key]:
+            # This is a modality with tensor/mask structure from UnifiedMasking
+            modality_batch = [item[key] for item in batch]
+            collated[key] = {}
             
-            return collated
+            # Stack all tensors (including 1D masks to 2D)
+            for sub_key in modality_batch[0].keys():
+                sub_batch = [mod[sub_key] for mod in modality_batch]
+                collated[key][sub_key] = torch.stack(sub_batch, dim=0)
+        else:
+            # Regular field, use default collate
+            field_batch = [item[key] for item in batch]
+            collated[key] = default_collate(field_batch)
     
-    # Fall back to default collate for other structures
-    return default_collate(batch)
+    return collated
 
 try:
     # Optionally load huggingface datasets
